@@ -205,9 +205,33 @@ void EventThread::process(RGSSThreadData &rtData)
 	void *sMenu = 0;
 #endif
 
+	/* ARC: on Android the window can already have its final size before we
+	 * start listening, so no SIZE_CHANGED event ever reports it and the game
+	 * stays small until the app is minimised and restored. For the first
+	 * 30 seconds, look at the real window size twice a second and report it. */
+	int arcPolls = 0;
+	int arcDrwW = -1, arcDrwH = -1;
+
 	while (true)
 	{
-		if (!SDL_WaitEvent(&event)) {
+		const bool arcPolling = (arcPolls < 60);
+		int arcRet = arcPolling ? SDL_WaitEventTimeout(&event, 500) : SDL_WaitEvent(&event);
+		if (!arcRet) {
+			if (arcPolling) {
+				++arcPolls;
+				int cw, ch, dw, dh;
+				SDL_GetWindowSize(win, &cw, &ch);
+				SDL_GL_GetDrawableSize(win, &dw, &dh);
+				if (cw != winW || ch != winH || dw != arcDrwW || dh != arcDrwH) {
+					winW = cw;
+					winH = ch;
+					arcDrwW = dw;
+					arcDrwH = dh;
+					windowSizeMsg.post(Vec2i(winW, winH));
+					drawableSizeMsg.post(Vec2i(dw, dh));
+				}
+				continue;
+			}
 			Debug() << "EventThread: Event error";
 			break;
 		}
