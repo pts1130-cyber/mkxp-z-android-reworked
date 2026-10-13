@@ -29,7 +29,7 @@
         android:layout_alignParentEnd="true"
         android:layout_alignParentBottom="true"
         android:layout_marginEnd="@dimen/_8sdp"
-        android:layout_marginBottom="@dimen/_40sdp"
+        android:layout_marginBottom="@dimen/_20sdp"
     >
         <com.hatkid.mkxpz.gamepad.GamepadButton
             android:id="@+id/button_X"
