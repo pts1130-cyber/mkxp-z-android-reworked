@@ -30,7 +30,17 @@
 
 #include <SDL_sound.h>
 
-#define SE_CACHE_MEM (10*1024*1024) // 10 MB
+#include <stdlib.h>
+
+#include "arc-prof.h"
+
+/* ARC: 32 MB (was 10 MB). Decoded effects are 32 bit float, long ones (Ruin
+ * Light, Z moves...) are several MB each and used to push each other out of
+ * the cache, so they were decoded from disk again and again. */
+#define SE_CACHE_MEM (32*1024*1024)
+
+/* ARC: effect files up to this size are read into memory in one go */
+#define ARC_SE_SLURP_MAX (24*1024*1024)
 
 struct SoundBuffer
 {
@@ -184,21 +194,114 @@ void SoundEmitter::stop()
 		AL::Source::stop(alSrcs[i]);
 }
 
+/* ARC: close function of the in-memory ops used by SoundOpenHandler.
+ * That ops struct lives on the stack of tryRead() and the file image is
+ * freed by the handler itself, so closing must not free anything:
+ * Sound_NewSample() (when no decoder takes the data) and Sound_FreeSample()
+ * both close the ops they were handed. */
+static int arcMemOpsClose(SDL_RWops *)
+{
+	return 0;
+}
+
 struct SoundOpenHandler : FileSystem::OpenHandler
 {
 	SoundBuffer *buffer;
 
+	/* ARC: timing for the log (milliseconds) */
+	double msRead;
+	double msDecode;
+	double msUpload;
+	Sint64 fileBytes;
+	bool slurped;
+	int rate;
+	int channels;
+
 	SoundOpenHandler()
-	    : buffer(0)
+	    : buffer(0),
+	      msRead(0), msDecode(0), msUpload(0),
+	      fileBytes(-1), slurped(false), rate(0), channels(0)
 	{}
 
 	bool tryRead(SDL_RWops &ops, const char *ext)
 	{
-		Sound_Sample *sample = Sound_NewSample(&ops, ext, 0, STREAM_BUF_SIZE);
+		/* ARC: the decoders (stb_vorbis, dr_mp3, wav...) pull the file out of
+		 * PhysFS a few bytes at a time. On the phone's shared storage every
+		 * single read call costs ~20 us, so one 100 KB effect used to freeze
+		 * the game for seconds.  Read the whole file with ONE read and decode
+		 * from memory instead. */
+		uint64_t t0 = SDL_GetPerformanceCounter();
+
+		SDL_RWops *src = &ops;
+		SDL_RWops memOps;   /* in-memory ops, valid until tryRead() returns */
+		void *mem = 0;
+
+		Sint64 fsize = SDL_RWsize(&ops);
+		fileBytes = fsize;
+
+		if (fsize > 0 && fsize <= ARC_SE_SLURP_MAX)
+		{
+			mem = malloc((size_t) fsize);
+
+			if (mem)
+			{
+				size_t got = 0;
+				bool haveMemOps = false;
+
+				while (got < (size_t) fsize)
+				{
+					size_t n = SDL_RWread(&ops, (char *) mem + got, 1,
+					                      (size_t) fsize - got);
+					if (n == 0)
+						break;
+					got += n;
+				}
+
+				if (got == (size_t) fsize)
+				{
+					SDL_RWops *tmp = SDL_RWFromConstMem(mem, (int) fsize);
+
+					if (tmp)
+					{
+						/* plain copy: the read position lives in the struct,
+						 * the data stays in mem. Our own close() never frees. */
+						memOps = *tmp;
+						SDL_FreeRW(tmp);
+						memOps.close = arcMemOpsClose;
+						haveMemOps = true;
+					}
+				}
+
+				if (haveMemOps)
+				{
+					/* the PhysFS handle is not needed any more */
+					SDL_RWclose(&ops);
+					src = &memOps;
+					slurped = true;
+				}
+				else
+				{
+					/* could not slurp: fall back to the old streaming path */
+					free(mem);
+					mem = 0;
+					SDL_RWseek(&ops, 0, RW_SEEK_SET);
+				}
+			}
+		}
+
+		uint64_t t1 = SDL_GetPerformanceCounter();
+		msRead = arcTicksToMs(t1 - t0);
+
+		Sound_Sample *sample = Sound_NewSample(src, ext, 0, STREAM_BUF_SIZE);
 
 		if (!sample)
 		{
+			/* Sound_NewSample() has already closed the ops it was given when no
+			 * decoder accepted the data. Closing the PhysFS ops once more is
+			 * harmless (the handle pointer is cleared on close, same as in the
+			 * original code); the in-memory ops is ours and needs no closing. */
 			SDL_RWclose(&ops);
+			free(mem);
 			return false;
 		}
 
@@ -208,6 +311,9 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 		uint8_t sampleSize = formatSampleSize(sample->actual.format);
 		uint32_t sampleCount = decBytes / sampleSize;
 
+		uint64_t t2 = SDL_GetPerformanceCounter();
+		msDecode = arcTicksToMs(t2 - t1);
+
 		buffer = new SoundBuffer;
 		buffer->bytes = sampleSize * sampleCount;
 
@@ -216,7 +322,16 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 		AL::Buffer::uploadData(buffer->alBuffer, alFormat, sample->buffer,
 							   buffer->bytes, sample->actual.rate);
 
+		rate = (int) sample->actual.rate;
+		channels = (int) sample->actual.channels;
+
+		/* closes src as well (the memory ops or the PhysFS ops) */
 		Sound_FreeSample(sample);
+
+		/* the decoder is gone, the file image is not needed any more */
+		free(mem);
+
+		msUpload = arcTicksToMs(SDL_GetPerformanceCounter() - t2);
 
 		return true;
 	}
@@ -238,9 +353,33 @@ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
 	else
 	{
 		/* Buffer not in cache, needs to be loaded */
+		uint64_t arcT0 = SDL_GetPerformanceCounter();
+
 		SoundOpenHandler handler;
 		shState->fileSystem().openRead(handler, filename.c_str());
 		buffer = handler.buffer;
+
+		/* ARC: log every effect that took 15 ms or more to load */
+		{
+			double total = arcTicksToMs(SDL_GetPerformanceCounter() - arcT0);
+
+			if (total >= 15.0)
+			{
+				double rest = total - handler.msRead - handler.msDecode -
+				              handler.msUpload;
+				if (rest < 0)
+					rest = 0;
+
+				arcLogLine(1, "_log/engine_snd.txt", 400,
+				           "[엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%lld바이트%s) 풀기 %.0fms | 올리기 %.0fms | %dHz %dch | %s%s",
+				           SDL_GetTicks() / 1000.0, total, rest,
+				           handler.msRead, (long long) handler.fileBytes,
+				           handler.slurped ? " 통째로" : " 조각조각",
+				           handler.msDecode, handler.msUpload,
+				           handler.rate, handler.channels,
+				           filename.c_str(), buffer ? "" : "  (실패)");
+			}
+		}
 
 		if (!buffer)
 		{

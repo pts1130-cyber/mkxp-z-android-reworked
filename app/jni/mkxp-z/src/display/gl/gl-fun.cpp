@@ -23,6 +23,7 @@
 
 #include "boost-hash.h"
 #include "exception.h"
+#include "arc-prof.h"
 
 #include <SDL_video.h>
 #include <string>
@@ -66,6 +67,101 @@ static void parseExtensionsCompat(_PFNGLGETSTRINGPROC GetString, BoostSet<std::s
         if (*ext == ' ')
             ++ext;
     }
+}
+
+/* ------------------------------------------------------------------------
+ * ARC: log-only GL call counters.
+ * The real entry points are kept in arcRealGl, the table the rest of the
+ * engine uses (gl) gets thin wrappers that count a few calls and time the
+ * ones that can stall (texture uploads, glReadPixels).  Behaviour is unchanged.
+ * ---------------------------------------------------------------------- */
+#ifdef GLES2_HEADER
+#define ARC_GLCALL GL_APIENTRY
+#else
+#define ARC_GLCALL APIENTRY
+#endif
+
+static GLFunctions arcRealGl;
+
+static void ARC_GLCALL arcDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
+{
+    ++arcGlCount().draws;
+    arcRealGl.DrawElements(mode, count, type, indices);
+}
+
+static void ARC_GLCALL arcBindFramebuffer(GLenum target, GLuint fb)
+{
+    ++arcGlCount().fboBinds;
+    arcRealGl.BindFramebuffer(target, fb);
+}
+
+static void ARC_GLCALL arcUseProgram(GLuint program)
+{
+    ++arcGlCount().progSwitches;
+    arcRealGl.UseProgram(program);
+}
+
+static void ARC_GLCALL arcClear(GLbitfield mask)
+{
+    ++arcGlCount().clears;
+    arcRealGl.Clear(mask);
+}
+
+static void ARC_GLCALL arcBindTexture(GLenum target, GLuint tex)
+{
+    ++arcGlCount().texBinds;
+    arcRealGl.BindTexture(target, tex);
+}
+
+static void ARC_GLCALL arcTexImage2D(GLenum target, GLint level, GLint internalformat,
+                                     GLsizei width, GLsizei height, GLint border,
+                                     GLenum format, GLenum type, const GLvoid *pixels)
+{
+    ArcGlCount &c = arcGlCount();
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    arcRealGl.TexImage2D(target, level, internalformat, width, height, border,
+                         format, type, pixels);
+    c.texTicks += SDL_GetPerformanceCounter() - t0;
+    ++c.texImages;
+    if (pixels)
+        c.texBytes += (uint64_t) width * (uint64_t) height * 4;
+}
+
+static void ARC_GLCALL arcTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                        GLsizei width, GLsizei height, GLenum format,
+                                        GLenum type, const GLvoid *pixels)
+{
+    ArcGlCount &c = arcGlCount();
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    arcRealGl.TexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+                            type, pixels);
+    c.texTicks += SDL_GetPerformanceCounter() - t0;
+    ++c.texSubImages;
+    c.texBytes += (uint64_t) width * (uint64_t) height * 4;
+}
+
+static void ARC_GLCALL arcReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
+                                     GLenum format, GLenum type, GLvoid *pixels)
+{
+    ArcGlCount &c = arcGlCount();
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    arcRealGl.ReadPixels(x, y, width, height, format, type, pixels);
+    c.readTicks += SDL_GetPerformanceCounter() - t0;
+    ++c.readPixels;
+}
+
+static void arcWrapGL()
+{
+    arcRealGl = gl;
+
+    gl.DrawElements = arcDrawElements;
+    gl.BindFramebuffer = arcBindFramebuffer;
+    gl.UseProgram = arcUseProgram;
+    gl.Clear = arcClear;
+    gl.BindTexture = arcBindTexture;
+    gl.TexImage2D = arcTexImage2D;
+    gl.TexSubImage2D = arcTexSubImage2D;
+    gl.ReadPixels = arcReadPixels;
 }
 
 #define GL_FUN(name, type) \
@@ -204,4 +300,7 @@ void initGLFunctions()
     
     if (!gles || glMajor >= 3 || HAVE_EXT(OES_texture_npot))
         gl.npot_repeat = true;
+
+    /* ARC: counters (log only) */
+    arcWrapGL();
 }

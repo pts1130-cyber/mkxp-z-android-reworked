@@ -12,8 +12,9 @@ public class GamepadConfig
     // View elements scale in percentage (default: 100)
     public Integer scale = 100;
 
-    // Whether use diagonal (8-way) movement on D-Pad (default: false)
-    public Boolean diagonalMovement = true;
+    // Whether use diagonal (8-way) movement on D-Pad.
+    // false = 4-way with sticky direction (right for tile based RPG Maker / Essentials games)
+    public Boolean diagonalMovement = false;
 
     /** Key bindings for each RGSS input **/
     public final Integer keycodeA = KeyEvent.KEYCODE_Z;

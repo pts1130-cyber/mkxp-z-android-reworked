@@ -48,6 +48,7 @@
 #include "util/util.h"
 
 #include "debugwriter.h"
+#include "arc-prof.h"
 
 #include "sigslot/signal.hpp"
 
@@ -401,6 +402,10 @@ struct BitmapPrivate
     }
 };
 
+/* ARC: counters shown in the _log/engine_gfx.txt summary lines */
+uint32_t arcImgCount = 0;
+uint64_t arcImgTicks = 0;
+
 /* ARC: image-load timing (file read vs decode) -> _log/engine_img.txt */
 static size_t (*arcOrigRead)(SDL_RWops *, void *, size_t, size_t) = 0;
 static Uint64 arcReadTicks = 0;
@@ -650,15 +655,24 @@ Bitmap::Bitmap(const char *filename)
     p->addTaintedArea(rect());
     
     {
-        /* ARC: log slow loads */
+        /* ARC: count every image loaded from a file, log the slow ones
+         * (12 ms or more, at most 400 lines per run) */
+        static int arcImgLines = 0;
         Uint64 arcT2 = SDL_GetPerformanceCounter();
         double total = arcMs(arcT2 - arcT0);
-        if (total >= 100.0)
+
+        ++arcImgCount;
+        arcImgTicks += (arcT2 - arcT0);
+
+        if (total >= 12.0 && arcImgLines < 400)
         {
             FILE *lf = fopen("_log/engine_img.txt", "a");
             if (lf)
             {
-                fprintf(lf, "%.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s\n",
+                char clk[16];
+                ++arcImgLines;
+                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s\n",
+                        arcClockStr(clk), SDL_GetTicks() / 1000.0,
                         total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
                         handler.readMs, handler.readBytes, handler.readCalls,
                         handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename);

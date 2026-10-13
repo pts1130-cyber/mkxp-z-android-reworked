@@ -44,6 +44,7 @@
 #include "util.h"
 #include "input.h"
 #include "sprite.h"
+#include "arc-prof.h"
 
 #include <SDL.h>
 #include <SDL_image.h>
@@ -766,6 +767,384 @@ private:
     }
 };
 
+
+/* ===========================================================================
+ * ARC: frame profiler.  LOG ONLY - writes _log/engine_gfx.txt and changes
+ * nothing about what is drawn or how fast the game runs.
+ *
+ * Every buffer swap closes one "frame record" (time since the previous swap):
+ *   루비  = everything outside the engine's own drawing (game scripts)
+ *   합성  = screen.composite(): all Sprites/Windows/... issue their GL calls
+ *   그림  = final scale-up blit to the window
+ *   대기  = frame limiter sleep (waiting for the next 1/40 s slot)
+ *   교체  = SDL_GL_SwapWindow (blocks when the GPU / display is behind)
+ *   GPU   = real GPU time of composite+blit (EXT_disjoint_timer_query), if the
+ *           phone's driver offers it
+ * ======================================================================== */
+#define ARC_GFX_LOG         "_log/engine_gfx.txt"
+#define ARC_SLOW_MS         40.0
+#define ARC_SUMMARY_EVERY   300
+#define ARC_SLOW_LINES_MAX  250
+#define ARC_SUM_LINES_MAX   240
+#define ARC_EVT_LINES_MAX   120
+
+#ifndef GL_TIME_ELAPSED_EXT
+#define GL_TIME_ELAPSED_EXT 0x88BF
+#endif
+#define ARC_GL_QUERY_RESULT            0x8866
+#define ARC_GL_QUERY_RESULT_AVAILABLE  0x8867
+#define ARC_GL_GPU_DISJOINT            0x8FBB
+
+typedef void (APIENTRYP ArcPFNGenQueries)(GLsizei n, GLuint *ids);
+typedef void (APIENTRYP ArcPFNBeginQuery)(GLenum target, GLuint id);
+typedef void (APIENTRYP ArcPFNEndQuery)(GLenum target);
+typedef void (APIENTRYP ArcPFNGetQueryObjuiv)(GLuint id, GLenum pname, GLuint *params);
+typedef void (APIENTRYP ArcPFNGetQueryObjui64v)(GLuint id, GLenum pname, uint64_t *params);
+
+struct ArcGpuTimer
+{
+    enum { N = 6 };
+
+    bool tried;
+    bool ok;
+    bool active;
+    GLuint ids[N];
+    int tail;
+    int count;
+
+    ArcPFNGenQueries genQ;
+    ArcPFNBeginQuery beginQ;
+    ArcPFNEndQuery endQ;
+    ArcPFNGetQueryObjuiv getU;
+    ArcPFNGetQueryObjui64v getU64;
+
+    double lastMs;
+    double sumMs;
+    double maxMs;
+    uint32_t n;
+
+    void init()
+    {
+        tried = true;
+
+        /* escape hatch: an (empty) file _log/gpu_timer.off turns the GPU timer off */
+        if (access("_log/gpu_timer.off", F_OK) == 0)
+            return;
+
+        const char *ext = (const char *) gl.GetString(GL_EXTENSIONS);
+
+        if (!ext || !strstr(ext, "GL_EXT_disjoint_timer_query"))
+            return;
+
+        genQ = (ArcPFNGenQueries) SDL_GL_GetProcAddress("glGenQueriesEXT");
+        beginQ = (ArcPFNBeginQuery) SDL_GL_GetProcAddress("glBeginQueryEXT");
+        endQ = (ArcPFNEndQuery) SDL_GL_GetProcAddress("glEndQueryEXT");
+        getU = (ArcPFNGetQueryObjuiv) SDL_GL_GetProcAddress("glGetQueryObjectuivEXT");
+        getU64 = (ArcPFNGetQueryObjui64v) SDL_GL_GetProcAddress("glGetQueryObjectui64vEXT");
+
+        if (!genQ || !beginQ || !endQ || !getU || !getU64)
+            return;
+
+        genQ(N, ids);
+
+        /* reading the disjoint flag once clears it */
+        GLint dj = 0;
+        gl.GetIntegerv(ARC_GL_GPU_DISJOINT, &dj);
+
+        ok = true;
+    }
+
+    void begin()
+    {
+        if (!tried)
+            init();
+
+        if (!ok)
+            return;
+
+        if (active)
+            end();
+
+        if (count >= N)
+            return;
+
+        beginQ(GL_TIME_ELAPSED_EXT, ids[(tail + count) % N]);
+        active = true;
+    }
+
+    void end()
+    {
+        if (!ok || !active)
+            return;
+
+        endQ(GL_TIME_ELAPSED_EXT);
+        ++count;
+        active = false;
+    }
+
+    /* collect finished measurements, oldest first, never waits */
+    void poll()
+    {
+        if (!ok)
+            return;
+
+        while (count > 0)
+        {
+            GLuint avail = 0;
+            getU(ids[tail], ARC_GL_QUERY_RESULT_AVAILABLE, &avail);
+
+            if (!avail)
+                break;
+
+            uint64_t ns = 0;
+            getU64(ids[tail], ARC_GL_QUERY_RESULT, &ns);
+
+            GLint dj = 0;
+            gl.GetIntegerv(ARC_GL_GPU_DISJOINT, &dj);
+
+            tail = (tail + 1) % N;
+            --count;
+
+            if (dj)
+                continue;
+
+            lastMs = ns / 1000000.0;
+            sumMs += lastMs;
+
+            if (lastMs > maxMs)
+                maxMs = lastMs;
+
+            ++n;
+        }
+    }
+};
+
+struct ArcGfxProf
+{
+    bool started;
+    bool headerDone;
+    bool useFrameSkipNow;
+
+    uint64_t tPrevEnd;   /* end of the previous swap */
+    uint64_t tDraw;      /* start of composite */
+    uint64_t tComp;      /* end of composite (0 = no composite this frame) */
+
+    double msComp, msBlit, msDelay, msSwap, msSkipDelay;
+    uint32_t skipped;
+    uint64_t seq;
+
+    ArcGlCount glPrev;
+
+    ArcElemBin bins[ArcElemProf::MAX_BINS];
+    int nbins;
+
+    /* running totals for the summary line */
+    uint32_t wN, wS30, wS50, wS80, wSkip;
+    double wInt, wMax, wRuby, wComp, wBlit, wDelay, wSwap;
+    ArcGlCount glWin;
+    uint64_t rwCallsWin, rwBytesWin, imgTicksWin;
+    uint32_t imgCountWin;
+
+    ArcGpuTimer gpu;
+
+    int slowLines, sumLines, evtLines;
+
+    void drawBegin()
+    {
+        tDraw = SDL_GetPerformanceCounter();
+        tComp = 0;
+        arcElemProf().reset();
+        gpu.begin();
+    }
+
+    void compositeEnd()
+    {
+        tComp = SDL_GetPerformanceCounter();
+        msComp = arcTicksToMs(tComp - tDraw);
+
+        ArcElemProf &ep = arcElemProf();
+        nbins = ep.nbins;
+
+        for (int i = 0; i < nbins; ++i)
+            bins[i] = ep.bins[i];
+    }
+
+    void skipFrame(double delayMs)
+    {
+        ++skipped;
+        msSkipDelay += delayMs;
+    }
+
+    void swapStart(uint64_t t0)
+    {
+        msBlit = tComp ? arcTicksToMs(t0 - tComp) : 0;
+        gpu.end();
+    }
+
+    void resetWindow()
+    {
+        wN = wS30 = wS50 = wS80 = wSkip = 0;
+        wInt = wMax = wRuby = wComp = wBlit = wDelay = wSwap = 0;
+        glWin = arcGlCount();
+        rwCallsWin = arcRwCalls;
+        rwBytesWin = arcRwBytes;
+        imgTicksWin = arcImgTicks;
+        imgCountWin = arcImgCount;
+        gpu.sumMs = 0;
+        gpu.maxMs = 0;
+        gpu.n = 0;
+    }
+
+    void logSlow(double interval, double ruby)
+    {
+        if (slowLines >= ARC_SLOW_LINES_MAX)
+            return;
+
+        ++slowLines;
+
+        const ArcGlCount &g = arcGlCount();
+        char clk[16];
+        char el[320];
+        char gpuTxt[32];
+        el[0] = '\0';
+
+        if (!gpu.ok)
+            snprintf(gpuTxt, sizeof(gpuTxt), "없음");
+        else if (gpu.n)
+            snprintf(gpuTxt, sizeof(gpuTxt), "%.1fms", gpu.lastMs);
+        else
+            snprintf(gpuTxt, sizeof(gpuTxt), "아직");
+
+        for (int i = 0; i < nbins; ++i)
+        {
+            size_t len = strlen(el);
+
+            if (len + 48 >= sizeof(el))
+                break;
+
+            snprintf(el + len, sizeof(el) - len, "%s%s %u건 %.1fms",
+                     i ? " · " : "", bins[i].name, bins[i].n, bins[i].ms);
+        }
+
+        arcLogLine(2, ARC_GFX_LOG, 1000000,
+            "[%s 엔진 %.1f초] 느린 프레임 #%llu %.0fms | 루비 %.1f 합성 %.1f 그림 %.1f 대기 %.1f 교체 %.1f 건너뜀 %u"
+            " | 그리기 %u FBO %u 프로그램 %u 올림 %u+%u(%.1fMB %.1fms) 읽어오기 %u(%.1fms) GPU(최근) %s"
+            " | 요소: %s",
+            arcClockStr(clk), SDL_GetTicks() / 1000.0,
+            (unsigned long long) seq, interval, ruby, msComp, msBlit, msDelay, msSwap, skipped,
+            g.draws - glPrev.draws, g.fboBinds - glPrev.fboBinds,
+            g.progSwitches - glPrev.progSwitches,
+            g.texImages - glPrev.texImages, g.texSubImages - glPrev.texSubImages,
+            (g.texBytes - glPrev.texBytes) / 1048576.0,
+            arcTicksToMs(g.texTicks - glPrev.texTicks),
+            g.readPixels - glPrev.readPixels,
+            arcTicksToMs(g.readTicks - glPrev.readTicks),
+            gpuTxt,
+            el[0] ? el : "(없음)");
+    }
+
+    void logSummary()
+    {
+        if (sumLines < ARC_SUM_LINES_MAX)
+        {
+            ++sumLines;
+
+            const ArcGlCount &g = arcGlCount();
+            double n = wN ? wN : 1;
+            char clk[16];
+            char gpuTxt[64];
+
+            if (!gpu.ok)
+                snprintf(gpuTxt, sizeof(gpuTxt), "GPU타이머 없음");
+            else if (gpu.n)
+                snprintf(gpuTxt, sizeof(gpuTxt), "GPU 평균 %.1fms 최대 %.1fms(%u회)",
+                         gpu.sumMs / gpu.n, gpu.maxMs, gpu.n);
+            else
+                snprintf(gpuTxt, sizeof(gpuTxt), "GPU 결과 아직 없음");
+
+            arcLogLine(2, ARC_GFX_LOG, 1000000,
+                "[%s 엔진 %.1f초] 요약 최근 %u프레임 | 평균 %.1fms 최대 %.0fms · 30ms넘음 %u · 50ms넘음 %u · 80ms넘음 %u · 건너뜀 %u(frameSkip=%d)"
+                " | 루비 %.1f 합성 %.1f 그림 %.1f 대기 %.1f 교체 %.1f"
+                " | 프레임당 그리기 %.0f FBO %.0f 프로그램 %.0f 올림 %.1f+%.1f(%.2fMB, %.1fms) 읽어오기 %.2f(%.1fms 합)"
+                " | %s | 파일읽기 %llu회 %lluKB · 그림불러오기 %u장 %.0fms",
+                arcClockStr(clk), SDL_GetTicks() / 1000.0, wN,
+                wInt / n, wMax, wS30, wS50, wS80, wSkip, useFrameSkipNow ? 1 : 0,
+                wRuby / n, wComp / n, wBlit / n, wDelay / n, wSwap / n,
+                (g.draws - glWin.draws) / n, (g.fboBinds - glWin.fboBinds) / n,
+                (g.progSwitches - glWin.progSwitches) / n,
+                (g.texImages - glWin.texImages) / n, (g.texSubImages - glWin.texSubImages) / n,
+                (g.texBytes - glWin.texBytes) / 1048576.0 / n,
+                arcTicksToMs(g.texTicks - glWin.texTicks) / n,
+                (g.readPixels - glWin.readPixels) / n,
+                arcTicksToMs(g.readTicks - glWin.readTicks),
+                gpuTxt,
+                (unsigned long long) (arcRwCalls - rwCallsWin),
+                (unsigned long long) ((arcRwBytes - rwBytesWin) / 1024),
+                arcImgCount - imgCountWin, arcTicksToMs(arcImgTicks - imgTicksWin));
+        }
+
+        resetWindow();
+    }
+
+    void frameEnd(uint64_t tEnd, double delayMs, double swapMs)
+    {
+        msDelay = delayMs;
+        msSwap = swapMs;
+        ++seq;
+
+        if (!started)
+        {
+            started = true;
+            tPrevEnd = tEnd;
+            glPrev = arcGlCount();
+            resetWindow();
+            msComp = msBlit = msSkipDelay = 0;
+            skipped = 0;
+            tComp = 0;
+            return;
+        }
+
+        double interval = arcTicksToMs(tEnd - tPrevEnd);
+        double ruby = interval - msComp - msBlit - msDelay - msSwap - msSkipDelay;
+
+        if (ruby < 0)
+            ruby = 0;
+
+        gpu.poll();
+
+        ++wN;
+        wInt += interval;
+
+        if (interval > wMax)
+            wMax = interval;
+
+        wRuby += ruby;
+        wComp += msComp;
+        wBlit += msBlit;
+        wDelay += msDelay;
+        wSwap += msSwap;
+        wSkip += skipped;
+
+        if (interval >= 30.0) ++wS30;
+        if (interval >= 50.0) ++wS50;
+        if (interval >= 80.0) ++wS80;
+
+        if (interval >= ARC_SLOW_MS)
+            logSlow(interval, ruby);
+
+        if (wN >= ARC_SUMMARY_EVERY)
+            logSummary();
+
+        tPrevEnd = tEnd;
+        glPrev = arcGlCount();
+        msComp = msBlit = msSkipDelay = 0;
+        skipped = 0;
+        tComp = 0;
+    }
+};
+
+static ArcGfxProf arcGfx;
+
 struct GraphicsPrivate {
     /* Screen resolution, ie. the resolution at which
      * RGSS renders at (settable with Graphics.resize_screen).
@@ -845,7 +1224,7 @@ struct GraphicsPrivate {
             rebuildIntegerScaleBuffer();
         }
         
-        recalculateScreenSize(rtData);
+        recalculateScreenSize(rtData->config.fixedAspectRatio);
         updateScreenResoRatio(rtData);
         
         TEXFBO::init(frozenScene);
@@ -950,28 +1329,65 @@ struct GraphicsPrivate {
         return true;
     }
     
+    /* ARC: one line in _log/engine_gfx.txt about the window / drawing box */
+    void arcLogResize(const char *why) {
+        if (arcGfx.evtLines >= ARC_EVT_LINES_MAX)
+            return;
+        
+        ++arcGfx.evtLines;
+        
+        char clk[16];
+        arcLogLine(2, ARC_GFX_LOG, 1000000,
+                   "[%s 엔진 %.1f초] 창 크기 계산(%s) | 창 %dx%d · 게임 화면 %dx%d · 그리는 칸 %dx%d @(%d,%d) · 비율고정 %d",
+                   arcClockStr(clk), SDL_GetTicks() / 1000.0, why,
+                   winSize.x, winSize.y, scRes.x, scRes.y, scSize.x, scSize.y,
+                   scOffset.x, scOffset.y, threadData->config.fixedAspectRatio ? 1 : 0);
+    }
+    
+    void applyWindowSize(const Vec2i &drawableSize, float newBackingScale,
+                         bool skipIntScaleBuffer, const char *why) {
+        backingScaleFactor = newBackingScale;
+        winSize = drawableSize;
+        
+        /* Make sure integer buffers are rebuilt before screen offsets are
+         * calculated so we have the final allocated buffer size ready */
+        if (integerScaleActive && findHighestIntegerScale() && !skipIntScaleBuffer)
+            rebuildIntegerScaleBuffer();
+        
+        /* some GL drivers change the viewport on window resize */
+        glState.viewport.refresh();
+        recalculateScreenSize(threadData->config.fixedAspectRatio);
+        updateScreenResoRatio(threadData);
+        
+        SDL_Rect screen = {scOffset.x, scOffset.y, scSize.x, scSize.y};
+        threadData->ethread->notifyGameScreenChange(screen);
+        
+        arcLogResize(why);
+    }
+    
     void checkResize(bool skipIntScaleBuffer = false) {
         if (threadData->windowSizeMsg.poll(winSize)) {
             /* Query the actual size in pixels, not units */
             Vec2i drawableSize(winSize);
             threadData->drawableSizeMsg.poll(drawableSize);
             
-            backingScaleFactor = drawableSize.x / winSize.x;
-            winSize = drawableSize;
-            
-            /* Make sure integer buffers are rebuilt before screen offsets are
-             * calculated so we have the final allocated buffer size ready */
-            if (integerScaleActive && findHighestIntegerScale() && !skipIntScaleBuffer)
-                rebuildIntegerScaleBuffer();
-            
-            /* some GL drivers change the viewport on window resize */
-            glState.viewport.refresh();
-            recalculateScreenSize(threadData);
-            updateScreenResoRatio(threadData);
-            
-            SDL_Rect screen = {scOffset.x, scOffset.y, scSize.x, scSize.y};
-            threadData->ethread->notifyGameScreenChange(screen);
+            applyWindowSize(drawableSize, drawableSize.x / winSize.x,
+                            skipIntScaleBuffer, "창 크기 신호");
         }
+        
+#ifdef __ANDROID__
+        /* ARC: on the phone the engine is never told the real size of the
+         * screen unless the phone is rotated (until then winSize is only the
+         * default from mkxp.json), so the picture was drawn into a box made
+         * for the wrong size.  Ask the window itself - it costs nothing. */
+        {
+            int dw = 0, dh = 0;
+            SDL_GL_GetDrawableSize(threadData->window, &dw, &dh);
+            
+            if (dw > 0 && dh > 0 && (dw != winSize.x || dh != winSize.y))
+                applyWindowSize(Vec2i(dw, dh), 1, skipIntScaleBuffer, "창 크기 직접 확인");
+        }
+#endif
     }
     
     void checkShutDownReset() {
@@ -986,13 +1402,54 @@ struct GraphicsPrivate {
         scriptBinding->terminate();
     }
     
+    /* ARC: first frame - write what we are running on / how it is set up */
+    void arcLogHeader() {
+        arcGfx.headerDone = true;
+        
+        char clk[16];
+        const Config &c = threadData->config;
+        
+        arcLogLine(2, ARC_GFX_LOG, 1000000, "===== %s ARC engine gfx profile (v1.0.7)", arcClockStr(clk));
+        arcLogLine(2, ARC_GFX_LOG, 1000000, "GL_VENDOR=%s | GL_RENDERER=%s | GL_VERSION=%s",
+                   (const char *) gl.GetString(GL_VENDOR),
+                   (const char *) gl.GetString(GL_RENDERER),
+                   (const char *) gl.GetString(GL_VERSION));
+        arcLogLine(2, ARC_GFX_LOG, 1000000, "GPU타이머(EXT_disjoint_timer_query): %s",
+                   arcGfx.gpu.ok ? "사용" : "이 폰 드라이버에 없음");
+        arcLogLine(2, ARC_GFX_LOG, 1000000,
+                   "옵션: frameSkip(mkxp.json)=%d frameSkip(지금)=%d · 비율고정=%d · 부드럽게확대=%d · vsync=%d(지금 스왑간격 %d) · syncToRefreshrate=%d · fixedFramerate=%d · 한도기 %s · 화면주사율 %d · 게임프레임 %d",
+                   c.frameSkip ? 1 : 0, useFrameSkip ? 1 : 0, c.fixedAspectRatio ? 1 : 0,
+                   c.smoothScaling ? 1 : 0, c.vsync ? 1 : 0, SDL_GL_GetSwapInterval(),
+                   c.syncToRefreshrate ? 1 : 0, c.fixedFramerate,
+                   fpsLimiter.disabled ? "꺼짐" : "켜짐", threadData->refreshRate, frameRate);
+        arcLogLine(2, ARC_GFX_LOG, 1000000,
+                   "화면: 창 %dx%d · 게임 화면 %dx%d · 그리는 칸 %dx%d @(%d,%d) (mkxp.json 기본 %dx%d)",
+                   winSize.x, winSize.y, scRes.x, scRes.y, scSize.x, scSize.y,
+                   scOffset.x, scOffset.y, c.defScreenW, c.defScreenH);
+    }
+    
     void swapGLBuffer() {
+        uint64_t arcT0 = SDL_GetPerformanceCounter();
+        arcGfx.swapStart(arcT0);
+        
         fpsLimiter.delay();
+        
+        uint64_t arcT1 = SDL_GetPerformanceCounter();
+        
         SDL_GL_SwapWindow(threadData->window);
+        
+        uint64_t arcT2 = SDL_GetPerformanceCounter();
         
         ++frameCount;
         
         threadData->ethread->notifyFrame();
+        
+        arcGfx.useFrameSkipNow = useFrameSkip;
+        
+        if (!arcGfx.headerDone)
+            arcLogHeader();
+        
+        arcGfx.frameEnd(arcT2, arcTicksToMs(arcT1 - arcT0), arcTicksToMs(arcT2 - arcT1));
     }
     
     void compositeToBuffer(TEXFBO &buffer) {
@@ -1022,7 +1479,9 @@ struct GraphicsPrivate {
     }
     
     void redrawScreen() {
+        arcGfx.drawBegin();
         screen.composite();
+        arcGfx.compositeEnd();
         
         // maybe unspaghetti this later
         if (integerScaleStepApplicable() && !integerLastMileScaling)
@@ -1166,7 +1625,9 @@ void Graphics::update(bool checkForShutdown) {
     if (p->fpsLimiter.frameSkipRequired()) {
         if (p->useFrameSkip) {
             /* Skip frame */
+            uint64_t arcS0 = SDL_GetPerformanceCounter();
             p->fpsLimiter.delay();
+            arcGfx.skipFrame(arcTicksToMs(SDL_GetPerformanceCounter() - arcS0));
             ++p->frameCount;
             p->threadData->ethread->notifyFrame();
             
@@ -1414,6 +1875,21 @@ void Graphics::resizeScreen(int width, int height) {
     glState.scissorBox.set(IntRect(0, 0, p->scRes.x, p->scRes.y));
     
     shState->eThread().requestWindowResize(width, height);
+    
+    /* ARC: the box the picture is drawn into depends on the aspect ratio of
+     * the game screen (682x384 is 16:9, the start is 640x480 = 4:3).  On the
+     * phone the window never answers requestWindowResize with a "size
+     * changed" signal, so the old 4:3 box stayed and the 16:9 picture was
+     * squeezed into it.  Work the box out again right now. */
+    p->recalculateScreenSize(p->threadData->config.fixedAspectRatio);
+    p->updateScreenResoRatio(p->threadData);
+    
+    {
+        SDL_Rect screen = {p->scOffset.x, p->scOffset.y, p->scSize.x, p->scSize.y};
+        p->threadData->ethread->notifyGameScreenChange(screen);
+    }
+    
+    p->arcLogResize("해상도 바꿈");
 }
 
 void Graphics::resizeWindow(int width, int height, bool center) {

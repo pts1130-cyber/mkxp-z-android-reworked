@@ -22,6 +22,9 @@
 #include "scene.h"
 #include "sharedstate.h"
 
+#include <typeinfo>
+#include "arc-prof.h"
+
 Scene::Scene()
 {}
 
@@ -97,7 +100,25 @@ void Scene::composite()
 		SceneElement *e = iter->data;
 
 		if (e->visible)
+		{
+			/* ARC: log-only timing of every element's draw call, split by
+			 * element type (Sprite / Window / Viewport ...). Time spent in
+			 * elements nested inside this one (Viewport children) is taken
+			 * out so each type only gets its own share. */
+			ArcElemProf &prof = arcElemProf();
+			double outerChild = prof.childMs;
+			prof.childMs = 0;
+			uint64_t t0 = SDL_GetPerformanceCounter();
+
 			e->draw();
+
+			double total = arcTicksToMs(SDL_GetPerformanceCounter() - t0);
+			double own = total - prof.childMs;
+			if (own < 0)
+				own = 0;
+			prof.add(arcShortName(typeid(*e).name()), own);
+			prof.childMs = outerChild + total;
+		}
 	}
 }
 

@@ -25,6 +25,7 @@
 #include "util/debugwriter.h"
 #include "util/exception.h"
 #include "util/util.h"
+#include "util/arc-prof.h"
 #include "display/font.h"
 #include "crypto/rgssad.h"
 
@@ -34,6 +35,8 @@
 #include <physfs.h>
 
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <stack>
 #include <unordered_map>
 #include <stdio.h>
@@ -194,6 +197,16 @@ static Sint64 SDL_RWopsSeek(SDL_RWops *ops, int64_t offset, int whence) {
   return (result != 0) ? PHYSFS_tell(f) : -1;
 }
 
+/* ARC: read-call statistics for the log (see arc-prof.h) */
+uint64_t arcRwCalls = 0;
+uint64_t arcRwBytes = 0;
+
+/* ARC: every file we open for reading gets a read buffer. Decoders such as
+ * stb_vorbis / libpng ask for the file a few bytes at a time and, on the
+ * phone's shared storage, every read call costs ~20 us. With a buffer those
+ * tiny reads are answered from memory. */
+#define ARC_READ_BUFFER (64 * 1024)
+
 static size_t SDL_RWopsRead(SDL_RWops *ops, void *buffer, size_t size,
                             size_t maxnum) {
   PHYSFS_File *f = sdlPHYS(ops);
@@ -202,6 +215,10 @@ static size_t SDL_RWopsRead(SDL_RWops *ops, void *buffer, size_t size,
     return 0;
 
   PHYSFS_sint64 result = PHYSFS_readBytes(f, buffer, size * maxnum);
+
+  __atomic_fetch_add(&arcRwCalls, 1, __ATOMIC_RELAXED);
+  if (result > 0)
+    __atomic_fetch_add(&arcRwBytes, (uint64_t)result, __ATOMIC_RELAXED);
 
   return (result != -1) ? (result / size) : 0;
 }
@@ -306,8 +323,12 @@ struct FileSystemPrivate {
   bool havePathCache;
 
   /* ARC: lazy per-directory listing cache used when the full path
-   * cache is off (key: directory path as given, value: file names) */
-  std::unordered_map<std::string, std::vector<std::string>> dirListCache;
+   * cache is off (key: directory path as given, value: file names).
+   * Files are opened from more than one thread (game + audio streaming),
+   * so the map is guarded and listings are shared, never modified. */
+  std::unordered_map<std::string, std::shared_ptr<const std::vector<std::string>>>
+      dirListCache;
+  std::mutex dirListLock;
 };
 
 static PHYSFS_EnumerateCallbackResult
@@ -384,6 +405,11 @@ void FileSystem::addPath(const char *path, const char *mountpoint, bool reload) 
         throw Exception(Exception::PHYSFSError, "Failed to mount %s (%s)", path, PHYSFS_getErrorByCode(err));
     }
     
+    { /* ARC: folder listings may have changed */
+        std::lock_guard<std::mutex> lock(p->dirListLock);
+        p->dirListCache.clear();
+    }
+    
     if (reload) reloadPathCache();
 }
 
@@ -392,6 +418,11 @@ void FileSystem::removePath(const char *path, bool reload) {
     if (!PHYSFS_unmount(path)) {
         PHYSFS_ErrorCode err = PHYSFS_getLastErrorCode();
         throw Exception(Exception::PHYSFSError, "Failed to unmount %s (%s)", path, PHYSFS_getErrorByCode(err));
+    }
+    
+    { /* ARC: folder listings may have changed */
+        std::lock_guard<std::mutex> lock(p->dirListLock);
+        p->dirListCache.clear();
     }
     
     if (reload) reloadPathCache();
@@ -638,6 +669,7 @@ openReadEnumCB(void *d, const char *dirpath, const char *filename) {
 
     return PHYSFS_ENUM_ERROR;
   }
+  PHYSFS_setBuffer(phys, ARC_READ_BUFFER);
   initReadOps(phys, data.ops, false);
 
   const char *ext = findExt(filename);
@@ -688,46 +720,55 @@ void FileSystem::openRead(OpenHandler &handler, const char *filename) {
       openReadEnumCB(&data, dir, fileList[i].c_str());
   } else {
     /* ARC: list each directory only once (enumerating big folders on
-     * every image load was the slow part), then match from the list */
+     * every image load was the slow part), then match from the list.
+     * Matching itself is exactly what it was: the names are handed to
+     * openReadEnumCB in the order PhysFS lists them. */
     std::string dirKey(dir);
-    auto it = p->dirListCache.find(dirKey);
-    if (it == p->dirListCache.end()) {
-      std::vector<std::string> names;
-      if (PHYSFS_enumerate(dir, collectNamesCB, &names) != 0)
-        it = p->dirListCache.emplace(dirKey, std::move(names)).first;
-      else
-        PHYSFS_enumerate(dir, openReadEnumCB, &data); /* old behaviour */
-    }
-    if (it != p->dirListCache.end()) {
-      const std::vector<std::string> &names = it->second;
-      for (size_t i = 0; i < names.size() && !data.stopSearching; ++i)
-        openReadEnumCB(&data, dir, names[i].c_str());
 
-      /* case-insensitive fallback, only when nothing matched exactly */
-      if (data.matchCount == 0 && !data.physfsError) {
-        std::string want(file);
-        strTolower(want);
-        for (size_t i = 0; i < names.size() && !data.stopSearching; ++i) {
-          const std::string &nm = names[i];
-          if (nm.size() < want.size())
-            continue;
-          std::string low = nm;
-          strTolower(low);
-          if (low.compare(0, want.size(), want) != 0)
-            continue;
-          char last = low.size() > want.size() ? low[want.size()] : '\0';
-          if (last != '.' && last != '\0')
-            continue;
-          std::string real = nm.substr(0, want.size());
-          OpenReadEnumData d2(handler, real.c_str(), real.size(),
-                              (BoostHash<std::string, std::string> *)0);
-          openReadEnumCB(&d2, dir, nm.c_str());
-          data.matchCount += d2.matchCount;
-          data.stopSearching = d2.stopSearching;
-          if (d2.physfsError)
-            data.physfsError = d2.physfsError;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      std::shared_ptr<const std::vector<std::string>> listing;
+      bool fromCache = false;
+
+      if (attempt == 0) {
+        std::lock_guard<std::mutex> lock(p->dirListLock);
+        auto it = p->dirListCache.find(dirKey);
+        if (it != p->dirListCache.end()) {
+          listing = it->second;
+          fromCache = true;
         }
       }
+
+      if (!listing) {
+        std::vector<std::string> names;
+
+        if (PHYSFS_enumerate(dir, collectNamesCB, &names) != 0) {
+          listing = std::make_shared<const std::vector<std::string>>(std::move(names));
+          std::lock_guard<std::mutex> lock(p->dirListLock);
+          p->dirListCache[dirKey] = listing;
+        } else {
+          /* cannot list it: do it the old way (reports the error the old way) */
+          {
+            std::lock_guard<std::mutex> lock(p->dirListLock);
+            p->dirListCache.erase(dirKey);
+          }
+          PHYSFS_enumerate(dir, openReadEnumCB, &data);
+          break;
+        }
+      }
+
+      for (size_t i = 0; i < listing->size() && !data.stopSearching; ++i)
+        openReadEnumCB(&data, dir, (*listing)[i].c_str());
+
+      /* A listing made earlier can be out of date (a file the game wrote or
+       * deleted since, a newly mounted folder). If it found nothing or ran
+       * into a file that is gone, list the folder again once, so the answer
+       * is the same as if the folder had been listed just now. */
+      if (!fromCache || (data.matchCount != 0 && !data.physfsError))
+        break;
+
+      data.matchCount = 0;
+      data.physfsError = 0;
+      data.stopSearching = false;
     }
   }
 
@@ -746,6 +787,7 @@ void FileSystem::openReadRaw(SDL_RWops &ops, const char *filename,
   if (!handle)
     throw Exception(Exception::NoFileError, "%s", filename);
 
+  PHYSFS_setBuffer(handle, ARC_READ_BUFFER);
   initReadOps(handle, ops, freeOnClose);
     return;
 }
