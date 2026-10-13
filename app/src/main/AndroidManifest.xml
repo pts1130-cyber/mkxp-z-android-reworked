@@ -55,7 +55,7 @@
             android:label="mkxp-z"
             android:alwaysRetainTaskState="true"
             android:launchMode="singleTask"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="fullSensor"
             android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
             android:resizeableActivity="true"
             android:preferMinimalPostProcessing="true"
