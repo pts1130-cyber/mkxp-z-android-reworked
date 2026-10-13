@@ -966,6 +966,11 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
      */
     public void setOrientationBis(int w, int h, boolean resizable, String hint)
     {
+        // ARC: always follow the device sensor (landscape + portrait). SDL would
+        // otherwise lock the orientation from the initial window size (landscape).
+        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
+        if (true) return;
+
         int orientation_landscape = -1;
         int orientation_portrait = -1;
 
