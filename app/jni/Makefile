@@ -77,7 +77,7 @@ else ifeq ($(ABI), arm64-v8a)
 endif
 
 # Compiler/linker flags
-CFLAGS      := -O0 $(CROSSFLAGS) --sysroot=$(TOOLCHAIN)/sysroot -I$(TOOLCHAIN)/sysroot/usr/include -I$(INCDIR)
+CFLAGS      := -O2 $(CROSSFLAGS) --sysroot=$(TOOLCHAIN)/sysroot -I$(TOOLCHAIN)/sysroot/usr/include -I$(INCDIR)
 LDFLAGS     := -L$(LIBDIR) -lm -lz
 CLANG_FLAGS := -target $(TARGET) --gcc-toolchain $(TOOLCHAIN)
 
