@@ -18,8 +18,8 @@ public class GamepadConfig
 
     /** Key bindings for each RGSS input **/
     public final Integer keycodeA = KeyEvent.KEYCODE_Z;
-    public final Integer keycodeB = KeyEvent.KEYCODE_X;
-    public final Integer keycodeC = KeyEvent.KEYCODE_C;
+    public final Integer keycodeB = KeyEvent.KEYCODE_C;   // v1.0.10: 화면 가운데 줄 왼쪽 버튼 = C (리키 요청: C/X 자리 바꿈)
+    public final Integer keycodeC = KeyEvent.KEYCODE_X;   // v1.0.10: 화면 가운데 줄 오른쪽 버튼 = X
     public final Integer keycodeX = KeyEvent.KEYCODE_A;
     public final Integer keycodeY = KeyEvent.KEYCODE_S;
     public final Integer keycodeZ = KeyEvent.KEYCODE_D;
