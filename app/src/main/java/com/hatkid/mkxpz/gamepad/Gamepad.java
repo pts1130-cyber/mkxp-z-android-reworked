@@ -104,6 +104,14 @@ public class Gamepad
         ViewUtils.changeOpacity(mGamepadLayout, mGamepadConfig.opacity);
     }
 
+    public void detachFrom(ViewGroup viewGroup)
+    {
+        if (mGamepadLayout != null) {
+            viewGroup.removeView(mGamepadLayout);
+            mGamepadLayout = null;
+        }
+    }
+
     private void setGamepadButtonKey(GamepadButton gpadBtn, Integer keycode)
     {
         // Prepare label for gamepad button

@@ -6,14 +6,14 @@ public class GamepadConfig
 {
     /** In-screen gamepad settings **/
 
-    // Opacity of view elements in percentage (default: 30)
+    // Opacity of view elements in percentage (semi-transparent, default: 30)
     public Integer opacity = 30;
 
     // View elements scale in percentage (default: 100)
     public Integer scale = 100;
 
     // Whether use diagonal (8-way) movement on D-Pad (default: false)
-    public Boolean diagonalMovement = false;
+    public Boolean diagonalMovement = true;
 
     /** Key bindings for each RGSS input **/
     public final Integer keycodeA = KeyEvent.KEYCODE_Z;
@@ -24,7 +24,7 @@ public class GamepadConfig
     public final Integer keycodeZ = KeyEvent.KEYCODE_D;
     public final Integer keycodeL = KeyEvent.KEYCODE_Q;
     public final Integer keycodeR = KeyEvent.KEYCODE_W;
-    public final Integer keycodeCTRL = KeyEvent.KEYCODE_CTRL_LEFT;
-    public final Integer keycodeALT = KeyEvent.KEYCODE_ALT_LEFT;
+    public final Integer keycodeCTRL = KeyEvent.KEYCODE_F12;
+    public final Integer keycodeALT = KeyEvent.KEYCODE_F9;
     public final Integer keycodeSHIFT = KeyEvent.KEYCODE_SHIFT_LEFT;
 }
