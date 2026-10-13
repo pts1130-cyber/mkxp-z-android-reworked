@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.content.pm.PackageManager;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -141,6 +142,21 @@ public class MainActivity extends SDLActivity
 
         if (mLayout != null) {
             mGamepad.attachTo(this, mLayout);
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig)
+    {
+        super.onConfigurationChanged(newConfig);
+
+        // Rotation: re-inflate gamepad so layout / layout-port is picked up
+        if (mLayout != null) {
+            boolean hidden = (isAndroidTV() || isChromebook());
+            mGamepad.detachFrom(mLayout);
+            mGamepad.init(new GamepadConfig(), hidden);
+            mGamepad.attachTo(this, mLayout);
+            mGamepadInvisible = hidden;
         }
     }
 
