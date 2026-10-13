@@ -28,6 +28,9 @@
 #include "sharedstate.h"
 #include "graphics.h"
 
+#include <vector>
+#include <algorithm>
+
 #if RAPI_FULL > 187
 DEF_TYPE(Bitmap);
 #else
@@ -718,6 +721,93 @@ RB_METHOD(bitmapInitializeCopy) {
     return self;
 }
 
+/* ===== ARC: native glow-layer builder (alpha only) =====
+ * Same result as AlphaBattleGlow.build_layer: copy the silhouette, grow it
+ * `extent` times by "over" blending shifted copies (cross / 3x3 alternating),
+ * then `blur` passes of the engine's 3-tap box blur (H then V).
+ * Only alpha matters (the layer sprite is tinted with a flat colour).
+ * Bitmap.arc_glow_alpha(raw, w, h, rx, ry, rw, rh, extent, blur)
+ *   -> [rgba_string, out_w, out_h, pad]                                  */
+RB_METHOD(bitmapArcGlowAlpha) {
+    RB_UNUSED_PARAM;
+    rb_check_argc(argc, 9);
+    VALUE raw = argv[0];
+    SafeStringValue(raw);
+    const int w = NUM2INT(argv[1]), h = NUM2INT(argv[2]);
+    const int rx = NUM2INT(argv[3]), ry = NUM2INT(argv[4]);
+    const int rw = NUM2INT(argv[5]), rh = NUM2INT(argv[6]);
+    const int extent = NUM2INT(argv[7]), blur = NUM2INT(argv[8]);
+
+    if (w <= 0 || h <= 0 || rw <= 0 || rh <= 0 || rx < 0 || ry < 0 ||
+        rx + rw > w || ry + rh > h || extent < 0 || extent > 64 ||
+        blur < 0 || blur > 16 || (long)RSTRING_LEN(raw) != (long)w * h * 4)
+        rb_raise(rb_eArgError, "arc_glow_alpha: bad arguments");
+
+    const int pad = extent + blur * 2;
+    const int W = rw + pad * 2, H = rh + pad * 2;
+    const unsigned char *src = (const unsigned char *)RSTRING_PTR(raw);
+
+    std::vector<unsigned char> cur((size_t)W * H, 0), nxt((size_t)W * H, 0), tmp((size_t)W * H, 0);
+    for (int y = 0; y < rh; ++y)
+        for (int x = 0; x < rw; ++x)
+            cur[(size_t)(y + pad) * W + (x + pad)] = src[((size_t)(ry + y) * w + (rx + x)) * 4 + 3];
+
+    static const int dirsEven[5][2] = {{0,0},{1,0},{-1,0},{0,1},{0,-1}};
+    static const int dirsOdd[9][2] = {{0,0},{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
+
+    for (int r = 0; r < extent; ++r) {
+        const bool even = (r % 2 == 0);
+        const int nd = even ? 5 : 9;
+        std::fill(nxt.begin(), nxt.end(), 0);
+        for (int di = 0; di < nd; ++di) {
+            const int dx = even ? dirsEven[di][0] : dirsOdd[di][0];
+            const int dy = even ? dirsEven[di][1] : dirsOdd[di][1];
+            const int x0 = dx > 0 ? dx : 0;
+            const int x1 = W + (dx < 0 ? dx : 0);
+            for (int sy = 0; sy < H; ++sy) {
+                const int ty = sy + dy;
+                if (ty < 0 || ty >= H) continue;
+                const unsigned char *cr = &cur[(size_t)sy * W] - dx;
+                unsigned char *nr = &nxt[(size_t)ty * W];
+                /* branch-free so the compiler can vectorise it */
+                for (int tx = x0; tx < x1; ++tx) {
+                    const unsigned sa = cr[tx];
+                    const unsigned da = nr[tx];
+                    const unsigned v = da * (255u - sa) + 128u;
+                    nr[tx] = (unsigned char)(sa + ((v + (v >> 8)) >> 8));
+                }
+            }
+        }
+        cur.swap(nxt);
+    }
+
+    for (int b = 0; b < blur; ++b) {
+        for (int y = 0; y < H; ++y) {
+            const unsigned char *c = &cur[(size_t)y * W];
+            unsigned char *t = &tmp[(size_t)y * W];
+            for (int x = 0; x < W; ++x) {
+                const int l = c[x > 0 ? x - 1 : 0], m = c[x], rr = c[x < W - 1 ? x + 1 : W - 1];
+                t[x] = (unsigned char)((2 * (l + m + rr) + 3) / 6);
+            }
+        }
+        for (int y = 0; y < H; ++y) {
+            const unsigned char *u = &tmp[(size_t)(y > 0 ? y - 1 : 0) * W];
+            const unsigned char *m = &tmp[(size_t)y * W];
+            const unsigned char *d = &tmp[(size_t)(y < H - 1 ? y + 1 : H - 1) * W];
+            unsigned char *o = &cur[(size_t)y * W];
+            for (int x = 0; x < W; ++x)
+                o[x] = (unsigned char)((2 * (u[x] + m[x] + d[x]) + 3) / 6);
+        }
+    }
+
+    VALUE out = rb_str_new(0, (long)W * H * 4);
+    unsigned char *op = (unsigned char *)RSTRING_PTR(out);
+    for (size_t i = 0, n = (size_t)W * H; i < n; ++i) {
+        op[i * 4] = 255; op[i * 4 + 1] = 255; op[i * 4 + 2] = 255; op[i * 4 + 3] = cur[i];
+    }
+    return rb_ary_new3(4, out, INT2NUM(W), INT2NUM(H), INT2NUM(pad));
+}
+
 void bitmapBindingInit() {
     VALUE klass = rb_define_class("Bitmap", rb_cObject);
 #if RAPI_FULL > 187
@@ -753,6 +843,7 @@ void bitmapBindingInit() {
     _rb_define_method(klass, "blur", bitmapBlur);
     _rb_define_method(klass, "radial_blur", bitmapRadialBlur);
     
+    rb_define_singleton_method(klass, "arc_glow_alpha", RUBY_METHOD_FUNC(bitmapArcGlowAlpha), -1);
     _rb_define_method(klass, "mega?", bitmapGetMega);
     rb_define_singleton_method(klass, "max_size", RUBY_METHOD_FUNC(bitmapGetMaxSize), -1);
     
