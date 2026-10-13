@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <stack>
+#include <unordered_map>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -303,7 +304,18 @@ struct FileSystemPrivate {
   /* This is for compatibility with games that take Windows'
    * case insensitivity for granted */
   bool havePathCache;
+
+  /* ARC: lazy per-directory listing cache used when the full path
+   * cache is off (key: directory path as given, value: file names) */
+  std::unordered_map<std::string, std::vector<std::string>> dirListCache;
 };
+
+static PHYSFS_EnumerateCallbackResult
+collectNamesCB(void *d, const char *origdir, const char *fname) {
+  (void)origdir;
+  static_cast<std::vector<std::string> *>(d)->push_back(fname);
+  return PHYSFS_ENUM_OK;
+}
 
 static void throwPhysfsError(const char *desc) {
   PHYSFS_ErrorCode ec = PHYSFS_getLastErrorCode();
@@ -675,7 +687,48 @@ void FileSystem::openRead(OpenHandler &handler, const char *filename) {
     for (size_t i = 0; i < fileList.size(); ++i)
       openReadEnumCB(&data, dir, fileList[i].c_str());
   } else {
-    PHYSFS_enumerate(dir, openReadEnumCB, &data);
+    /* ARC: list each directory only once (enumerating big folders on
+     * every image load was the slow part), then match from the list */
+    std::string dirKey(dir);
+    auto it = p->dirListCache.find(dirKey);
+    if (it == p->dirListCache.end()) {
+      std::vector<std::string> names;
+      if (PHYSFS_enumerate(dir, collectNamesCB, &names) != 0)
+        it = p->dirListCache.emplace(dirKey, std::move(names)).first;
+      else
+        PHYSFS_enumerate(dir, openReadEnumCB, &data); /* old behaviour */
+    }
+    if (it != p->dirListCache.end()) {
+      const std::vector<std::string> &names = it->second;
+      for (size_t i = 0; i < names.size() && !data.stopSearching; ++i)
+        openReadEnumCB(&data, dir, names[i].c_str());
+
+      /* case-insensitive fallback, only when nothing matched exactly */
+      if (data.matchCount == 0 && !data.physfsError) {
+        std::string want(file);
+        strTolower(want);
+        for (size_t i = 0; i < names.size() && !data.stopSearching; ++i) {
+          const std::string &nm = names[i];
+          if (nm.size() < want.size())
+            continue;
+          std::string low = nm;
+          strTolower(low);
+          if (low.compare(0, want.size(), want) != 0)
+            continue;
+          char last = low.size() > want.size() ? low[want.size()] : '\0';
+          if (last != '.' && last != '\0')
+            continue;
+          std::string real = nm.substr(0, want.size());
+          OpenReadEnumData d2(handler, real.c_str(), real.size(),
+                              (BoostHash<std::string, std::string> *)0);
+          openReadEnumCB(&d2, dir, nm.c_str());
+          data.matchCount += d2.matchCount;
+          data.stopSearching = d2.stopSearching;
+          if (d2.physfsError)
+            data.physfsError = d2.physfsError;
+        }
+      }
+    }
   }
 
   if (data.physfsError)
