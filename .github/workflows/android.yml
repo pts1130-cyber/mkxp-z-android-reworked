@@ -55,6 +55,8 @@ jobs:
       # ── 5. Android SDK ────────────────────────────────────────────────────────
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+             packages: 'platform-tools'
 
       - name: Install Android NDK ${{ env.ANDROID_NDK_VERSION }}
         run: |
