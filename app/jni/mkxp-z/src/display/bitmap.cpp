@@ -55,6 +55,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <algorithm>
+#include <vector>
+#include <string.h>
 
 extern "C" {
 #include "libnsgif/libnsgif.h"
@@ -241,10 +243,23 @@ struct BitmapPrivate
      * ourselves the expensive blending calculation */
     pixman_region16_t tainted;
     
+    /* ARC: set_pixel batching. A script that calls set_pixel tens of
+     * thousands of times used to do one 1x1 glTexSubImage2D per call (0.5 s
+     * freeze on the phone). Now the pixels are written to the CPU copy
+     * (surface) and the changed rectangle is uploaded ONCE, right before the
+     * texture is used by anything else (flushPending is called from every
+     * path that touches the GL texture/FBO of this bitmap). */
+    bool pendDirty;
+    int pendX1, pendY1, pendX2, pendY2;   /* bounding box, x2/y2 exclusive */
+    int spStreak;                         /* consecutive setPixel calls */
+    
     BitmapPrivate(Bitmap *self)
     : self(self),
     megaSurface(0),
-    surface(0)
+    surface(0),
+    pendDirty(false),
+    pendX1(0), pendY1(0), pendX2(0), pendY2(0),
+    spStreak(0)
     {
         format = SDL_AllocFormat(SDL_PIXELFORMAT_ABGR8888);
         
@@ -271,7 +286,50 @@ struct BitmapPrivate
         pixman_region_fini(&tainted);
     }
     
+    /* ARC: upload the pixels written by batched setPixel calls */
+    void flushPending()
+    {
+        spStreak = 0;
+        
+        if (!pendDirty)
+            return;
+        
+        pendDirty = false;
+        
+        if (!surface || animation.enabled)
+            return;
+        
+        int w = pendX2 - pendX1;
+        int h = pendY2 - pendY1;
+        
+        if (w <= 0 || h <= 0)
+            return;
+        
+        const uint8_t *base = (const uint8_t *) surface->pixels;
+        
+        TEX::bind(gl.tex);
+        
+        if (w == surface->w)
+        {
+            /* full rows are contiguous in the surface */
+            TEX::uploadSubImage(0, pendY1, w, h,
+                                base + (size_t) pendY1 * surface->pitch, GL_RGBA);
+        }
+        else
+        {
+            std::vector<uint8_t> tmp((size_t) w * h * 4);
+            
+            for (int row = 0; row < h; ++row)
+                memcpy(&tmp[(size_t) row * w * 4],
+                       base + (size_t) (pendY1 + row) * surface->pitch + (size_t) pendX1 * 4,
+                       (size_t) w * 4);
+            
+            TEX::uploadSubImage(pendX1, pendY1, w, h, tmp.data(), GL_RGBA);
+        }
+    }
+    
     TEXFBO &getGLTypes() {
+        flushPending();
         return (animation.enabled) ? animation.currentFrame() : gl;
     }
     
@@ -331,6 +389,8 @@ struct BitmapPrivate
     
     void bindTexture(ShaderBase &shader)
     {
+        flushPending();
+        
         if (animation.enabled) {
             TEXFBO cframe = animation.currentFrame();
             TEX::bind(cframe.tex);
@@ -343,6 +403,7 @@ struct BitmapPrivate
     
     void bindFBO()
     {
+        flushPending();
         FBO::bind((animation.enabled) ? animation.currentFrame().fbo : gl.fbo);
     }
     
@@ -392,6 +453,9 @@ struct BitmapPrivate
     
     void onModified(bool freeSurface = true)
     {
+        if (freeSurface)
+            flushPending();   /* safety net: never lose batched pixels */
+        
         if (surface && freeSurface)
         {
             SDL_FreeSurface(surface);
@@ -1133,6 +1197,7 @@ void Bitmap::blur()
     glState.blend.pushSet(false);
     glState.viewport.pushSet(IntRect(0, 0, width(), height()));
     
+    p->flushPending();
     TEX::bind(p->gl.tex);
     FBO::bind(auxTex.fbo);
     
@@ -1328,6 +1393,52 @@ void Bitmap::setPixel(int x, int y, const Color &color)
         (uint8_t) clamp<double>(color.blue,  0, 255),
         (uint8_t) clamp<double>(color.alpha, 0, 255)
     };
+    
+    /* ARC: batch long runs of setPixel calls (see BitmapPrivate::flushPending).
+     * A lone setPixel keeps the old immediate upload so single calls do not
+     * pay for a full read-back of the bitmap. Out-of-range coordinates keep
+     * the old (GL decides) path as well. */
+    bool inRange = x >= 0 && y >= 0 && x < width() && y < height();
+    
+    if (inRange && (p->surface || p->spStreak >= 32))
+    {
+        if (!p->surface)
+        {
+            p->allocSurface();
+            
+            FBO::bind(p->gl.fbo);
+            
+            glState.viewport.pushSet(IntRect(0, 0, width(), height()));
+            
+            gl.ReadPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
+            
+            glState.viewport.pop();
+        }
+        
+        uint32_t &surfPixel = getPixelAt(p->surface, p->format, x, y);
+        surfPixel = SDL_MapRGBA(p->format, pixel[0], pixel[1], pixel[2], pixel[3]);
+        
+        if (!p->pendDirty)
+        {
+            p->pendDirty = true;
+            p->pendX1 = x;     p->pendY1 = y;
+            p->pendX2 = x + 1; p->pendY2 = y + 1;
+        }
+        else
+        {
+            if (x < p->pendX1)     p->pendX1 = x;
+            if (y < p->pendY1)     p->pendY1 = y;
+            if (x + 1 > p->pendX2) p->pendX2 = x + 1;
+            if (y + 1 > p->pendY2) p->pendY2 = y + 1;
+        }
+        
+        ++p->spStreak;
+        p->addTaintedArea(IntRect(x, y, 1, 1));
+        p->onModified(false);
+        return;
+    }
+    
+    ++p->spStreak;
     
     TEX::bind(p->gl.tex);
     TEX::uploadSubImage(x, y, 1, 1, &pixel, GL_RGBA);
@@ -1594,6 +1705,8 @@ void Bitmap::drawText(const IntRect &rect, const char *str, int align)
     GUARD_MEGA;
     GUARD_ANIMATED;
     
+    p->flushPending();   /* ARC: batched setPixel data goes to the GPU first */
+    
     std::string fixed = fixupString(str);
     str = fixed.c_str();
     
@@ -1727,6 +1840,7 @@ void Bitmap::drawText(const IntRect &rect, const char *str, int align)
                     posRect.h = inters.h;
                 }
                 
+                p->flushPending();
                 TEX::bind(p->gl.tex);
                 
                 if (!subImage)
@@ -2004,6 +2118,9 @@ int Bitmap::addFrame(Bitmap &source, int position)
     if (source.height() != height() || source.width() != width())
         throw Exception(Exception::MKXPError, "Animations with varying dimensions are not supported (%ix%i vs %ix%i)",
                         source.width(), source.height(), width(), height());
+    
+    p->flushPending();
+    source.p->flushPending();
     
     TEXFBO newframe = shState->texPool().request(source.width(), source.height());
     
