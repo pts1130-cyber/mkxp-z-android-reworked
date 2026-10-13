@@ -2,7 +2,11 @@
 
 #ifdef FRAGMENT_SHADER
 /* Only the fragment shader has no default float precision */
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 #endif
 
 #else
