@@ -7,6 +7,11 @@ import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.content.pm.PackageManager;
 import android.view.KeyEvent;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.MotionEvent;
 import android.view.InputDevice;
 import android.os.Build;
@@ -142,6 +147,49 @@ public class MainActivity extends SDLActivity
 
         if (mLayout != null) {
             mGamepad.attachTo(this, mLayout);
+        }
+
+        arcApplyFullscreen();
+    }
+
+    // ARC: force true full-screen (cut-out area + hidden system bars) at start and
+    // every time the window gets focus, so the first screen is not small/letterboxed.
+    private void arcApplyFullscreen()
+    {
+        try {
+            Window w = getWindow();
+            if (Build.VERSION.SDK_INT >= 28) {
+                WindowManager.LayoutParams lp = w.getAttributes();
+                lp.layoutInDisplayCutoutMode = (Build.VERSION.SDK_INT >= 30)
+                    ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                w.setAttributes(lp);
+            }
+            w.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            View d = w.getDecorView();
+            d.setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            d.requestLayout();
+        } catch (Throwable e) {
+            Log.w(TAG, "arcApplyFullscreen failed: " + e);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus)
+    {
+        super.onWindowFocusChanged(hasFocus);
+
+        if (hasFocus) {
+            arcApplyFullscreen();
+            Handler h = new Handler(Looper.getMainLooper());
+            h.postDelayed(this::arcApplyFullscreen, 400);
+            h.postDelayed(this::arcApplyFullscreen, 1500);
         }
     }
 
