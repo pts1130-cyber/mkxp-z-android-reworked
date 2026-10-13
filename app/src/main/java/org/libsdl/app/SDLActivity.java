@@ -1944,10 +1944,12 @@ class DummyEdit extends View implements View.OnKeyListener {
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         ic = new SDLInputConnection(this, true);
 
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT |
-                             InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+        // ARC: single-line field + Done action, so the soft keyboard shows a
+        // "확인/Done" key (sends Enter) instead of a newline key.
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT;
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI |
-                              EditorInfo.IME_FLAG_NO_FULLSCREEN /* API 11 */;
+                              EditorInfo.IME_FLAG_NO_FULLSCREEN /* API 11 */ |
+                              EditorInfo.IME_ACTION_DONE;
 
         return ic;
     }
@@ -1989,6 +1991,15 @@ class SDLInputConnection extends BaseInputConnection {
         }
 
         return super.sendKeyEvent(event);
+    }
+
+    @Override
+    public boolean performEditorAction(int actionCode) {
+        // Done/Go/Search/Send key -> behave like a hardware Enter press.
+        long t = android.os.SystemClock.uptimeMillis();
+        sendKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER, 0));
+        sendKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER, 0));
+        return true;
     }
 
     @Override
