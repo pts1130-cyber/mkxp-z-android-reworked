@@ -52,6 +52,7 @@
 #include "sigslot/signal.hpp"
 
 #include <math.h>
+#include <stdio.h>
 #include <algorithm>
 
 extern "C" {
@@ -400,6 +401,26 @@ struct BitmapPrivate
     }
 };
 
+/* ARC: image-load timing (file read vs decode) -> _log/engine_img.txt */
+static size_t (*arcOrigRead)(SDL_RWops *, void *, size_t, size_t) = 0;
+static Uint64 arcReadTicks = 0;
+static size_t arcReadBytes = 0, arcReadCalls = 0;
+
+static size_t arcTimedRead(SDL_RWops *ctx, void *ptr, size_t size, size_t maxnum)
+{
+    Uint64 a = SDL_GetPerformanceCounter();
+    size_t r = arcOrigRead(ctx, ptr, size, maxnum);
+    arcReadTicks += SDL_GetPerformanceCounter() - a;
+    ++arcReadCalls;
+    arcReadBytes += r * size;
+    return r;
+}
+
+static double arcMs(Uint64 ticks)
+{
+    return (double)ticks * 1000.0 / (double)SDL_GetPerformanceFrequency();
+}
+
 struct BitmapOpenHandler : FileSystem::OpenHandler
 {
     // Non-GIF
@@ -411,9 +432,13 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
     unsigned char *gif_data;
     size_t gif_data_size;
     
+    // ARC timing
+    double readMs, decodeMs;
+    size_t readBytes, readCalls;
     
     BitmapOpenHandler()
-    : surface(0), gif(0), gif_data(0), gif_data_size(0)
+    : surface(0), gif(0), gif_data(0), gif_data_size(0),
+      readMs(0), decodeMs(0), readBytes(0), readCalls(0)
     {}
     
     bool tryRead(SDL_RWops &ops, const char *ext)
@@ -461,7 +486,16 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
                 return false;
             }
         } else {
+            arcOrigRead = ops.read;
+            arcReadTicks = 0; arcReadBytes = 0; arcReadCalls = 0;
+            ops.read = arcTimedRead;
+            Uint64 t0 = SDL_GetPerformanceCounter();
             surface = IMG_LoadTyped_RW(&ops, 1, ext);
+            Uint64 total = SDL_GetPerformanceCounter() - t0;
+            readMs = arcMs(arcReadTicks);
+            decodeMs = arcMs(total) - readMs;
+            readBytes = arcReadBytes;
+            readCalls = arcReadCalls;
         }
         return (surface || gif);
     }
@@ -469,8 +503,10 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
 
 Bitmap::Bitmap(const char *filename)
 {
+    Uint64 arcT0 = SDL_GetPerformanceCounter();
     BitmapOpenHandler handler;
     shState->fileSystem().openRead(handler, filename);
+    Uint64 arcT1 = SDL_GetPerformanceCounter();
     
     if (!handler.error.empty()) {
         // Not loaded with SDL, but I want it to be caught with the same exception type
@@ -612,6 +648,24 @@ Bitmap::Bitmap(const char *filename)
     }
     
     p->addTaintedArea(rect());
+    
+    {
+        /* ARC: log slow loads */
+        Uint64 arcT2 = SDL_GetPerformanceCounter();
+        double total = arcMs(arcT2 - arcT0);
+        if (total >= 100.0)
+        {
+            FILE *lf = fopen("_log/engine_img.txt", "a");
+            if (lf)
+            {
+                fprintf(lf, "%.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s\n",
+                        total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
+                        handler.readMs, handler.readBytes, handler.readCalls,
+                        handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename);
+                fclose(lf);
+            }
+        }
+    }
 }
 
 Bitmap::Bitmap(int width, int height)
