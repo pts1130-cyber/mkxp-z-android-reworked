@@ -194,59 +194,38 @@
         </LinearLayout>
     </RelativeLayout>
 
+    <!-- F12(CTRL) 은 방향키 바로 위 왼쪽, F9(ALT) 는 오른쪽 끝 위쪽 — 가운데 아래에 붙어 있으면 방향키를 누르다 F12(게임 리셋)가 눌림(리키 요청, 조이플레이 배치 참고) -->
     <RelativeLayout
         android:id="@+id/buttons_mod_layout"
-        android:layout_width="@dimen/_145sdp"
-        android:layout_height="@dimen/_23sdp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
         android:layout_alignParentBottom="true"
-        android:layout_centerHorizontal="true"
-        android:layout_marginStart="@dimen/_10sdp"
-        android:layout_marginTop="@dimen/_10sdp"
-        android:layout_marginEnd="@dimen/_10sdp"
-        android:layout_marginBottom="0dp"
+        android:layout_marginBottom="@dimen/_134sdp"
     >
-        <LinearLayout
-            android:id="@+id/buttons_mod_row"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_alignParentTop="true"
-            android:layout_centerHorizontal="true"
-            android:orientation="horizontal"
-            tools:ignore="UselessParent"
-        >
-            <com.hatkid.mkxpz.gamepad.GamepadButton
-                android:id="@+id/button_CTRL"
-                android:layout_width="@dimen/_30sdp"
-                android:layout_height="@dimen/_16sdp"
-                android:layout_marginStart="@dimen/_14sdp"
-                android:layout_marginTop="@dimen/_2sdp"
-                android:layout_marginEnd="@dimen/_14sdp"
-                android:layout_marginBottom="@dimen/_2sdp"
-                app:bgDrawable="@drawable/gamepad_button_square"
-                tools:ignore="ImageContrastCheck"
-            />
-            <com.hatkid.mkxpz.gamepad.GamepadButton
-                android:id="@+id/button_ALT"
-                android:layout_width="@dimen/_30sdp"
-                android:layout_height="@dimen/_16sdp"
-                android:layout_marginStart="@dimen/_14sdp"
-                android:layout_marginTop="@dimen/_2sdp"
-                android:layout_marginEnd="@dimen/_14sdp"
-                android:layout_marginBottom="@dimen/_2sdp"
-                app:bgDrawable="@drawable/gamepad_button_square"
-                tools:ignore="ImageContrastCheck"
-            />
-            <com.hatkid.mkxpz.gamepad.GamepadButton
-                android:id="@+id/button_SHIFT"
-                android:layout_width="@dimen/_30sdp"
-                android:layout_height="@dimen/_16sdp"
-                android:layout_marginStart="@dimen/_14sdp"
-                android:layout_marginTop="@dimen/_2sdp"
-                android:layout_marginEnd="@dimen/_14sdp"
-                android:layout_marginBottom="@dimen/_2sdp"
-                app:bgDrawable="@drawable/gamepad_button_square"
-                tools:ignore="ImageContrastCheck"
-            />
-        </LinearLayout>
+        <com.hatkid.mkxpz.gamepad.GamepadButton
+            android:id="@+id/button_CTRL"
+            android:layout_width="@dimen/_34sdp"
+            android:layout_height="@dimen/_17sdp"
+            android:layout_alignParentStart="true"
+            android:layout_marginStart="@dimen/_52sdp"
+            app:bgDrawable="@drawable/gamepad_button_square"
+            tools:ignore="ImageContrastCheck"
+        />
+        <com.hatkid.mkxpz.gamepad.GamepadButton
+            android:id="@+id/button_ALT"
+            android:layout_width="@dimen/_34sdp"
+            android:layout_height="@dimen/_17sdp"
+            android:layout_alignParentEnd="true"
+            android:layout_marginEnd="@dimen/_52sdp"
+            app:bgDrawable="@drawable/gamepad_button_square"
+            tools:ignore="ImageContrastCheck"
+        />
+        <com.hatkid.mkxpz.gamepad.GamepadButton
+            android:id="@+id/button_SHIFT"
+            android:layout_width="@dimen/_1sdp"
+            android:layout_height="@dimen/_1sdp"
+            android:visibility="gone"
+            app:bgDrawable="@drawable/gamepad_button_square"
+        />
     </RelativeLayout>
 </RelativeLayout>
