@@ -1068,6 +1068,12 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         return false;
     }
 
+    /** ARC v1.0.13: true from SDL_StartTextInput until the game stops text input (even if the IME is dismissed). */
+    public static boolean arcTextEntryActive()
+    {
+        return mTextEdit != null && mScreenKeyboardShown;
+    }
+
     /**
      * This method is called by SDL using JNI.
      */
@@ -1984,21 +1990,50 @@ class SDLInputConnection extends BaseInputConnection {
          * as we do with physical keyboards, let's just use it to hide the keyboard.
          */
 
+        // ARC v1.0.13: Enter is no longer swallowed by onNativeSoftReturnKey (that only hid the
+        // keyboard and stopped text input, so the game never saw Enter). Real Enter is sent in
+        // performEditorAction below; ignore the extra Enter events some IMEs also send.
         if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) {
-            if (SDLActivity.onNativeSoftReturnKey()) {
-                return true;
-            }
+            return true;
         }
 
         return super.sendKeyEvent(event);
     }
 
+    // ---- ARC v1.0.13: serial key/text injection --------------------------------------------
+    // The game polls key state once per frame. A key down+up injected back to back is never
+    // seen as "pressed", which broke Backspace during IME composition (Korean "ㄱ가간가낟나다").
+    // So every injected key is held for ARC_KEY_HOLD_MS and operations are strictly serialised.
+    private static final String ARC_TAG = "ARC_IME";
+    private static final long ARC_KEY_HOLD_MS = 70;
+    private static final long ARC_KEY_GAP_MS = 70;
+    private static final Handler sArcHandler = new Handler(android.os.Looper.getMainLooper());
+    private static long sArcNextAt = 0;
+
+    private static void arcSchedule(Runnable r, long occupyMs) {
+        long now = android.os.SystemClock.uptimeMillis();
+        long at = Math.max(now, sArcNextAt);
+        sArcNextAt = at + occupyMs;
+        sArcHandler.postDelayed(r, at - now);
+    }
+
+    /** Press and release one Android keycode so the game's per-frame polling sees it. */
+    static void arcTapKey(final int keyCode) {
+        arcSchedule(new Runnable() {
+            @Override public void run() {
+                SDLActivity.onNativeKeyDown(keyCode);
+                sArcHandler.postDelayed(new Runnable() {
+                    @Override public void run() { SDLActivity.onNativeKeyUp(keyCode); }
+                }, ARC_KEY_HOLD_MS);
+            }
+        }, ARC_KEY_HOLD_MS + ARC_KEY_GAP_MS);
+    }
+
     @Override
     public boolean performEditorAction(int actionCode) {
-        // Done/Go/Search/Send key -> behave like a hardware Enter press.
-        long t = android.os.SystemClock.uptimeMillis();
-        sendKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER, 0));
-        sendKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER, 0));
+        // Done/Go/Search/Send key -> behave like a real Enter press, after any pending text.
+        Log.i(ARC_TAG, "editorAction=" + actionCode + " -> ENTER");
+        arcTapKey(KeyEvent.KEYCODE_ENTER);
         return true;
     }
 
@@ -2048,28 +2083,44 @@ class SDLInputConnection extends BaseInputConnection {
             matchLength += Character.charCount(codePoint);
         }
         /* FIXME: This doesn't handle graphemes, like '🌬️' */
+        int backspaces = 0;
         for (offset = matchLength; offset < mCommittedText.length(); ) {
             int codePoint = mCommittedText.codePointAt(offset);
-            nativeGenerateScancodeForUnichar('\b');
+            backspaces++;
             offset += Character.charCount(codePoint);
         }
 
+        String pendingText = "";
         if (matchLength < text.length()) {
-            String pendingText = text.subSequence(matchLength, text.length()).toString();
-            for (offset = 0; offset < pendingText.length(); ) {
-                int codePoint = pendingText.codePointAt(offset);
-                if (codePoint == '\n') {
-                    if (SDLActivity.onNativeSoftReturnKey()) {
-                        return;
+            pendingText = text.subSequence(matchLength, text.length()).toString();
+        }
+
+        Log.i(ARC_TAG, "update committed=\"" + mCommittedText + "\" text=\"" + text
+                + "\" match=" + matchLength + " backspaces=" + backspaces
+                + " pending=\"" + pendingText + "\"");
+
+        // ARC v1.0.13: queue (in order) the Backspaces, then the new text.
+        for (int i = 0; i < backspaces; i++) {
+            arcTapKey(KeyEvent.KEYCODE_DEL);
+        }
+        if (pendingText.length() > 0) {
+            final String pt = pendingText;
+            arcSchedule(new Runnable() {
+                @Override public void run() {
+                    for (int o = 0; o < pt.length(); ) {
+                        int codePoint = pt.codePointAt(o);
+                        if (codePoint == '\n') {
+                            SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_ENTER);
+                            SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_ENTER);
+                        } else if (codePoint < 128) {
+                            /* Higher code points don't generate simulated scancodes */
+                            nativeGenerateScancodeForUnichar((char) codePoint);
+                        }
+                        o += Character.charCount(codePoint);
                     }
+                    SDLInputConnection.nativeCommitText(pt, 0);
                 }
-                /* Higher code points don't generate simulated scancodes */
-                if (codePoint < 128) {
-                    nativeGenerateScancodeForUnichar((char)codePoint);
-                }
-                offset += Character.charCount(codePoint);
-            }
-            SDLInputConnection.nativeCommitText(pendingText, 0);
+            }, 30);
         }
         mCommittedText = text;
     }

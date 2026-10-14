@@ -1409,7 +1409,7 @@ struct GraphicsPrivate {
         char clk[16];
         const Config &c = threadData->config;
         
-        arcLogLine(2, ARC_GFX_LOG, 1000000, "===== %s ARC engine gfx profile (v1.0.7)", arcClockStr(clk));
+        arcLogLine(2, ARC_GFX_LOG, 1000000, "===== %s ARC engine gfx profile (v1.0.13)", arcClockStr(clk));
         arcLogLine(2, ARC_GFX_LOG, 1000000, "GL_VENDOR=%s | GL_RENDERER=%s | GL_VERSION=%s",
                    (const char *) gl.GetString(GL_VENDOR),
                    (const char *) gl.GetString(GL_RENDERER),

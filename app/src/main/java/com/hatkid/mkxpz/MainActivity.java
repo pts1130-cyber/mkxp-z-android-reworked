@@ -142,8 +142,18 @@ public class MainActivity extends SDLActivity
         mGamepadInvisible = (isAndroidTV() || isChromebook());
         GamepadConfig gpadConfig = new GamepadConfig();
         mGamepad.init(gpadConfig, mGamepadInvisible);
-        mGamepad.setOnKeyDownListener(SDLActivity::onNativeKeyDown);
-        mGamepad.setOnKeyUpListener(SDLActivity::onNativeKeyUp);
+        // v1.0.13: while a text-entry (name/search) is active, the on-screen X (cancel) button
+        // also sends Escape, which is what the game's text-entry screens use to cancel.
+        mGamepad.setOnKeyDownListener(key -> {
+            SDLActivity.onNativeKeyDown(key);
+            if (key == KeyEvent.KEYCODE_X && SDLActivity.arcTextEntryActive())
+                SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_ESCAPE);
+        });
+        mGamepad.setOnKeyUpListener(key -> {
+            SDLActivity.onNativeKeyUp(key);
+            if (key == KeyEvent.KEYCODE_X)
+                SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_ESCAPE);
+        });
 
         if (mLayout != null) {
             mGamepad.attachTo(this, mLayout);
