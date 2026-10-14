@@ -1279,6 +1279,14 @@ struct GraphicsPrivate {
         
         scOffset.x = (winSize.x - scSize.x) / 2.f;
         scOffset.y = (winSize.y - scSize.y) / 2.f;
+        
+        /* ARC: 세로 화면(폰을 세워 쓸 때)에서는 가운데가 아니라 위쪽에 둠 — 조이플레이와 같은 높이(위에서 화면 높이의 24.5%).
+         * 크기는 그대로(폭에 맞춤)이고 위치만 올라감. 터치 좌표는 screenOffset 으로 같이 보정됨. 아래 여백이 조작 버튼 자리. */
+        if (winSize.y > winSize.x && scSize.y < winSize.y) {
+            int top = (int)(winSize.y * 0.245f);
+            int maxTop = winSize.y - scSize.y;
+            scOffset.y = top < maxTop ? top : maxTop;
+        }
     }
     
     static int findHighestFittingScale(int base, int target) {
