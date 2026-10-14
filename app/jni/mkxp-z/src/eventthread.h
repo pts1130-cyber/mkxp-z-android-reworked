@@ -72,6 +72,11 @@ public:
 	};
 
 	static uint8_t keyStates[SDL_NUM_SCANCODES];
+	// ARC v1.0.14: every key press stays visible for at least 2 Input.update calls, even if the
+	// release arrives sooner (frames can take 150-250ms; a short injected tap was being missed)
+	static uint8_t keyLatch[SDL_NUM_SCANCODES];
+	static uint8_t keyReleasePending[SDL_NUM_SCANCODES];
+	static void consumeKeyLatch();
     static ControllerState controllerState;
 	static MouseState mouseState;
 	static TouchState touchState;

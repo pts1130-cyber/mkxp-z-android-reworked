@@ -83,6 +83,10 @@ static void initALCFunctions(ALCdevice *alcDev)
 #define HAVE_ALC_DEVICE_PAUSE alc.DevicePause
 
 uint8_t EventThread::keyStates[];
+uint8_t EventThread::keyLatch[SDL_NUM_SCANCODES];
+uint8_t EventThread::keyReleasePending[SDL_NUM_SCANCODES];
+// ARC v1.0.14: bytes of typed text still waiting for Input.gets (read by the Android IME helper)
+volatile int g_arcTextPending = 0;
 EventThread::ControllerState EventThread::controllerState;
 EventThread::MouseState EventThread::mouseState;
 EventThread::TouchState EventThread::touchState;
@@ -295,6 +299,7 @@ void EventThread::process(RGSSThreadData &rtData)
 
 				if (textInputBuffer.size() < 512)
 					textInputBuffer += event.text.text;
+				g_arcTextPending = (int)textInputBuffer.size();
 
 				lockText(false);
 
@@ -373,6 +378,8 @@ void EventThread::process(RGSSThreadData &rtData)
 				}
 
 				keyStates[event.key.keysym.scancode] = true;
+				keyLatch[event.key.keysym.scancode] = 2;
+				keyReleasePending[event.key.keysym.scancode] = 0;
 
 				break;
 
@@ -387,7 +394,10 @@ void EventThread::process(RGSSThreadData &rtData)
 					break;
 				}
 
-				keyStates[event.key.keysym.scancode] = false;
+				if (keyLatch[event.key.keysym.scancode])
+					keyReleasePending[event.key.keysym.scancode] = 1;
+				else
+					keyStates[event.key.keysym.scancode] = false;
 
 				break;
 
@@ -498,11 +508,13 @@ void EventThread::process(RGSSThreadData &rtData)
 							SDL_StartTextInput();
 							lockText(true);
 							textInputBuffer.clear();
+							g_arcTextPending = 0;
 							lockText(false);
 						} else {
 							SDL_StopTextInput();
 							lockText(true);
 							textInputBuffer.clear();
+							g_arcTextPending = 0;
 							lockText(false);
 						}
 						break;
@@ -659,8 +671,27 @@ void EventThread::cleanup()
 			free(event.user.data1);
 }
 
+void EventThread::consumeKeyLatch()
+{
+	for (int i = 0; i < SDL_NUM_SCANCODES; i++)
+	{
+		if (!keyLatch[i])
+			continue;
+
+		keyLatch[i]--;
+
+		if (keyLatch[i] == 0 && keyReleasePending[i])
+		{
+			keyStates[i] = false;
+			keyReleasePending[i] = 0;
+		}
+	}
+}
+
 void EventThread::resetInputStates()
 {
+	memset(&keyLatch, 0, sizeof(keyLatch));
+	memset(&keyReleasePending, 0, sizeof(keyReleasePending));
 	memset(&keyStates, 0, sizeof(keyStates));
 	memset(&controllerState, 0, sizeof(controllerState));
 	memset(&mouseState.buttons, 0, sizeof(mouseState.buttons));
@@ -923,3 +954,16 @@ void SyncPoint::Util::waitForUnlock()
 
 	SDL_UnlockMutex(mut);
 }
+
+
+#if defined(__ANDROID__) || defined(MKXPZ_BUILD_ANDROID)
+#include <jni.h>
+// ARC v1.0.14: lets the Java IME helper wait until the game has read the typed text
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_libsdl_app_SDLInputConnection_nativeArcTextPending(JNIEnv *env, jclass cls)
+{
+	(void)env;
+	(void)cls;
+	return g_arcTextPending > 0 ? JNI_TRUE : JNI_FALSE;
+}
+#endif

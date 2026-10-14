@@ -2000,33 +2000,90 @@ class SDLInputConnection extends BaseInputConnection {
         return super.sendKeyEvent(event);
     }
 
-    // ---- ARC v1.0.13: serial key/text injection --------------------------------------------
-    // The game polls key state once per frame. A key down+up injected back to back is never
-    // seen as "pressed", which broke Backspace during IME composition (Korean "ㄱ가간가낟나다").
-    // So every injected key is held for ARC_KEY_HOLD_MS and operations are strictly serialised.
+    // ---- ARC v1.0.14: serial key/text injection --------------------------------------------
+    // The game polls key state once per frame and reads typed text once per frame (Input.gets),
+    // and frames can take 150-250ms. So injected operations run strictly one after another and a
+    // key operation waits until the game has read the text typed before it (native flag), so
+    // Backspace can never run before the character it must delete (Korean "ㄱ가나다" bug).
+    // The engine also keeps every tapped key visible for >= 2 Input.update calls.
     private static final String ARC_TAG = "ARC_IME";
-    private static final long ARC_KEY_HOLD_MS = 70;
-    private static final long ARC_KEY_GAP_MS = 70;
+    private static final long ARC_KEY_HOLD_MS = 60;
+    private static final long ARC_KEY_GAP_MS = 40;
+    private static final long ARC_TEXT_GAP_MS = 20;
+    private static final long ARC_POLL_MS = 10;
+    private static final long ARC_MAX_WAIT_MS = 600;
     private static final Handler sArcHandler = new Handler(android.os.Looper.getMainLooper());
-    private static long sArcNextAt = 0;
+    private static final java.util.ArrayDeque<ArcOp> sArcQueue = new java.util.ArrayDeque<ArcOp>();
+    private static boolean sArcRunning = false;
 
-    private static void arcSchedule(Runnable r, long occupyMs) {
-        long now = android.os.SystemClock.uptimeMillis();
-        long at = Math.max(now, sArcNextAt);
-        sArcNextAt = at + occupyMs;
-        sArcHandler.postDelayed(r, at - now);
+    private static class ArcOp {
+        final int keyCode;     // 0 = text op
+        final String text;
+        long waited = 0;
+        ArcOp(int keyCode, String text) { this.keyCode = keyCode; this.text = text; }
+    }
+
+    private static boolean arcTextPending() {
+        try {
+            return nativeArcTextPending();
+        } catch (UnsatisfiedLinkError e) {
+            return false;
+        }
+    }
+
+    private static final Runnable sArcStep = new Runnable() {
+        @Override public void run() {
+            final ArcOp op;
+            synchronized (sArcQueue) {
+                op = sArcQueue.peek();
+                if (op == null) {
+                    sArcRunning = false;
+                    return;
+                }
+                if (op.keyCode != 0 && op.waited < ARC_MAX_WAIT_MS && arcTextPending()) {
+                    op.waited += ARC_POLL_MS;
+                    sArcHandler.postDelayed(this, ARC_POLL_MS);
+                    return;
+                }
+                sArcQueue.poll();
+            }
+            if (op.keyCode == 0) {
+                String pt = op.text;
+                for (int o = 0; o < pt.length(); ) {
+                    int codePoint = pt.codePointAt(o);
+                    if (codePoint < 128) {
+                        /* Higher code points don't generate simulated scancodes */
+                        nativeGenerateScancodeForUnichar((char) codePoint);
+                    }
+                    o += Character.charCount(codePoint);
+                }
+                SDLInputConnection.nativeCommitText(pt, 0);
+                sArcHandler.postDelayed(this, ARC_TEXT_GAP_MS);
+            } else {
+                SDLActivity.onNativeKeyDown(op.keyCode);
+                sArcHandler.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        SDLActivity.onNativeKeyUp(op.keyCode);
+                        sArcHandler.postDelayed(sArcStep, ARC_KEY_GAP_MS);
+                    }
+                }, ARC_KEY_HOLD_MS);
+            }
+        }
+    };
+
+    private static void arcEnqueue(ArcOp op) {
+        synchronized (sArcQueue) {
+            sArcQueue.add(op);
+            if (!sArcRunning) {
+                sArcRunning = true;
+                sArcHandler.post(sArcStep);
+            }
+        }
     }
 
     /** Press and release one Android keycode so the game's per-frame polling sees it. */
     static void arcTapKey(final int keyCode) {
-        arcSchedule(new Runnable() {
-            @Override public void run() {
-                SDLActivity.onNativeKeyDown(keyCode);
-                sArcHandler.postDelayed(new Runnable() {
-                    @Override public void run() { SDLActivity.onNativeKeyUp(keyCode); }
-                }, ARC_KEY_HOLD_MS);
-            }
-        }, ARC_KEY_HOLD_MS + ARC_KEY_GAP_MS);
+        arcEnqueue(new ArcOp(keyCode, null));
     }
 
     @Override
@@ -2099,28 +2156,29 @@ class SDLInputConnection extends BaseInputConnection {
                 + "\" match=" + matchLength + " backspaces=" + backspaces
                 + " pending=\"" + pendingText + "\"");
 
-        // ARC v1.0.13: queue (in order) the Backspaces, then the new text.
+        // ARC v1.0.14: queue (in order) the Backspaces, then the new text.
         for (int i = 0; i < backspaces; i++) {
             arcTapKey(KeyEvent.KEYCODE_DEL);
         }
         if (pendingText.length() > 0) {
-            final String pt = pendingText;
-            arcSchedule(new Runnable() {
-                @Override public void run() {
-                    for (int o = 0; o < pt.length(); ) {
-                        int codePoint = pt.codePointAt(o);
-                        if (codePoint == '\n') {
-                            SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_ENTER);
-                            SDLActivity.onNativeKeyUp(KeyEvent.KEYCODE_ENTER);
-                        } else if (codePoint < 128) {
-                            /* Higher code points don't generate simulated scancodes */
-                            nativeGenerateScancodeForUnichar((char) codePoint);
-                        }
-                        o += Character.charCount(codePoint);
+            // an Enter typed through the IME as text becomes a real Enter key press
+            StringBuilder run = new StringBuilder();
+            for (int o = 0; o < pendingText.length(); ) {
+                int cp = pendingText.codePointAt(o);
+                if (cp == '\n') {
+                    if (run.length() > 0) {
+                        arcEnqueue(new ArcOp(0, run.toString()));
+                        run.setLength(0);
                     }
-                    SDLInputConnection.nativeCommitText(pt, 0);
+                    arcTapKey(KeyEvent.KEYCODE_ENTER);
+                } else {
+                    run.appendCodePoint(cp);
                 }
-            }, 30);
+                o += Character.charCount(cp);
+            }
+            if (run.length() > 0) {
+                arcEnqueue(new ArcOp(0, run.toString()));
+            }
         }
         mCommittedText = text;
     }
@@ -2128,6 +2186,8 @@ class SDLInputConnection extends BaseInputConnection {
     public static native void nativeCommitText(String text, int newCursorPosition);
 
     public static native void nativeGenerateScancodeForUnichar(char c);
+
+    public static native boolean nativeArcTextPending();
 }
 
 class SDLClipboardHandler implements

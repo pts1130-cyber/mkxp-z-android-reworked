@@ -1210,6 +1210,9 @@ void Input::update()
     p->updateRaw();
     p->updateControllerRaw();
     
+    // ARC v1.0.14: release keys whose tap was shorter than 2 updates
+    EventThread::consumeKeyLatch();
+    
     // Record mouse positions
     p->mousePos[0] = shState->eThread().mouseState.x;
     p->mousePos[1] = shState->eThread().mouseState.y;
@@ -1487,9 +1490,12 @@ const char *Input::getText()
     return shState->eThread().textInputBuffer.c_str();
 }
 
+extern volatile int g_arcTextPending;
+
 void Input::clearText()
 {
     shState->eThread().textInputBuffer.clear();
+    g_arcTextPending = 0;
 }
 
 char *Input::getClipboardText()
