@@ -146,7 +146,7 @@ public class MainActivity extends SDLActivity
         // also sends Escape, which is what the game's text-entry screens use to cancel.
         mGamepad.setOnKeyDownListener(key -> {
             SDLActivity.onNativeKeyDown(key);
-            if (key == KeyEvent.KEYCODE_X && SDLActivity.arcTextEntryActive())
+            if (key == KeyEvent.KEYCODE_X)
                 SDLActivity.onNativeKeyDown(KeyEvent.KEYCODE_ESCAPE);
         });
         mGamepad.setOnKeyUpListener(key -> {
