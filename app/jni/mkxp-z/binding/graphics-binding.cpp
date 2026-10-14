@@ -57,7 +57,14 @@ RB_METHOD(graphicsAverageFrameRate)
 {
     RB_UNUSED_PARAM;
     GFX_LOCK;
-    VALUE ret = rb_float_new(shState->graphics().averageFrameRate());
+    double fps = shState->graphics().averageFrameRate();
+    /* ARC: right after a map load / big hitch the 40-frame average can be
+     * tiny or NaN, which makes plugins that size animations with
+     * (N * average_frame_rate / 60).floor get 0 frames (pause menu stuck
+     * off-screen on first open). Keep it in a sane range. */
+    if (!(fps >= 30.0)) fps = 30.0;
+    if (fps > 120.0) fps = 120.0;
+    VALUE ret = rb_float_new(fps);
     GFX_UNLOCK;
     return ret;
 }
