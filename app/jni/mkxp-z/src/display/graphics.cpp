@@ -1250,6 +1250,8 @@ struct GraphicsPrivate {
         ratio.y = (float)scRes.y / scSize.y * backingScaleFactor;
         
         rtData->screenOffset = scOffset / backingScaleFactor;
+        /* 마우스·터치 좌표는 위에서부터이므로 y 는 위쪽 여백으로 (가운데 정렬일 땐 값이 같음) */
+        rtData->screenOffset.y = (winSize.y - scOffset.y - scSize.y) / backingScaleFactor;
     }
     
     /* Enforces fixed aspect ratio, if desired */
@@ -1283,9 +1285,10 @@ struct GraphicsPrivate {
         /* ARC: 세로 화면(폰을 세워 쓸 때)에서는 가운데가 아니라 위쪽에 둠 — 조이플레이와 같은 높이(위에서 화면 높이의 24.5%).
          * 크기는 그대로(폭에 맞춤)이고 위치만 올라감. 터치 좌표는 screenOffset 으로 같이 보정됨. 아래 여백이 조작 버튼 자리. */
         if (winSize.y > winSize.x && scSize.y < winSize.y) {
-            int top = (int)(winSize.y * 0.245f);
+            int top = (int)(winSize.y * 0.245f);          /* 화면 위에서부터의 거리 */
             int maxTop = winSize.y - scSize.y;
-            scOffset.y = top < maxTop ? top : maxTop;
+            if (top > maxTop) top = maxTop;
+            scOffset.y = winSize.y - top - scSize.y;      /* scOffset.y 는 GL 좌표(아래에서부터)라서 변환 */
         }
     }
     
@@ -1367,7 +1370,7 @@ struct GraphicsPrivate {
         recalculateScreenSize(threadData->config.fixedAspectRatio);
         updateScreenResoRatio(threadData);
         
-        SDL_Rect screen = {scOffset.x, scOffset.y, scSize.x, scSize.y};
+        SDL_Rect screen = {scOffset.x, winSize.y - scOffset.y - scSize.y, scSize.x, scSize.y};
         threadData->ethread->notifyGameScreenChange(screen);
         
         arcLogResize(why);
@@ -1893,7 +1896,7 @@ void Graphics::resizeScreen(int width, int height) {
     p->updateScreenResoRatio(p->threadData);
     
     {
-        SDL_Rect screen = {p->scOffset.x, p->scOffset.y, p->scSize.x, p->scSize.y};
+        SDL_Rect screen = {p->scOffset.x, p->winSize.y - p->scOffset.y - p->scSize.y, p->scSize.x, p->scSize.y};
         p->threadData->ethread->notifyGameScreenChange(screen);
     }
     
