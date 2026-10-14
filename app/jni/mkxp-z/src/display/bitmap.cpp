@@ -57,6 +57,8 @@
 #include <algorithm>
 #include <vector>
 #include <string.h>
+#include <mutex>
+#include <unordered_set>
 
 extern "C" {
 #include "libnsgif/libnsgif.h"
@@ -154,6 +156,12 @@ static void gif_bitmap_modified(void *bitmap)
 }
 
 // --------------------
+
+/* ARC: registry of live bitmaps so the picture memory can be summed natively
+ * (the Ruby ObjectSpace walk cost 90-150 ms per snapshot). */
+struct BitmapPrivate;
+static std::unordered_set<BitmapPrivate*> g_arcLiveBitmaps;
+static std::mutex g_arcLiveMx;
 
 struct BitmapPrivate
 {
@@ -277,10 +285,19 @@ struct BitmapPrivate
         
         font = &shState->defaultFont();
         pixman_region_init(&tainted);
+        
+        {
+            std::lock_guard<std::mutex> lk(g_arcLiveMx);
+            g_arcLiveBitmaps.insert(this);
+        }
     }
     
     ~BitmapPrivate()
     {
+        {
+            std::lock_guard<std::mutex> lk(g_arcLiveMx);
+            g_arcLiveBitmaps.erase(this);
+        }
         prepareCon.disconnect();
         SDL_FreeFormat(format);
         pixman_region_fini(&tainted);
@@ -2303,4 +2320,46 @@ void Bitmap::releaseResources()
         shState->texPool().release(p->gl);
     
     delete p;
+}
+
+/* ARC: total picture memory of all live bitmaps (RGBA, 4 bytes per pixel).
+ * bigW/bigH = size of the largest single bitmap. */
+void arcBitmapStats(unsigned long long *bytes, int *count,
+                    int *bigW, int *bigH)
+{
+    unsigned long long total = 0;
+    int n = 0, bw = 0, bh = 0;
+    unsigned long long bigA = 0;
+    
+    std::lock_guard<std::mutex> lk(g_arcLiveMx);
+    for (BitmapPrivate *b : g_arcLiveBitmaps) {
+        unsigned long long w, h, frames = 1;
+        
+        if (b->megaSurface) {
+            w = b->megaSurface->w;
+            h = b->megaSurface->h;
+        } else if (b->animation.enabled) {
+            w = b->animation.width;
+            h = b->animation.height;
+            frames = b->animation.frames.size();
+        } else {
+            w = b->gl.width;
+            h = b->gl.height;
+        }
+        
+        unsigned long long a = w * h;
+        total += a * 4ULL * frames;
+        ++n;
+        
+        if (a > bigA) {
+            bigA = a;
+            bw = (int)w;
+            bh = (int)h;
+        }
+    }
+    
+    *bytes = total;
+    *count = n;
+    *bigW = bw;
+    *bigH = bh;
 }

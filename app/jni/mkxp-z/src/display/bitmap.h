@@ -166,4 +166,8 @@ private:
 	BitmapPrivate *p;
 };
 
+/* ARC: native picture memory counter (see bitmap.cpp) */
+void arcBitmapStats(unsigned long long *bytes, int *count,
+                    int *bigW, int *bigH);
+
 #endif // BITMAP_H

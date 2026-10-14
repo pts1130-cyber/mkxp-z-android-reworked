@@ -22,6 +22,7 @@
 #include "audio/audio.h"
 #include "filesystem/filesystem.h"
 #include "display/graphics.h"
+#include "display/bitmap.h"
 #include "display/font.h"
 #include "system/system.h"
 
@@ -138,6 +139,7 @@ RB_METHOD(mkxpPowerState);
 RB_METHOD(mkxpSettingsMenu);
 RB_METHOD(mkxpCpuCount);
 RB_METHOD(mkxpSystemMemory);
+RB_METHOD(arcBitmapStatsRb);
 RB_METHOD(mkxpReloadPathCache);
 RB_METHOD(mkxpAddPath);
 RB_METHOD(mkxpRemovePath);
@@ -251,6 +253,7 @@ static void mriBindingInit()
 	_rb_define_module_function(mod, "power_state", mkxpPowerState);
 	_rb_define_module_function(mod, "nproc", mkxpCpuCount);
 	_rb_define_module_function(mod, "memory", mkxpSystemMemory);
+	_rb_define_module_function(mod, "arc_bitmap_stats", arcBitmapStatsRb);
 
 	_rb_define_module_function(mod, "reload_cache", mkxpReloadPathCache);
 	_rb_define_module_function(mod, "mount", mkxpAddPath);
@@ -532,6 +535,22 @@ RB_METHOD(mkxpCpuCount) {
     RB_UNUSED_PARAM;
     
     return INT2NUM(SDL_GetCPUCount());
+}
+
+/* ARC: System.arc_bitmap_stats => [live bitmap count, bytes, biggest w, biggest h] */
+RB_METHOD(arcBitmapStatsRb) {
+    RB_UNUSED_PARAM;
+    
+    unsigned long long bytes = 0;
+    int count = 0, bw = 0, bh = 0;
+    arcBitmapStats(&bytes, &count, &bw, &bh);
+    
+    VALUE ary = rb_ary_new();
+    rb_ary_push(ary, INT2NUM(count));
+    rb_ary_push(ary, ULL2NUM(bytes));
+    rb_ary_push(ary, INT2NUM(bw));
+    rb_ary_push(ary, INT2NUM(bh));
+    return ary;
 }
 
 RB_METHOD(mkxpSystemMemory) {
