@@ -2,6 +2,10 @@ name: Android Build & Release
 
 on:
   push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
     tags:
       - 'v*.*.*'
   workflow_dispatch:
@@ -162,8 +166,11 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            # main push: auto tag build-<run number>-<short sha>
+            echo "tag=build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       # ── 15. Create GitHub Release and upload APK ──────────────────────────────
