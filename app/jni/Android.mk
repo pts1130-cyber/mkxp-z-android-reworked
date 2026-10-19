@@ -15,6 +15,7 @@ include $(L_PATH)/uchardet.mk
 include $(L_PATH)/libiconv.mk
 include $(L_PATH)/openssl.mk
 include $(L_PATH)/ruby.mk
+include $(L_PATH)/arcfog.mk
 
 # Include main library
 include $(L_PATH)/mkxp-z.mk
