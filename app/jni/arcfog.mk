@@ -1,4 +1,6 @@
 # libarcfog.so — 폭주 안개(Rogue Aura) 계산 (게임 쪽 MiniFFI 가 이름으로 불러 씀)
+LOCAL_PATH := $(call my-dir)
+
 include $(CLEAR_VARS)
 LOCAL_MODULE := arcfog
 LOCAL_SRC_FILES := arcfog/arcfog.c
