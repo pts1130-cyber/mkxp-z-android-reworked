@@ -12,7 +12,7 @@
 #endif
 
 #define ARCFOG_VERSION 1
-#define GRAD 4
+#define GRAD 16
 #define LEVELS 12
 #define W1 1.5
 #define W2 1.2
