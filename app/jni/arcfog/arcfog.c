@@ -225,6 +225,64 @@ EXPORT int arcfog_paint(const double *dp, const int *ip, const unsigned char *sr
   return painted;
 }
 
+
+/* 그림자 불꽃 "불꽃똥" 지우기 — 루비 ARCShadowFlameClean.run 과 같은 결과를 내는 C 판.
+ * 바깥 띠 색(RGBA 가 정확히 같은 칸)이 든, 알파가 0 이 아닌 칸의 8방향 덩어리가
+ * maxblob 칸 이하면 그 덩어리를 통째로 0 으로 지운다. (maxblob 를 넘는 덩어리는 남김)
+ * ip: [0]=tw [1]=th [2]=알파자리 [3]=R자리 [4]=G자리 [5]=B자리 [6]=바깥띠 R [7]=G [8]=B [9]=maxblob
+ * buf: tw*th*4 바이트(제자리 수정). 반환: 지운 칸 수 / 음수 = 오류 */
+EXPORT int arcfog_clean(const int *ip, unsigned char *buf) {
+  int tw, th, ai, ri, gi_, bi, cr, cg, cb, maxblob;
+  long n, i, killed = 0;
+  unsigned char *seen;
+  int *q;
+  if (!ip || !buf) return -1;
+  tw = ip[0]; th = ip[1]; ai = ip[2]; ri = ip[3]; gi_ = ip[4]; bi = ip[5];
+  cr = ip[6]; cg = ip[7]; cb = ip[8]; maxblob = ip[9];
+  if (tw <= 0 || th <= 0 || maxblob < 1) return -1;
+  if (ai < 0 || ai > 3 || ri < 0 || ri > 3 || gi_ < 0 || gi_ > 3 || bi < 0 || bi > 3) return -1;
+  n = (long)tw * th;
+  if (n > 16000000L) return -1;
+  seen = (unsigned char *)calloc((size_t)n, 1);
+  q = (int *)malloc(sizeof(int) * (size_t)n);
+  if (!seen || !q) { free(seen); free(q); return -2; }
+  for (i = 0; i < n; i++) {
+    unsigned char *p = buf + i * 4;
+    long qn, qi;
+    if (seen[i]) continue;
+    if (p[ai] != 255 || p[ri] != cr || p[gi_] != cg || p[bi] != cb) continue;
+    q[0] = (int)i; qn = 1; qi = 0; seen[i] = 1;
+    while (qi < qn) {
+      int cur = q[qi++];
+      int x = cur % tw, y = cur / tw, dy, dx;
+      for (dy = -1; dy <= 1; dy++) {
+        int yy = y + dy;
+        if (yy < 0 || yy >= th) continue;
+        for (dx = -1; dx <= 1; dx++) {
+          int xx = x + dx;
+          long nq;
+          if (xx < 0 || xx >= tw || (dx == 0 && dy == 0)) continue;
+          nq = (long)yy * tw + xx;
+          if (seen[nq]) continue;
+          if (buf[nq * 4 + ai] == 0) continue;
+          seen[nq] = 1;
+          q[qn++] = (int)nq;
+        }
+      }
+    }
+    if (qn <= maxblob) {
+      long k;
+      for (k = 0; k < qn; k++) {
+        unsigned char *pp = buf + (long)q[k] * 4;
+        pp[0] = pp[1] = pp[2] = pp[3] = 0;
+      }
+      killed += qn;
+    }
+  }
+  free(seen); free(q);
+  return (int)killed;
+}
+
 EXPORT void arcfog_release(void) {
   int i;
   for (i = 0; i < SLOTS; i++) if (slots[i].used) slot_free(&slots[i]);
