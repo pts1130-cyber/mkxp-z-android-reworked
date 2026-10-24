@@ -28,9 +28,16 @@
 
 #include <string>
 #include <vector>
+#include <deque>
+#include <unordered_set>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 
 struct SoundBuffer;
 struct Config;
+struct ArcDecodedSound;
 
 struct SoundEmitter
 {
@@ -58,8 +65,24 @@ struct SoundEmitter
 
 	void stop();
 
+	/* ARC: decode an effect on a worker thread ahead of time, so the first
+	 * play() does not block the game thread. Safe to call for names that
+	 * are already cached or queued. */
+	void preload(const std::string &filename);
+
 private:
 	SoundBuffer *allocateBuffer(const std::string &filename);
+	void insertBuffer(SoundBuffer *buffer, const std::string &filename);
+	void adoptDecoded();
+	void workerMain();
+
+	std::mutex arcLock;
+	std::condition_variable arcCond;
+	std::deque<std::string> arcQueue;
+	std::unordered_set<std::string> arcPending;
+	std::vector<std::shared_ptr<ArcDecodedSound> > arcDone;
+	std::thread arcWorker;
+	bool arcQuit;
 };
 
 #endif // SOUNDEMITTER_H

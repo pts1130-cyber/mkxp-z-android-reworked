@@ -310,6 +310,11 @@ void Audio::seStop()
 	p->se.stop();
 }
 
+void Audio::sePreload(const char *filename)
+{
+	p->se.preload(filename);
+}
+
 void Audio::setupMidi()
 {
 	shState->midiState().initIfNeeded(shState->config());

@@ -94,6 +94,17 @@ DEF_FADE( me )
 
 DEF_PLAY_STOP( se )
 
+RB_METHOD(audio_sePreload)
+{
+	RB_UNUSED_PARAM;
+
+	const char *filename;
+	rb_get_args(argc, argv, "z", &filename RB_ARG_END);
+	shState->audio().sePreload(filename);
+
+	return Qnil;
+}
+
 RB_METHOD(audioSetupMidi)
 {
 	RB_UNUSED_PARAM;
@@ -143,6 +154,7 @@ audioBindingInit()
 	_rb_define_module_function(module, "setup_midi", audioSetupMidi);
 
 	BIND_PLAY_STOP( se )
+	_rb_define_module_function(module, "se_preload", audio_sePreload);
 
 	_rb_define_module_function(module, "__reset__", audioReset);
 }

@@ -103,7 +103,8 @@ SoundEmitter::SoundEmitter(const Config &conf)
       srcCount(conf.SE.sourceCount),
       alSrcs(srcCount),
       atchBufs(srcCount),
-      srcPrio(srcCount)
+      srcPrio(srcCount),
+      arcQuit(false)
 {
 	for (size_t i = 0; i < srcCount; ++i)
 	{
@@ -115,6 +116,15 @@ SoundEmitter::SoundEmitter(const Config &conf)
 
 SoundEmitter::~SoundEmitter()
 {
+	{
+		std::lock_guard<std::mutex> lock(arcLock);
+		arcQuit = true;
+		arcQueue.clear();
+	}
+	arcCond.notify_all();
+	if (arcWorker.joinable())
+		arcWorker.join();
+
 	for (size_t i = 0; i < srcCount; ++i)
 	{
 		AL::Source::stop(alSrcs[i]);
@@ -204,9 +214,26 @@ static int arcMemOpsClose(SDL_RWops *)
 	return 0;
 }
 
+/* ARC: PCM produced by the worker thread, uploaded to OpenAL by the game thread */
+struct ArcDecodedSound
+{
+	std::string key;
+	std::vector<char> pcm;
+	ALenum alFormat;
+	int rate;
+	int channels;
+	uint32_t bytes;
+
+	ArcDecodedSound() : alFormat(0), rate(0), channels(0), bytes(0) {}
+};
+
 struct SoundOpenHandler : FileSystem::OpenHandler
 {
 	SoundBuffer *buffer;
+
+	/* ARC: true = only decode into 'decoded' (no OpenAL calls, thread safe) */
+	bool decodeOnly;
+	std::shared_ptr<ArcDecodedSound> decoded;
 
 	/* ARC: timing for the log (milliseconds) */
 	double msRead;
@@ -218,7 +245,7 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 	int channels;
 
 	SoundOpenHandler()
-	    : buffer(0),
+	    : buffer(0), decodeOnly(false),
 	      msRead(0), msDecode(0), msUpload(0),
 	      fileBytes(-1), slurped(false), rate(0), channels(0)
 	{}
@@ -314,13 +341,27 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 		uint64_t t2 = SDL_GetPerformanceCounter();
 		msDecode = arcTicksToMs(t2 - t1);
 
-		buffer = new SoundBuffer;
-		buffer->bytes = sampleSize * sampleCount;
-
+		uint32_t pcmBytes = sampleSize * sampleCount;
 		ALenum alFormat = chooseALFormat(sampleSize, sample->actual.channels);
 
-		AL::Buffer::uploadData(buffer->alBuffer, alFormat, sample->buffer,
-							   buffer->bytes, sample->actual.rate);
+		if (decodeOnly)
+		{
+			decoded.reset(new ArcDecodedSound);
+			decoded->pcm.assign((const char *) sample->buffer,
+			                    (const char *) sample->buffer + pcmBytes);
+			decoded->bytes = pcmBytes;
+			decoded->alFormat = alFormat;
+			decoded->rate = (int) sample->actual.rate;
+			decoded->channels = (int) sample->actual.channels;
+		}
+		else
+		{
+			buffer = new SoundBuffer;
+			buffer->bytes = pcmBytes;
+
+			AL::Buffer::uploadData(buffer->alBuffer, alFormat, sample->buffer,
+			                       buffer->bytes, sample->actual.rate);
+		}
 
 		rate = (int) sample->actual.rate;
 		channels = (int) sample->actual.channels;
@@ -337,9 +378,154 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 	}
 };
 
+void SoundEmitter::insertBuffer(SoundBuffer *buffer, const std::string &filename)
+{
+	buffer->key = filename;
+	uint32_t wouldBeBytes = bufferBytes + buffer->bytes;
+
+	/* If memory limit is reached, delete lowest priority buffer
+	 * until there is room or no buffers left */
+	while (wouldBeBytes > SE_CACHE_MEM && !buffers.isEmpty())
+	{
+		SoundBuffer *last = buffers.tail();
+		bufferHash.remove(last->key);
+		buffers.remove(last->link);
+
+		wouldBeBytes -= last->bytes;
+
+		SoundBuffer::deref(last);
+	}
+
+	bufferHash.insert(filename, buffer);
+	buffers.prepend(buffer->link);
+
+	bufferBytes = wouldBeBytes;
+}
+
+/* ARC: move effects finished by the worker thread into the cache (game thread only) */
+void SoundEmitter::adoptDecoded()
+{
+	std::vector<std::shared_ptr<ArcDecodedSound> > done;
+
+	{
+		std::lock_guard<std::mutex> lock(arcLock);
+		done.swap(arcDone);
+	}
+
+	for (size_t i = 0; i < done.size(); ++i)
+	{
+		ArcDecodedSound &d = *done[i];
+
+		if (bufferHash.value(d.key, 0))
+			continue;
+
+		SoundBuffer *buffer = new SoundBuffer;
+		buffer->bytes = d.bytes;
+
+		AL::Buffer::uploadData(buffer->alBuffer, d.alFormat, &d.pcm[0],
+		                       d.bytes, d.rate);
+
+		insertBuffer(buffer, d.key);
+	}
+}
+
+void SoundEmitter::workerMain()
+{
+	for (;;)
+	{
+		std::string name;
+
+		{
+			std::unique_lock<std::mutex> lock(arcLock);
+			arcCond.wait(lock, [this] { return arcQuit || !arcQueue.empty(); });
+
+			if (arcQuit)
+				return;
+
+			name = arcQueue.front();
+			arcQueue.pop_front();
+		}
+
+		std::shared_ptr<ArcDecodedSound> result;
+
+		try
+		{
+			SoundOpenHandler handler;
+			handler.decodeOnly = true;
+			shState->fileSystem().openRead(handler, name.c_str());
+			result = handler.decoded;
+		}
+		catch (...)
+		{
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(arcLock);
+
+			if (result)
+			{
+				result->key = name;
+				arcDone.push_back(result);
+			}
+
+			arcPending.erase(name);
+		}
+
+		arcCond.notify_all();
+	}
+}
+
+void SoundEmitter::preload(const std::string &filename)
+{
+	adoptDecoded();
+
+	if (bufferHash.value(filename, 0))
+		return;
+
+	{
+		std::lock_guard<std::mutex> lock(arcLock);
+
+		if (arcQuit || arcPending.count(filename))
+			return;
+
+		arcPending.insert(filename);
+		arcQueue.push_back(filename);
+
+		if (!arcWorker.joinable())
+			arcWorker = std::thread(&SoundEmitter::workerMain, this);
+	}
+
+	arcCond.notify_all();
+}
+
 SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
 {
+	adoptDecoded();
+
 	SoundBuffer *buffer = bufferHash.value(filename, 0);
+
+	if (!buffer)
+	{
+		/* ARC: being decoded by the worker right now: wait for it instead of
+		 * decoding the same file a second time */
+		bool waited = false;
+
+		{
+			std::unique_lock<std::mutex> lock(arcLock);
+
+			if (arcPending.count(filename))
+			{
+				arcCond.wait(lock, [this, &filename] { return arcPending.count(filename) == 0; });
+				waited = true;
+			}
+		}
+
+		if (waited)
+		{
+			adoptDecoded();
+			buffer = bufferHash.value(filename, 0);
+		}
+	}
 
 	if (buffer)
 	{
@@ -391,26 +577,7 @@ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
 			return 0;
 		}
 
-		buffer->key = filename;
-		uint32_t wouldBeBytes = bufferBytes + buffer->bytes;
-
-		/* If memory limit is reached, delete lowest priority buffer
-		 * until there is room or no buffers left */
-		while (wouldBeBytes > SE_CACHE_MEM && !buffers.isEmpty())
-		{
-			SoundBuffer *last = buffers.tail();
-			bufferHash.remove(last->key);
-			buffers.remove(last->link);
-
-			wouldBeBytes -= last->bytes;
-
-			SoundBuffer::deref(last);
-		}
-
-		bufferHash.insert(filename, buffer);
-		buffers.prepend(buffer->link);
-
-		bufferBytes = wouldBeBytes;
+		insertBuffer(buffer, filename);
 
 		return buffer;
 	}
