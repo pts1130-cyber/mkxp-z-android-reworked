@@ -1,0 +1,69 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REF: 37a04d14413454551a7b6aadbb4e93e67168accb
+
+jobs:
+  build-windows:
+    name: Windows MSYS2 (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - name: Checkout upstream mkxp-z
+        uses: actions/checkout@v4
+        with:
+          repository: mkxp-z/mkxp-z
+          ref: ${{ env.UPSTREAM_REF }}
+          path: mkxp-z
+
+      - name: Apply Audio.se_preload patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/se-preload.patch
+          git apply ../patchrepo/windows-engine/se-preload.patch
+          git diff --stat
+
+      - name: Install dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: mingw64
+          install: >-
+            bison mingw-w64-x86_64-ccache mingw-w64-x86_64-cmake diffutils mingw-w64-x86_64-git make mingw-w64-x86_64-meson mingw-w64-x86_64-ruby
+            mingw-w64-x86_64-gcc
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cd mkxp-z
+          meson setup --prefix "$(pwd)/build/artifact" --buildtype release -Dstrip=true -Db_lto=true build
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cd mkxp-z
+          ninja -C build -v
+
+      - name: Prepare artifact
+        shell: msys2 {0}
+        run: |
+          cd mkxp-z
+          meson install -C build --no-rebuild --tags mkxp-z
+          ls -la build/artifact
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mkxp-z-windows-se-preload
+          path: mkxp-z/build/artifact/
+          if-no-files-found: error
