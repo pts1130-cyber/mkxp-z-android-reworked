@@ -7,11 +7,11 @@ permissions:
   contents: read
 
 env:
-  UPSTREAM_REF: 37a04d14413454551a7b6aadbb4e93e67168accb
+  UPSTREAM_REF: 061405b5931a0c97313b951042343a028f3000e5
 
 jobs:
   build-windows:
-    name: Windows MSYS2 (x86_64)
+    name: Windows MSYS2 (x86_64, legacy layout)
     runs-on: windows-latest
     steps:
       - name: Checkout patch repository
@@ -34,37 +34,54 @@ jobs:
           git apply ../patchrepo/windows-engine/se-preload.patch
           git diff --stat
 
-      - name: Install dependencies
-        uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64
           suppress-deprecation-warnings: msystem-mingw64
           install: >-
-            bison mingw-w64-x86_64-ccache mingw-w64-x86_64-cmake diffutils mingw-w64-x86_64-git make mingw-w64-x86_64-meson mingw-w64-x86_64-ruby
+            base-devel
+            git
+            ruby
+            vim
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-autotools
             mingw-w64-x86_64-gcc
 
-      - name: Configure
+      - name: Build all dependencies
         shell: msys2 {0}
         run: |
-          cd mkxp-z
-          meson setup --prefix "$(pwd)/build/artifact" --buildtype release -Dstrip=true -Db_lto=true build
+          cd mkxp-z/windows
+          make
 
-      - name: Build
+      - name: Build exe
         shell: msys2 {0}
         run: |
           cd mkxp-z
-          ninja -C build -v
+          source windows/vars.sh
+          meson setup build
+          cd build
+          ninja
+          strip ./mkxp-z.exe
 
-      - name: Prepare artifact
+      - name: Prepare archive
         shell: msys2 {0}
         run: |
           cd mkxp-z
-          meson install -C build --no-rebuild --tags mkxp-z
-          ls -la build/artifact
+          mkdir build/artifact
+          cd build/artifact
+          cp /mingw64/bin/zlib1.dll .
+          cp ../../windows/build-mingw64/bin/x64-msvcrt-ruby310.dll .
+          cp -r ../../windows/build-mingw64/lib/ruby/3.1.0 .
+          mv ./3.1.0 ./stdlib
+          cp ../mkxp-z.exe .
+          cp ../../mkxp.json .
+          cp -r ../../scripts .
+          ls -la
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z-windows-se-preload
+          name: mkxp-z-windows-legacy-se-preload
           path: mkxp-z/build/artifact/
           if-no-files-found: error
