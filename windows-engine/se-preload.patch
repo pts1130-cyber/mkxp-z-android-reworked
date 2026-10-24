@@ -28,6 +28,50 @@ index 1e6d177..b51957b 100644
  
  	_rb_define_module_function(module, "__reset__", audioReset);
  }
+diff --git a/binding/bitmap-binding.cpp b/binding/bitmap-binding.cpp
+index 91c01e5..520af6b 100644
+--- a/binding/bitmap-binding.cpp
++++ b/binding/bitmap-binding.cpp
+@@ -455,6 +455,30 @@ RB_METHOD_GUARD(bitmapRadialBlur) {
+ }
+ RB_METHOD_GUARD_END
+ 
++RB_METHOD_GUARD(bitmapAlphaBounds) {
++    RB_UNUSED_PARAM;
++
++    Bitmap *b = getPrivateData<Bitmap>(self);
++    int threshold = 0, x = 0, y = 0, w = 0x7fffffff, h = 0x7fffffff;
++    rb_get_args(argc, argv, "|iiiii", &threshold, &x, &y, &w, &h RB_ARG_END);
++
++    IntRect r;
++    GFX_GUARD_EXC(r = b->alphaBounds(threshold, IntRect(x, y, w, h)););
++
++    return rb_ary_new_from_args(4, INT2FIX(r.x), INT2FIX(r.y), INT2FIX(r.w), INT2FIX(r.h));
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD(bitmapPreload) {
++    RB_UNUSED_PARAM;
++
++    const char *filename;
++    rb_get_args(argc, argv, "z", &filename RB_ARG_END);
++    Bitmap::preload(filename);
++
++    return Qnil;
++}
++
+ RB_METHOD_GUARD(bitmapGetRawData) {
+     RB_UNUSED_PARAM;
+     
+@@ -921,6 +945,8 @@ void bitmapBindingInit() {
+     _rb_define_method(klass, "draw_text", bitmapDrawText);
+     _rb_define_method(klass, "text_size", bitmapTextSize);
+     
++    _rb_define_method(klass, "alpha_bounds", bitmapAlphaBounds);
++    rb_define_singleton_method(klass, "preload", RUBY_METHOD_FUNC(bitmapPreload), -1);
+     _rb_define_method(klass, "raw_data", bitmapGetRawData);
+     _rb_define_method(klass, "raw_data=", bitmapSetRawData);
+     _rb_define_method(klass, "to_file", bitmapSaveToFile);
 diff --git a/src/audio/audio.cpp b/src/audio/audio.cpp
 index eaf4cc6..c539f0b 100644
 --- a/src/audio/audio.cpp
@@ -387,3 +431,268 @@ index 0a83423..e3fd4fe 100644
  };
  
  #endif // SOUNDEMITTER_H
+diff --git a/src/display/bitmap.cpp b/src/display/bitmap.cpp
+index b301b92..bb27564 100644
+--- a/src/display/bitmap.cpp
++++ b/src/display/bitmap.cpp
+@@ -21,6 +21,13 @@
+ 
+ #include "bitmap.h"
+ 
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
++
+ #include <SDL.h>
+ #include <SDL_image.h>
+ #include <SDL_ttf.h>
+@@ -489,6 +496,155 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
+     }
+ };
+ 
++/* Decodes image files on a worker thread ahead of time (Bitmap.preload), so the
++ * game thread only has to upload the texture when Bitmap.new gets the same name. */
++struct ArcImageHandler : FileSystem::OpenHandler
++{
++    SDL_Surface *surface;
++
++    ArcImageHandler() : surface(0) {}
++
++    bool tryRead(SDL_RWops &ops, const char *ext)
++    {
++        if (IMG_isGIF(&ops))
++            return false;
++
++        surface = IMG_LoadTyped_RW(&ops, 1, ext);
++        return surface != 0;
++    }
++};
++
++struct ArcImagePreload
++{
++    static const size_t MAX_BYTES = 192u * 1024u * 1024u;
++
++    std::mutex lock;
++    std::condition_variable cond;
++    std::deque<std::string> queue;
++    std::unordered_set<std::string> pending;
++    std::unordered_map<std::string, SDL_Surface *> done;
++    size_t doneBytes;
++    std::thread worker;
++    bool quit;
++
++    ArcImagePreload() : doneBytes(0), quit(false) {}
++
++    ~ArcImagePreload()
++    {
++        {
++            std::lock_guard<std::mutex> l(lock);
++            quit = true;
++        }
++        cond.notify_all();
++        if (worker.joinable())
++            worker.join();
++    }
++
++    void run()
++    {
++        for (;;)
++        {
++            std::string name;
++
++            {
++                std::unique_lock<std::mutex> l(lock);
++                cond.wait(l, [this] { return quit || !queue.empty(); });
++
++                if (quit)
++                    return;
++
++                name = queue.front();
++                queue.pop_front();
++            }
++
++            SDL_Surface *surf = 0;
++
++            try
++            {
++                ArcImageHandler handler;
++                shState->fileSystem().openRead(handler, name.c_str());
++                surf = handler.surface;
++            }
++            catch (...)
++            {
++            }
++
++            {
++                std::lock_guard<std::mutex> l(lock);
++
++                if (surf)
++                {
++                    size_t bytes = (size_t) surf->pitch * surf->h;
++
++                    if (doneBytes + bytes <= MAX_BYTES && !done.count(name))
++                    {
++                        done[name] = surf;
++                        doneBytes += bytes;
++                    }
++                    else
++                    {
++                        SDL_FreeSurface(surf);
++                    }
++                }
++
++                pending.erase(name);
++            }
++
++            cond.notify_all();
++        }
++    }
++
++    void request(const std::string &name)
++    {
++        {
++            std::lock_guard<std::mutex> l(lock);
++
++            if (quit || pending.count(name) || done.count(name))
++                return;
++
++            pending.insert(name);
++            queue.push_back(name);
++
++            if (!worker.joinable())
++                worker = std::thread(&ArcImagePreload::run, this);
++        }
++
++        cond.notify_all();
++    }
++
++    /* Returns the decoded surface (caller owns it) or 0. Waits if the
++     * worker is decoding exactly this file right now. */
++    SDL_Surface *take(const std::string &name)
++    {
++        std::unique_lock<std::mutex> l(lock);
++
++        if (pending.count(name))
++            cond.wait(l, [this, &name] { return pending.count(name) == 0; });
++
++        auto it = done.find(name);
++
++        if (it == done.end())
++            return 0;
++
++        SDL_Surface *surf = it->second;
++        doneBytes -= (size_t) surf->pitch * surf->h;
++        done.erase(it);
++
++        return surf;
++    }
++};
++
++static ArcImagePreload &arcImagePreload()
++{
++    static ArcImagePreload instance;
++    return instance;
++}
++
++void Bitmap::preload(const char *filename)
++{
++    arcImagePreload().request(filename);
++}
++
+ Bitmap::Bitmap(const char *filename)
+ {
+     std::string hiresPrefix = "Hires/";
+@@ -509,6 +665,12 @@ Bitmap::Bitmap(const char *filename)
+         }
+     }
+ 
++    if (SDL_Surface *pre = arcImagePreload().take(filenameStd))
++    {
++        initFromSurface(pre, hiresBitmap, false);
++        return;
++    }
++
+     BitmapOpenHandler handler;
+     try {
+         shState->fileSystem().openRead(handler, filename);
+@@ -1799,6 +1961,64 @@ Color Bitmap::getPixel(int x, int y) const
+                  (pixel >> p->format->Ashift) & 0xFF);
+ }
+ 
++IntRect Bitmap::alphaBounds(int threshold, const IntRect &region) const
++{
++    guardDisposed();
++
++    GUARD_MEGA;
++    GUARD_ANIMATED;
++
++    int x0 = clamp<int>(region.x, 0, width());
++    int y0 = clamp<int>(region.y, 0, height());
++    int x1 = (int) std::min<long long>((long long) region.x + region.w, width());
++    int y1 = (int) std::min<long long>((long long) region.y + region.h, height());
++    x1 = std::max(x1, 0);
++    y1 = std::max(y1, 0);
++
++    if (x1 <= x0 || y1 <= y0)
++        return IntRect(0, 0, 0, 0);
++
++    if (!p->surface)
++    {
++        p->allocSurface();
++
++        FBO::bind(p->gl.fbo);
++
++        glState.viewport.pushSet(IntRect(0, 0, width(), height()));
++
++        gl.ReadPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
++
++        glState.viewport.pop();
++    }
++
++    const uint32_t aMask = 0xFFu << p->format->Ashift;
++    const uint32_t aShift = p->format->Ashift;
++    const uint32_t limit = (uint32_t) clamp<int>(threshold, 0, 255);
++
++    int minX = x1, minY = y1, maxX = -1, maxY = -1;
++
++    for (int y = y0; y < y1; ++y)
++    {
++        const uint32_t *row = (const uint32_t *) ((const uint8_t *) p->surface->pixels + y * p->surface->pitch);
++
++        for (int x = x0; x < x1; ++x)
++        {
++            if (((row[x] & aMask) >> aShift) > limit)
++            {
++                if (x < minX) minX = x;
++                if (x > maxX) maxX = x;
++                if (y < minY) minY = y;
++                maxY = y;
++            }
++        }
++    }
++
++    if (maxX < 0)
++        return IntRect(0, 0, 0, 0);
++
++    return IntRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
++}
++
+ void Bitmap::setPixel(int x, int y, const Color &color)
+ {
+     guardDisposed();
+diff --git a/src/display/bitmap.h b/src/display/bitmap.h
+index ca02734..c3cbff5 100644
+--- a/src/display/bitmap.h
++++ b/src/display/bitmap.h
+@@ -99,6 +99,8 @@ public:
+ 	void clear();
+ 
+ 	Color getPixel(int x, int y) const;
++	IntRect alphaBounds(int threshold, const IntRect &region) const;
++	static void preload(const char *filename);
+ 	void setPixel(int x, int y, const Color &color);
+     
+     bool getRaw(void *output, int output_size);
