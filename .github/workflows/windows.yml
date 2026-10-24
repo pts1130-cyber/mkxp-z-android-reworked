@@ -38,6 +38,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64
+          suppress-deprecation-warnings: msystem-mingw64
           install: >-
             bison mingw-w64-x86_64-ccache mingw-w64-x86_64-cmake diffutils mingw-w64-x86_64-git make mingw-w64-x86_64-meson mingw-w64-x86_64-ruby
             mingw-w64-x86_64-gcc
