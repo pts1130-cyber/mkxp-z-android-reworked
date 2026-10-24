@@ -51,9 +51,10 @@ jobs:
       - name: Build all dependencies
         shell: msys2 {0}
         run: |
+          set +e +o pipefail
           cd mkxp-z/windows
-          make 2>&1 | tee ../../deps.log
-          rc=${PIPESTATUS[0]}
+          make > ../../deps.log 2>&1
+          rc=$?
           if [ "$rc" != "0" ]; then
             msg=$(grep -n -i -E "error|\*\*\*|not found|failed|404" ../../deps.log | tail -n 25 | cut -c1-300 | sed ':a;N;$!ba;s/\n/%0A/g')
             tailmsg=$(tail -n 25 ../../deps.log | cut -c1-300 | sed ':a;N;$!ba;s/\n/%0A/g')
