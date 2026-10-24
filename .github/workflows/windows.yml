@@ -52,7 +52,15 @@ jobs:
         shell: msys2 {0}
         run: |
           cd mkxp-z/windows
-          make
+          make 2>&1 | tee ../../deps.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != "0" ]; then
+            msg=$(grep -n -i -E "error|\*\*\*|not found|failed|404" ../../deps.log | tail -n 25 | cut -c1-300 | sed ':a;N;$!ba;s/\n/%0A/g')
+            tailmsg=$(tail -n 25 ../../deps.log | cut -c1-300 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=deps-grep::$msg"
+            echo "::error title=deps-tail::$tailmsg"
+            exit $rc
+          fi
 
       - name: Build exe
         shell: msys2 {0}
