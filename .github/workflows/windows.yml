@@ -41,6 +41,13 @@ jobs:
           git apply --check ../patchrepo/windows-engine/audio-gain.patch
           git apply ../patchrepo/windows-engine/audio-gain.patch
 
+      - name: Apply SE wait patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/audio-wait.patch
+          git apply ../patchrepo/windows-engine/audio-wait.patch
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64
@@ -100,6 +107,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mkxp-z-windows-legacy-se-preload-gain
+          name: mkxp-z-windows-legacy-se-preload-fix
           path: mkxp-z/build/artifact/
           if-no-files-found: error

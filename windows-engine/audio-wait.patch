@@ -1,0 +1,61 @@
+diff --git a/src/audio/soundemitter.cpp b/src/audio/soundemitter.cpp
+index ae3fabd..f202502 100644
+--- a/src/audio/soundemitter.cpp
++++ b/src/audio/soundemitter.cpp
+@@ -327,6 +327,7 @@ void SoundEmitter::workerMain()
+ 
+ 			name = arcQueue.front();
+ 			arcQueue.pop_front();
++			arcActive = name;
+ 		}
+ 
+ 		std::shared_ptr<ArcDecodedSound> result;
+@@ -352,6 +353,7 @@ void SoundEmitter::workerMain()
+ 			}
+ 
+ 			arcPending.erase(name);
++			arcActive.clear();
+ 		}
+ 
+ 		arcCond.notify_all();
+@@ -398,8 +400,26 @@ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
+ 
+ 			if (arcPending.count(filename))
+ 			{
+-				arcCond.wait(lock, [this, &filename] { return arcPending.count(filename) == 0; });
+-				waited = true;
++				if (arcActive == filename)
++				{
++					arcCond.wait(lock, [this, &filename] { return arcPending.count(filename) == 0; });
++					waited = true;
++				}
++				else
++				{
++					/* still queued behind other files: take it out of the queue
++					 * and decode it right here instead of waiting for the queue */
++					for (std::deque<std::string>::iterator it = arcQueue.begin(); it != arcQueue.end(); ++it)
++					{
++						if (*it == filename)
++						{
++							arcQueue.erase(it);
++							break;
++						}
++					}
++
++					arcPending.erase(filename);
++				}
+ 			}
+ 		}
+ 
+diff --git a/src/audio/soundemitter.h b/src/audio/soundemitter.h
+index e3fd4fe..b3f5937 100644
+--- a/src/audio/soundemitter.h
++++ b/src/audio/soundemitter.h
+@@ -81,6 +81,7 @@ private:
+ 	std::unordered_set<std::string> arcPending;
+ 	std::vector<std::shared_ptr<ArcDecodedSound> > arcDone;
+ 	std::thread arcWorker;
++	std::string arcActive;
+ 	bool arcQuit;
+ };
+ 
