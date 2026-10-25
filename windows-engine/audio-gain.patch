@@ -1,0 +1,12 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 6e09d71..db88456 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -151,6 +151,7 @@ int rgssThreadFun(void *userdata) {
+   }
+ 
+   alcMakeContextCurrent(alcCtx);
++  alListenerf(AL_GAIN, 2.0f);
+ 
+   try {
+     SharedState::initInstance(threadData);
