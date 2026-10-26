@@ -62,7 +62,8 @@ public:
 	            int volume = 100,
 	            int pitch = 100);
 	void seStop();
-	void sePreload(const char *filename);
+	void sePreload(const char *filename, bool pin = false);
+	void seUnpinAll();
 
 	void setupMidi();
 	float bgmPos();

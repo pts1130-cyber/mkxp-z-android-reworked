@@ -48,6 +48,13 @@ jobs:
           git apply --check ../patchrepo/windows-engine/audio-wait.patch
           git apply ../patchrepo/windows-engine/audio-wait.patch
 
+      - name: Apply SE cache patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/audio-cache.patch
+          git apply ../patchrepo/windows-engine/audio-cache.patch
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

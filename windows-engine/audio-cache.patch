@@ -1,0 +1,196 @@
+diff --git a/binding/audio-binding.cpp b/binding/audio-binding.cpp
+index b51957b6..b846174a 100644
+--- a/binding/audio-binding.cpp
++++ b/binding/audio-binding.cpp
+@@ -167,8 +167,18 @@ RB_METHOD(audio_sePreload)
+ 	RB_UNUSED_PARAM;
+ 
+ 	const char *filename;
+-	rb_get_args(argc, argv, "z", &filename RB_ARG_END);
+-	shState->audio().sePreload(filename);
++	bool pin = false;
++	rb_get_args(argc, argv, "z|b", &filename, &pin RB_ARG_END);
++	shState->audio().sePreload(filename, pin);
++
++	return Qnil;
++}
++
++RB_METHOD(audio_seUnpinAll)
++{
++	RB_UNUSED_PARAM;
++
++	shState->audio().seUnpinAll();
+ 
+ 	return Qnil;
+ }
+@@ -225,6 +235,7 @@ audioBindingInit()
+ 
+ 	BIND_PLAY_STOP( se )
+ 	_rb_define_module_function(module, "se_preload", audio_sePreload);
++	_rb_define_module_function(module, "se_unpin_all", audio_seUnpinAll);
+ 
+ 	_rb_define_module_function(module, "__reset__", audioReset);
+ }
+diff --git a/src/audio/audio.cpp b/src/audio/audio.cpp
+index c539f0b8..b64d92c5 100644
+--- a/src/audio/audio.cpp
++++ b/src/audio/audio.cpp
+@@ -402,9 +402,14 @@ void Audio::seStop()
+ 	p->se.stop();
+ }
+ 
+-void Audio::sePreload(const char *filename)
++void Audio::sePreload(const char *filename, bool pin)
+ {
+-	p->se.preload(filename);
++	p->se.preload(filename, pin);
++}
++
++void Audio::seUnpinAll()
++{
++	p->se.unpinAll();
+ }
+ 
+ void Audio::setupMidi()
+diff --git a/src/audio/audio.h b/src/audio/audio.h
+index 383a5270..cbbe0fd3 100644
+--- a/src/audio/audio.h
++++ b/src/audio/audio.h
+@@ -65,7 +65,8 @@ public:
+ 	            int volume = 100,
+ 	            int pitch = 100);
+ 	void seStop();
+-	void sePreload(const char *filename);
++	void sePreload(const char *filename, bool pin = false);
++	void seUnpinAll();
+ 
+ 	void setupMidi();
+ 	double bgmPos(int track = 0);
+diff --git a/src/audio/soundemitter.cpp b/src/audio/soundemitter.cpp
+index f2025023..2ae1ee68 100644
+--- a/src/audio/soundemitter.cpp
++++ b/src/audio/soundemitter.cpp
+@@ -30,7 +30,7 @@
+ 
+ #include <SDL_sound.h>
+ 
+-#define SE_CACHE_MEM (32*1024*1024) // 32 MB
++#define SE_CACHE_MEM (256*1024*1024) // 256 MB
+ 
+ struct SoundBuffer
+ {
+@@ -48,9 +48,13 @@ struct SoundBuffer
+ 	/* Reference count */
+ 	uint8_t refCount;
+ 
++	/* kept in the cache until SoundEmitter::unpinAll() */
++	bool pinned;
++
+ 	SoundBuffer()
+ 	    : link(this),
+-	      refCount(1)
++	      refCount(1),
++	      pinned(false)
+ 
+ 	{
+ 		alBuffer = AL::Buffer::gen();
+@@ -264,13 +268,22 @@ struct SoundOpenHandler : FileSystem::OpenHandler
+ void SoundEmitter::insertBuffer(SoundBuffer *buffer, const std::string &filename)
+ {
+ 	buffer->key = filename;
++	buffer->pinned = arcPinned.count(filename) > 0;
+ 	uint32_t wouldBeBytes = bufferBytes + buffer->bytes;
+ 
+-	/* If memory limit is reached, delete lowest priority buffer
+-	 * until there is room or no buffers left */
+-	while (wouldBeBytes > SE_CACHE_MEM && !buffers.isEmpty())
++	/* If memory limit is reached, delete lowest priority unpinned buffer
++	 * until there is room or only pinned buffers are left */
++	while (wouldBeBytes > SE_CACHE_MEM)
+ 	{
+-		SoundBuffer *last = buffers.tail();
++		IntruListLink<SoundBuffer> *node = buffers.end()->prev;
++
++		while (node != buffers.end() && node->data->pinned)
++			node = node->prev;
++
++		if (node == buffers.end())
++			break;
++
++		SoundBuffer *last = node->data;
+ 		bufferHash.remove(last->key);
+ 		buffers.remove(last->link);
+ 
+@@ -360,12 +373,19 @@ void SoundEmitter::workerMain()
+ 	}
+ }
+ 
+-void SoundEmitter::preload(const std::string &filename)
++void SoundEmitter::preload(const std::string &filename, bool pin)
+ {
+ 	adoptDecoded();
+ 
+-	if (bufferHash.value(filename, 0))
++	if (pin)
++		arcPinned.insert(filename);
++
++	if (SoundBuffer *cached = bufferHash.value(filename, 0))
++	{
++		if (pin)
++			cached->pinned = true;
+ 		return;
++	}
+ 
+ 	{
+ 		std::lock_guard<std::mutex> lock(arcLock);
+@@ -383,6 +403,14 @@ void SoundEmitter::preload(const std::string &filename)
+ 	arcCond.notify_all();
+ }
+ 
++void SoundEmitter::unpinAll()
++{
++	arcPinned.clear();
++
++	for (IntruListLink<SoundBuffer> *node = buffers.begin(); node != buffers.end(); node = node->next)
++		node->data->pinned = false;
++}
++
+ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
+ {
+ 	adoptDecoded();
+@@ -433,9 +461,9 @@ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
+ 	if (buffer)
+ 	{
+ 		/* Buffer still in cashe.
+-		 * Move to front of priority list */
++		 * Move to front of priority list (eviction takes the tail) */
+ 		buffers.remove(buffer->link);
+-		buffers.append(buffer->link);
++		buffers.prepend(buffer->link);
+ 
+ 		return buffer;
+ 	}
+diff --git a/src/audio/soundemitter.h b/src/audio/soundemitter.h
+index b3f5937b..644db070 100644
+--- a/src/audio/soundemitter.h
++++ b/src/audio/soundemitter.h
+@@ -67,7 +67,10 @@ struct SoundEmitter
+ 
+ 	/* Decode an effect on a worker thread ahead of time, so the first
+ 	 * play() does not block the game thread. */
+-	void preload(const std::string &filename);
++	void preload(const std::string &filename, bool pin = false);
++
++	/* pinned effects are never pushed out of the cache until unpinAll() */
++	void unpinAll();
+ 
+ private:
+ 	SoundBuffer *allocateBuffer(const std::string &filename);
+@@ -79,6 +82,7 @@ private:
+ 	std::condition_variable arcCond;
+ 	std::deque<std::string> arcQueue;
+ 	std::unordered_set<std::string> arcPending;
++	std::unordered_set<std::string> arcPinned;
+ 	std::vector<std::shared_ptr<ArcDecodedSound> > arcDone;
+ 	std::thread arcWorker;
+ 	std::string arcActive;

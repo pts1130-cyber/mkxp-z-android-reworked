@@ -310,9 +310,14 @@ void Audio::seStop()
 	p->se.stop();
 }
 
-void Audio::sePreload(const char *filename)
+void Audio::sePreload(const char *filename, bool pin)
 {
-	p->se.preload(filename);
+	p->se.preload(filename, pin);
+}
+
+void Audio::seUnpinAll()
+{
+	p->se.unpinAll();
 }
 
 void Audio::setupMidi()

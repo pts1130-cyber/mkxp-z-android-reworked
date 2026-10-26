@@ -68,7 +68,10 @@ struct SoundEmitter
 	/* ARC: decode an effect on a worker thread ahead of time, so the first
 	 * play() does not block the game thread. Safe to call for names that
 	 * are already cached or queued. */
-	void preload(const std::string &filename);
+	void preload(const std::string &filename, bool pin = false);
+
+	/* ARC: pinned effects are never pushed out of the cache until unpinAll() */
+	void unpinAll();
 
 private:
 	SoundBuffer *allocateBuffer(const std::string &filename);
@@ -80,6 +83,7 @@ private:
 	std::condition_variable arcCond;
 	std::deque<std::string> arcQueue;
 	std::unordered_set<std::string> arcPending;
+	std::unordered_set<std::string> arcPinned;
 	std::vector<std::shared_ptr<ArcDecodedSound> > arcDone;
 	std::thread arcWorker;
 	bool arcQuit;

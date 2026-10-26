@@ -34,10 +34,9 @@
 
 #include "arc-prof.h"
 
-/* ARC: 32 MB (was 10 MB). Decoded effects are 32 bit float, long ones (Ruin
- * Light, Z moves...) are several MB each and used to push each other out of
- * the cache, so they were decoded from disk again and again. */
-#define SE_CACHE_MEM (32*1024*1024)
+/* ARC: decoded effects are 32 bit float; the long move sounds of one battle
+ * (Z moves, Ruin Light...) take 70 MB and more */
+#define SE_CACHE_MEM (128*1024*1024)
 
 /* ARC: effect files up to this size are read into memory in one go */
 #define ARC_SE_SLURP_MAX (24*1024*1024)
@@ -58,9 +57,13 @@ struct SoundBuffer
 	/* Reference count */
 	uint8_t refCount;
 
+	/* ARC: kept in the cache until SoundEmitter::unpinAll() */
+	bool pinned;
+
 	SoundBuffer()
 	    : link(this),
-	      refCount(1)
+	      refCount(1),
+	      pinned(false)
 
 	{
 		alBuffer = AL::Buffer::gen();
@@ -381,13 +384,22 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 void SoundEmitter::insertBuffer(SoundBuffer *buffer, const std::string &filename)
 {
 	buffer->key = filename;
+	buffer->pinned = arcPinned.count(filename) > 0;
 	uint32_t wouldBeBytes = bufferBytes + buffer->bytes;
 
-	/* If memory limit is reached, delete lowest priority buffer
-	 * until there is room or no buffers left */
-	while (wouldBeBytes > SE_CACHE_MEM && !buffers.isEmpty())
+	/* If memory limit is reached, delete lowest priority unpinned buffer
+	 * until there is room or only pinned buffers are left */
+	while (wouldBeBytes > SE_CACHE_MEM)
 	{
-		SoundBuffer *last = buffers.tail();
+		IntruListLink<SoundBuffer> *node = buffers.end()->prev;
+
+		while (node != buffers.end() && node->data->pinned)
+			node = node->prev;
+
+		if (node == buffers.end())
+			break;
+
+		SoundBuffer *last = node->data;
 		bufferHash.remove(last->key);
 		buffers.remove(last->link);
 
@@ -475,12 +487,19 @@ void SoundEmitter::workerMain()
 	}
 }
 
-void SoundEmitter::preload(const std::string &filename)
+void SoundEmitter::preload(const std::string &filename, bool pin)
 {
 	adoptDecoded();
 
-	if (bufferHash.value(filename, 0))
+	if (pin)
+		arcPinned.insert(filename);
+
+	if (SoundBuffer *cached = bufferHash.value(filename, 0))
+	{
+		if (pin)
+			cached->pinned = true;
 		return;
+	}
 
 	{
 		std::lock_guard<std::mutex> lock(arcLock);
@@ -496,6 +515,14 @@ void SoundEmitter::preload(const std::string &filename)
 	}
 
 	arcCond.notify_all();
+}
+
+void SoundEmitter::unpinAll()
+{
+	arcPinned.clear();
+
+	for (IntruListLink<SoundBuffer> *node = buffers.begin(); node != buffers.end(); node = node->next)
+		node->data->pinned = false;
 }
 
 SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
@@ -530,9 +557,9 @@ SoundBuffer *SoundEmitter::allocateBuffer(const std::string &filename)
 	if (buffer)
 	{
 		/* Buffer still in cashe.
-		 * Move to front of priority list */
+		 * Move to front of priority list (eviction takes the tail) */
 		buffers.remove(buffer->link);
-		buffers.append(buffer->link);
+		buffers.prepend(buffer->link);
 
 		return buffer;
 	}
