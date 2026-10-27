@@ -808,6 +808,29 @@ RB_METHOD(bitmapArcGlowAlpha) {
     return rb_ary_new3(4, out, INT2NUM(W), INT2NUM(H), INT2NUM(pad));
 }
 
+RB_METHOD(bitmapPreload) {
+    RB_UNUSED_PARAM;
+    
+    for (int i = 0; i < argc; ++i) {
+        VALUE arg = argv[i];
+        if (RB_TYPE_P(arg, T_ARRAY)) {
+            long n = RARRAY_LEN(arg);
+            for (long j = 0; j < n; ++j)
+                Bitmap::preload(objAsStringPtr(rb_ary_entry(arg, j)));
+        } else {
+            Bitmap::preload(objAsStringPtr(arg));
+        }
+    }
+    
+    return Qnil;
+}
+
+RB_METHOD(bitmapPreloadClear) {
+    RB_UNUSED_PARAM;
+    Bitmap::preloadClear();
+    return Qnil;
+}
+
 void bitmapBindingInit() {
     VALUE klass = rb_define_class("Bitmap", rb_cObject);
 #if RAPI_FULL > 187
@@ -817,6 +840,9 @@ void bitmapBindingInit() {
 #endif
     
     disposableBindingInit<Bitmap>(klass);
+    
+    rb_define_class_method(klass, "preload", bitmapPreload);
+    rb_define_class_method(klass, "preload_clear", bitmapPreloadClear);
     
     _rb_define_method(klass, "initialize", bitmapInitialize);
     _rb_define_method(klass, "initialize_copy", bitmapInitializeCopy);

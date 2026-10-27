@@ -58,6 +58,10 @@
 #include <vector>
 #include <string.h>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <deque>
+#include <map>
 #include <unordered_set>
 
 extern "C" {
@@ -587,11 +591,282 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
     }
 };
 
+
+/* ARC: background image decoding. Bitmap.preload(path) queues a file; a worker
+ * thread reads and decodes it (PNG inflate is the slow part, 60-250 ms for the
+ * big effect sheets on the phone) and Bitmap.new(path) then only has to upload
+ * the finished pixels. The worker never touches OpenGL. To keep memory bounded
+ * it stops decoding while PRE_MAX_DONE finished images are waiting to be taken. */
+namespace
+{
+    enum ArcPreStage { PRE_QUEUED, PRE_WORKING, PRE_DONE };
+
+    struct ArcPreItem
+    {
+        ArcPreStage stage;
+        SDL_Surface *surf;
+        ArcPreItem() : stage(PRE_QUEUED), surf(0) {}
+    };
+
+    const size_t PRE_MAX_DONE = 3;
+    const size_t PRE_MAX_BYTES = 40u * 1024u * 1024u;
+
+    struct ArcPreState
+    {
+        std::mutex lock;
+        std::condition_variable cond;
+        std::deque<std::string> queue;
+        std::map<std::string, ArcPreItem> items;
+        size_t doneCount;
+        size_t doneBytes;
+        bool quit;
+        std::thread worker;
+
+        ArcPreState() : doneCount(0), doneBytes(0), quit(false) {}
+    };
+
+    ArcPreState *arcPre = 0;
+
+    struct ArcPreHandler : FileSystem::OpenHandler
+    {
+        SDL_Surface *surface;
+        bool isGif;
+
+        ArcPreHandler() : surface(0), isGif(false) {}
+
+        bool tryRead(SDL_RWops &ops, const char *ext)
+        {
+            isGif = IMG_isGIF(&ops) != 0;
+            surface = IMG_LoadTyped_RW(&ops, 1, ext);
+            return surface != 0;
+        }
+    };
+
+    void arcPreWorkerMain(ArcPreState *st)
+    {
+        for (;;)
+        {
+            std::string name;
+
+            {
+                std::unique_lock<std::mutex> lk(st->lock);
+                st->cond.wait(lk, [st] {
+                    return st->quit ||
+                           (!st->queue.empty() &&
+                            st->doneCount < PRE_MAX_DONE &&
+                            st->doneBytes < PRE_MAX_BYTES);
+                });
+
+                if (st->quit)
+                    return;
+
+                name = st->queue.front();
+                st->queue.pop_front();
+
+                std::map<std::string, ArcPreItem>::iterator it = st->items.find(name);
+                if (it == st->items.end() || it->second.stage != PRE_QUEUED)
+                    continue;
+                it->second.stage = PRE_WORKING;
+            }
+
+            SDL_Surface *surf = 0;
+
+            try
+            {
+                ArcPreHandler h;
+                shState->fileSystem().openRead(h, name.c_str());
+
+                if (h.surface && !h.isGif)
+                {
+                    surf = h.surface;
+                    if (surf->format->format != SDL_PIXELFORMAT_ABGR8888)
+                    {
+                        SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ABGR8888, 0);
+                        SDL_FreeSurface(surf);
+                        surf = conv;
+                    }
+                }
+                else if (h.surface)
+                {
+                    SDL_FreeSurface(h.surface);
+                }
+            }
+            catch (...)
+            {
+                surf = 0;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(st->lock);
+                std::map<std::string, ArcPreItem>::iterator it = st->items.find(name);
+
+                if (it == st->items.end())
+                {
+                    if (surf)
+                        SDL_FreeSurface(surf);
+                }
+                else if (!surf)
+                {
+                    st->items.erase(it);
+                }
+                else
+                {
+                    it->second.surf = surf;
+                    it->second.stage = PRE_DONE;
+                    ++st->doneCount;
+                    st->doneBytes += (size_t)surf->pitch * (size_t)surf->h;
+                }
+            }
+
+            st->cond.notify_all();
+        }
+    }
+
+    /* game thread: returns the decoded surface if the file was preloaded.
+     * A file still waiting in the queue is not waited for (the caller loads it itself) */
+    SDL_Surface *arcPreTake(const char *filename, double *waitedMs)
+    {
+        *waitedMs = -1.0;
+
+        if (!arcPre)
+            return 0;
+
+        ArcPreState *st = arcPre;
+        std::string name(filename);
+        Uint64 t0 = 0;
+        bool waited = false;
+
+        std::unique_lock<std::mutex> lk(st->lock);
+
+        for (;;)
+        {
+            std::map<std::string, ArcPreItem>::iterator it = st->items.find(name);
+
+            if (it == st->items.end())
+                return 0;
+
+            if (it->second.stage == PRE_QUEUED)
+            {
+                st->items.erase(it);
+                for (std::deque<std::string>::iterator q = st->queue.begin(); q != st->queue.end(); ++q)
+                {
+                    if (*q == name)
+                    {
+                        st->queue.erase(q);
+                        break;
+                    }
+                }
+                return 0;
+            }
+
+            if (it->second.stage == PRE_DONE)
+            {
+                SDL_Surface *surf = it->second.surf;
+                st->doneBytes -= (size_t)surf->pitch * (size_t)surf->h;
+                --st->doneCount;
+                st->items.erase(it);
+                lk.unlock();
+                st->cond.notify_all();
+                *waitedMs = waited ? arcMs(SDL_GetPerformanceCounter() - t0) : 0.0;
+                return surf;
+            }
+
+            if (!waited)
+            {
+                waited = true;
+                t0 = SDL_GetPerformanceCounter();
+            }
+            st->cond.wait(lk);
+        }
+    }
+}
+
+void Bitmap::preload(const char *filename)
+{
+    if (!filename || !*filename)
+        return;
+
+    if (!arcPre)
+        arcPre = new ArcPreState();
+
+    ArcPreState *st = arcPre;
+
+    {
+        std::lock_guard<std::mutex> lk(st->lock);
+
+        if (st->quit || st->items.count(filename))
+            return;
+
+        st->items[filename] = ArcPreItem();
+        st->queue.push_back(filename);
+
+        if (!st->worker.joinable())
+            st->worker = std::thread(arcPreWorkerMain, st);
+    }
+
+    st->cond.notify_all();
+}
+
+void Bitmap::preloadClear()
+{
+    if (!arcPre)
+        return;
+
+    ArcPreState *st = arcPre;
+
+    {
+        std::lock_guard<std::mutex> lk(st->lock);
+
+        st->queue.clear();
+
+        for (std::map<std::string, ArcPreItem>::iterator it = st->items.begin(); it != st->items.end();)
+        {
+            if (it->second.surf)
+                SDL_FreeSurface(it->second.surf);
+            it = st->items.erase(it);
+        }
+
+        st->doneCount = 0;
+        st->doneBytes = 0;
+    }
+
+    st->cond.notify_all();
+}
+
+void Bitmap::preloadShutdown()
+{
+    if (!arcPre)
+        return;
+
+    ArcPreState *st = arcPre;
+
+    {
+        std::lock_guard<std::mutex> lk(st->lock);
+        st->quit = true;
+    }
+
+    st->cond.notify_all();
+
+    if (st->worker.joinable())
+        st->worker.join();
+
+    for (std::map<std::string, ArcPreItem>::iterator it = st->items.begin(); it != st->items.end(); ++it)
+        if (it->second.surf)
+            SDL_FreeSurface(it->second.surf);
+
+    st->items.clear();
+    arcPre = 0;
+    delete st;
+}
+
 Bitmap::Bitmap(const char *filename)
 {
     Uint64 arcT0 = SDL_GetPerformanceCounter();
     BitmapOpenHandler handler;
-    shState->fileSystem().openRead(handler, filename);
+    double arcPreWaitMs = -1.0;
+    handler.surface = arcPreTake(filename, &arcPreWaitMs);
+    if (!handler.surface)
+        shState->fileSystem().openRead(handler, filename);
     Uint64 arcT1 = SDL_GetPerformanceCounter();
     
     if (!handler.error.empty()) {
@@ -752,11 +1027,12 @@ Bitmap::Bitmap(const char *filename)
             {
                 char clk[16];
                 ++arcImgLines;
-                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s\n",
+                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s%s\n",
                         arcClockStr(clk), SDL_GetTicks() / 1000.0,
                         total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
                         handler.readMs, handler.readBytes, handler.readCalls,
-                        handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename);
+                        handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename,
+                        arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]"));
                 fclose(lf);
             }
         }

@@ -24,6 +24,7 @@
 #include "util.h"
 #include "filesystem.h"
 #include "graphics.h"
+#include "bitmap.h"
 #include "input.h"
 #include "audio.h"
 #include "glstate.h"
@@ -166,6 +167,7 @@ struct SharedStatePrivate
 
 	~SharedStatePrivate()
 	{
+		Bitmap::preloadShutdown();
 		TEX::del(globalTex);
 		TEXFBO::fini(gpTexFBO);
 		TEXFBO::fini(atlasTex);

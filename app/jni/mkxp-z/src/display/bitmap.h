@@ -39,6 +39,11 @@ class Bitmap : public Disposable
 {
 public:
 	Bitmap(const char *filename);
+
+	/* ARC: decode image files on a worker thread before they are needed */
+	static void preload(const char *filename);
+	static void preloadClear();
+	static void preloadShutdown();
 	Bitmap(int width, int height);
     Bitmap(void *pixeldata, int width, int height);
 	/* Clone constructor */
