@@ -55,6 +55,13 @@ jobs:
           git apply --check ../patchrepo/windows-engine/audio-cache.patch
           git apply ../patchrepo/windows-engine/audio-cache.patch
 
+      - name: Apply fast signal mutex patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/fast-mutex.patch
+          git apply ../patchrepo/windows-engine/fast-mutex.patch
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

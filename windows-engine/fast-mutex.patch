@@ -1,0 +1,27 @@
+diff --git a/src/util/sigslot/signal.hpp b/src/util/sigslot/signal.hpp
+index 3dfd2def..8471fea7 100644
+--- a/src/util/sigslot/signal.hpp
++++ b/src/util/sigslot/signal.hpp
+@@ -737,7 +737,11 @@ using observer_st = observer_base<detail::null_mutex>;
+ /**
+  * Specialization of observer_base to be used in multi-threaded contexts.
+  */
++#ifdef _WIN32
++using observer = observer_base<detail::spin_mutex>;
++#else
+ using observer = observer_base<std::mutex>;
++#endif
+ 
+ 
+ namespace detail {
+@@ -1606,6 +1610,10 @@ using signal_st = signal_base<detail::null_mutex, T...>;
+  * Recursive signal emission and emission cycles are supported too.
+  */
+ template <typename... T>
++#ifdef _WIN32
++using signal = signal_base<detail::spin_mutex, T...>;
++#else
+ using signal = signal_base<std::mutex, T...>;
++#endif
+ 
+ } // namespace sigslot
