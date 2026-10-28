@@ -11,7 +11,7 @@
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-#define ARCFOG_VERSION 1
+#define ARCFOG_VERSION 2
 #define GRAD 4
 #define LEVELS 12
 #define W1 1.5
@@ -35,7 +35,6 @@ typedef struct {
   float *tab;          /* base(dd) 표 */
   int tabn;
   float *d;            /* 거리 작업장 gw*gh */
-  unsigned char *solid; /* gw1*gh1 작업장 */
   int gw1, gh1;
   unsigned long stamp;
 } Slot;
@@ -44,7 +43,7 @@ static Slot slots[SLOTS];
 static unsigned long tick = 0;
 
 static void slot_free(Slot *s) {
-  free(s->amp); free(s->ph); free(s->tab); free(s->d); free(s->solid);
+  free(s->amp); free(s->ph); free(s->tab); free(s->d);
   memset(s, 0, sizeof(Slot));
 }
 
@@ -72,10 +71,9 @@ static Slot *slot_get(int gw, int gh, int mg, int g, double sc, double s1, doubl
     s->amp = (float *)malloc(sizeof(float) * n);
     s->ph = (float *)malloc(sizeof(float) * n);
     s->d = (float *)malloc(sizeof(float) * n);
-    s->solid = (unsigned char *)malloc((size_t)gw1 * gh1);
     s->tabn = (int)ceil((2.6 * s2 + 2.0) / TABLE_STEP) + 2;
     s->tab = (float *)malloc(sizeof(float) * s->tabn);
-    if (!s->amp || !s->ph || !s->d || !s->solid || !s->tab) { slot_free(s); return NULL; }
+    if (!s->amp || !s->ph || !s->d || !s->tab) { slot_free(s); return NULL; }
     for (k = 0; k < s->tabn; k++) {
       double dd = k * TABLE_STEP;
       s->tab[k] = (float)(W1 * 0.5 * erfc(dd / (s1 * sq2)) + W2 * 0.5 * erfc(dd / (s2 * sq2)));
@@ -100,40 +98,56 @@ static Slot *slot_get(int gw, int gh, int mg, int g, double sc, double s1, doubl
 
 EXPORT int arcfog_version(void) { return ARCFOG_VERSION; }
 
-/* dp: [0]=시각(초) [1]=주기(초) [2]=방향(-1:3시, 1:9시) [3]=sc [4]=s1 [5]=s2
- * ip: [0]=sw [1]=sh [2]=rx [3]=ry [4]=rw [5]=rh [6]=알파자리 [7]=위아래뒤집힘 [8..10]=R,G,B 자리
- *     [11]=step [12]=g [13]=gw1 [14]=gh1 [15]=mg [16]=gw [17]=gh [18]=rep(칸 하나를 rep×rep 점으로 씀)
- * src: 현재 프레임 RGBA(sw*sh*4) / out: (gw*rep)*(gh*rep)*4 (전부 덮어씀)
- * 반환: 칠한 칸 수(0 이상) / 음수 = 오류 */
-EXPORT int arcfog_paint(const double *dp, const int *ip, const unsigned char *src, unsigned char *out) {
-  int sw = ip[0], sh = ip[1], rx = ip[2], ry = ip[3], rw = ip[4], rh = ip[5];
-  int ai = ip[6], flip = ip[7], ri = ip[8], gi_ = ip[9], bi = ip[10];
-  int step = ip[11], g = ip[12], gw1 = ip[13], gh1 = ip[14], mg = ip[15], gw = ip[16], gh = ip[17], rp = ip[18];
-  double t = dp[0], period = dp[1], dir = dp[2], sc = dp[3], s1 = dp[4], s2 = dp[5];
-  int half, r, c, rmin = -1, rmax = -1, painted = 0;
-  long n;
-  Slot *s;
-  float *d;
-  const float INF = 1.0e9f, DG = 1.4142f;
-  double bh, top, omega, th, pulse;
-
-  if (!dp || !ip || !src || !out) return -1;
-  if (sw <= 0 || sh <= 0 || gw1 <= 0 || gh1 <= 0 || gw != gw1 + 2 * mg || gh != gh1 + 2 * mg || step < 1 || g < 1 || rp < 1) return -1;
-  if (sc <= 0.0 || s1 <= 0.0 || s2 <= 0.0 || period <= 0.0) return -1;
-  n = (long)gw * gh;
-  memset(out, 0, (size_t)n * rp * rp * 4);
-  s = slot_get(gw, gh, mg, g, sc, s1, s2, gw1, gh1);
-  if (!s) return -2;
-  d = s->d;
+/* 몸 칸 마스크: 칸 중심 점의 알파가 128 보다 크면 1. 몸 프레임마다 한 번만 만들어 두고 arcfog_paint 가 계속 씀
+ * ip: [0]=sw [1]=sh [2]=rx [3]=ry [4]=rw [5]=rh [6]=알파자리 [7]=step [8]=g [9]=gw1 [10]=gh1
+ * src: RGBA(sw*sh*4) / mask: gw1*gh1 바이트(전부 덮어씀) / 반환: 몸 칸 수(0 이상) / 음수 = 오류 */
+EXPORT int arcfog_prep(const int *ip, const unsigned char *src, unsigned char *mask) {
+  int sw, sh, rx, ry, rw, rh, ai, step, g, gw1, gh1, half, r, c, solid = 0;
+  if (!ip || !src || !mask) return -1;
+  sw = ip[0]; sh = ip[1]; rx = ip[2]; ry = ip[3]; rw = ip[4]; rh = ip[5];
+  ai = ip[6]; step = ip[7]; g = ip[8]; gw1 = ip[9]; gh1 = ip[10];
+  if (sw <= 0 || sh <= 0 || gw1 <= 0 || gh1 <= 0 || step < 1 || g < 1 || ai < 0 || ai > 3) return -1;
   half = step / 2;
-  for (r = 0; r < gh; r++) for (c = 0; c < gw; c++) d[(long)r * gw + c] = INF;
+  memset(mask, 0, (size_t)gw1 * gh1);
   for (r = 0; r < gh1; r++) {
     int yy = ry + (r * g * step) + half;
     if (yy >= ry + rh || yy >= sh) continue;
     for (c = 0; c < gw1; c++) {
       int xx = rx + (c * g * step) + half;
       if (xx >= rx + rw || xx >= sw) continue;
-      if (src[((long)yy * sw + xx) * 4 + ai] > 128) {
+      if (src[((long)yy * sw + xx) * 4 + ai] > 128) { mask[(long)r * gw1 + c] = 1; solid++; }
+    }
+  }
+  return solid;
+}
+
+/* dp: [0]=시각(초) [1]=주기(초) [2]=방향(-1:3시, 1:9시) [3]=sc [4]=s1 [5]=s2
+ * ip: [0]=알파자리 [1]=위아래뒤집힘 [2..4]=R,G,B 자리 [5]=g [6]=gw1 [7]=gh1 [8]=mg [9]=gw [10]=gh [11]=rep(칸 하나를 rep×rep 점으로 씀)
+ * mask: arcfog_prep 가 만든 gw1*gh1 / out: (gw*rep)*(gh*rep)*4 (전부 덮어씀)
+ * 반환: 칠한 칸 수(0 이상) / 음수 = 오류 */
+EXPORT int arcfog_paint(const double *dp, const int *ip, const unsigned char *mask, unsigned char *out) {
+  int ai = ip[0], flip = ip[1], ri = ip[2], gi_ = ip[3], bi = ip[4];
+  int g = ip[5], gw1 = ip[6], gh1 = ip[7], mg = ip[8], gw = ip[9], gh = ip[10], rp = ip[11];
+  double t = dp[0], period = dp[1], dir = dp[2], sc = dp[3], s1 = dp[4], s2 = dp[5];
+  int r, c, rmin = -1, rmax = -1, painted = 0;
+  long n;
+  Slot *s;
+  float *d;
+  const float INF = 1.0e9f, DG = 1.4142f;
+  double bh, top, omega, th, pulse;
+
+  if (!dp || !ip || !mask || !out) return -1;
+  if (gw1 <= 0 || gh1 <= 0 || gw != gw1 + 2 * mg || gh != gh1 + 2 * mg || g < 1 || rp < 1) return -1;
+  if (sc <= 0.0 || s1 <= 0.0 || s2 <= 0.0 || period <= 0.0) return -1;
+  n = (long)gw * gh;
+  memset(out, 0, (size_t)n * rp * rp * 4);
+  s = slot_get(gw, gh, mg, g, sc, s1, s2, gw1, gh1);
+  if (!s) return -2;
+  d = s->d;
+  for (r = 0; r < gh; r++) for (c = 0; c < gw; c++) d[(long)r * gw + c] = INF;
+  for (r = 0; r < gh1; r++) {
+    for (c = 0; c < gw1; c++) {
+      if (mask[(long)r * gw1 + c]) {
         d[(long)(r + mg) * gw + (c + mg)] = 0.0f;
         if (rmin < 0) rmin = r;
         rmax = r;
