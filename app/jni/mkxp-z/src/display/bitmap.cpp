@@ -608,8 +608,8 @@ namespace
         ArcPreItem() : stage(PRE_QUEUED), surf(0) {}
     };
 
-    const size_t PRE_MAX_DONE = 3;
-    const size_t PRE_MAX_BYTES = 40u * 1024u * 1024u;
+    const size_t PRE_MAX_DONE = 8;
+    const size_t PRE_MAX_BYTES = 64u * 1024u * 1024u;
 
     struct ArcPreState
     {
