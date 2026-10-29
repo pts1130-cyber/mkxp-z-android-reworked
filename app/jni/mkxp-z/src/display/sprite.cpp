@@ -224,9 +224,8 @@ struct SpritePrivate
         float wavePos = phase + (chunkY / (float) wave.length) * (float) (M_PI * 2);
         float chunkX = sin(wavePos) * wave.amp;
         
-        FloatRect tex(0, chunkY / zoomY, width, chunkLength / zoomY);
-        FloatRect pos = tex;
-        pos.x = chunkX;
+        FloatRect tex(srcRect->x, srcRect->y + chunkY / zoomY, width, chunkLength / zoomY);
+        FloatRect pos(chunkX, chunkY / zoomY, width, chunkLength / zoomY);
         
         Quad::setTexPosRect(vert, mirrored ? tex.hFlipped() : tex, pos);
         vert += 4;
