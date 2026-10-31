@@ -60,8 +60,15 @@ RB_METHOD(bitmapInitialize) {
     if (argc == 1) {
         char *filename;
         rb_get_args(argc, argv, "z", &filename RB_ARG_END);
-        
+
         GFX_GUARD_EXC(b = new Bitmap(filename);)
+    } else if (argc == 2 && RB_TYPE_P(argv[0], T_STRING)) {
+        /* ARC: Bitmap.new(filename, logical_scale) -> texture at 1/scale, same width/height */
+        char *filename;
+        int scale;
+        rb_get_args(argc, argv, "zi", &filename, &scale RB_ARG_END);
+
+        GFX_GUARD_EXC(b = new Bitmap(filename, scale);)
     } else {
         int width, height;
         rb_get_args(argc, argv, "ii", &width, &height RB_ARG_END);
@@ -83,6 +90,17 @@ RB_METHOD(bitmapWidth) {
     int value = 0;
     GUARD_EXC(value = b->width(););
     
+    return INT2FIX(value);
+}
+
+RB_METHOD(bitmapLogicalScale) {
+    RB_UNUSED_PARAM;
+
+    Bitmap *b = getPrivateData<Bitmap>(self);
+
+    int value = 1;
+    GUARD_EXC(value = b->logicalScale(););
+
     return INT2FIX(value);
 }
 
@@ -810,19 +828,37 @@ RB_METHOD(bitmapArcGlowAlpha) {
 
 RB_METHOD(bitmapPreload) {
     RB_UNUSED_PARAM;
-    
-    for (int i = 0; i < argc; ++i) {
+
+    /* ARC: a trailing Integer is the logical scale for every path in the call */
+    int scale = 1;
+    int n = argc;
+    if (n > 0 && FIXNUM_P(argv[n - 1])) {
+        scale = NUM2INT(argv[n - 1]);
+        --n;
+    }
+
+    for (int i = 0; i < n; ++i) {
         VALUE arg = argv[i];
         if (RB_TYPE_P(arg, T_ARRAY)) {
-            long n = RARRAY_LEN(arg);
-            for (long j = 0; j < n; ++j)
-                Bitmap::preload(objAsStringPtr(rb_ary_entry(arg, j)));
+            long m = RARRAY_LEN(arg);
+            for (long j = 0; j < m; ++j)
+                Bitmap::preload(objAsStringPtr(rb_ary_entry(arg, j)), scale);
         } else {
-            Bitmap::preload(objAsStringPtr(arg));
+            Bitmap::preload(objAsStringPtr(arg), scale);
         }
     }
-    
+
     return Qnil;
+}
+
+RB_METHOD(bitmapPreloadLimits) {
+    RB_UNUSED_PARAM;
+
+    int maxDone = 0;
+    unsigned long long maxBytes = 0;
+    Bitmap::preloadLimits(&maxDone, &maxBytes);
+
+    return rb_ary_new3(2, INT2NUM(maxDone), ULL2NUM(maxBytes));
 }
 
 RB_METHOD(bitmapPreloadClear) {
@@ -843,12 +879,14 @@ void bitmapBindingInit() {
     
     rb_define_class_method(klass, "preload", bitmapPreload);
     rb_define_class_method(klass, "preload_clear", bitmapPreloadClear);
+    rb_define_class_method(klass, "preload_limits", bitmapPreloadLimits);
     
     _rb_define_method(klass, "initialize", bitmapInitialize);
     _rb_define_method(klass, "initialize_copy", bitmapInitializeCopy);
     
     _rb_define_method(klass, "width", bitmapWidth);
     _rb_define_method(klass, "height", bitmapHeight);
+    _rb_define_method(klass, "logical_scale", bitmapLogicalScale);
     _rb_define_method(klass, "rect", bitmapRect);
     _rb_define_method(klass, "blt", bitmapBlt);
     _rb_define_method(klass, "stretch_blt", bitmapStretchBlt);

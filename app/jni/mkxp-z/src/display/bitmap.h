@@ -38,12 +38,17 @@ struct BitmapPrivate;
 class Bitmap : public Disposable
 {
 public:
-	Bitmap(const char *filename);
+	/* ARC: logicalScale > 1 loads the file at 1/logicalScale size (alpha-weighted
+	 * box filter, linear sampling). width()/height()/rect() and every coordinate
+	 * the scripts use stay at the file's original ("logical") size */
+	Bitmap(const char *filename, int logicalScale = 1);
 
 	/* ARC: decode image files on a worker thread before they are needed */
-	static void preload(const char *filename);
+	static void preload(const char *filename, int logicalScale = 1);
 	static void preloadClear();
 	static void preloadShutdown();
+	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
+	int logicalScale() const;
 	Bitmap(int width, int height);
     Bitmap(void *pixeldata, int width, int height);
 	/* Clone constructor */

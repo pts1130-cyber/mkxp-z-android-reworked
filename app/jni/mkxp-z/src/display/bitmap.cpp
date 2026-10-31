@@ -63,6 +63,8 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <list>
+#include <stdlib.h>
 
 extern "C" {
 #include "libnsgif/libnsgif.h"
@@ -90,6 +92,17 @@ throw Exception(Exception::MKXPError, \
 }
 
 #define OUTLINE_SIZE 1
+
+#define GUARD_SCALED \
+{ \
+if (p->lscale > 1) \
+throw Exception(Exception::MKXPError, \
+"Operation not supported for scaled bitmaps"); \
+}
+
+struct BitmapPrivate;
+static void arcKeepRemove(BitmapPrivate *p);
+static void arcKeepRegister(BitmapPrivate *p);
 
 /* Normalize (= ensure width and
  * height are positive) */
@@ -264,6 +277,16 @@ struct BitmapPrivate
     bool pendDirty;
     int pendX1, pendY1, pendX2, pendY2;   /* bounding box, x2/y2 exclusive */
     int spStreak;                         /* consecutive setPixel calls */
+
+    /* ARC: logical scale. gl holds the texture at 1/lscale size, width()/height()
+     * report gl size * lscale (see Bitmap(const char*, int)) */
+    int lscale;
+
+    /* ARC: 'surface' (decoded file pixels or a read-back) is kept in RAM, bounded
+     * by ARC_KEEP_MAX_BYTES across all bitmaps, so raw_data/get_pixel on a fresh
+     * picture is a memcpy instead of a GPU read-back */
+    bool kept;
+    std::list<BitmapPrivate *>::iterator keepIt;
     
     BitmapPrivate(Bitmap *self)
     : self(self),
@@ -271,7 +294,9 @@ struct BitmapPrivate
     surface(0),
     pendDirty(false),
     pendX1(0), pendY1(0), pendX2(0), pendY2(0),
-    spStreak(0)
+    spStreak(0),
+    lscale(1),
+    kept(false)
     {
         format = SDL_AllocFormat(SDL_PIXELFORMAT_ABGR8888);
         
@@ -303,6 +328,12 @@ struct BitmapPrivate
             g_arcLiveBitmaps.erase(this);
         }
         prepareCon.disconnect();
+        arcKeepRemove(this);
+        if (surface)
+        {
+            SDL_FreeSurface(surface);
+            surface = 0;
+        }
         SDL_FreeFormat(format);
         pixman_region_fini(&tainted);
     }
@@ -419,7 +450,7 @@ struct BitmapPrivate
             return;
         }
         TEX::bind(gl.tex);
-        shader.setTexSize(Vec2i(gl.width, gl.height));
+        shader.setTexSize(Vec2i(gl.width * lscale, gl.height * lscale));
     }
     
     void bindFBO()
@@ -479,13 +510,148 @@ struct BitmapPrivate
         
         if (surface && freeSurface)
         {
+            arcKeepRemove(this);
             SDL_FreeSurface(surface);
             surface = 0;
         }
-        
+
         self->modified();
     }
 };
+
+/* ARC: decoded pictures kept in RAM, most recently used first */
+namespace
+{
+    std::list<BitmapPrivate *> arcKeepList;
+    size_t arcKeepBytes = 0;
+    const size_t ARC_KEEP_MAX_BYTES = 64u * 1024u * 1024u;
+
+    size_t arcSurfBytes(SDL_Surface *s)
+    {
+        return s ? (size_t) s->pitch * (size_t) s->h : 0;
+    }
+}
+
+static void arcKeepRemove(BitmapPrivate *p)
+{
+    if (!p->kept)
+        return;
+
+    p->kept = false;
+    arcKeepList.erase(p->keepIt);
+    size_t b = arcSurfBytes(p->surface);
+    arcKeepBytes = arcKeepBytes > b ? arcKeepBytes - b : 0;
+}
+
+/* p->surface is set: count it and drop the least recently kept pictures over the cap */
+static void arcKeepRegister(BitmapPrivate *p)
+{
+    if (!p->surface || p->kept)
+        return;
+
+    size_t b = arcSurfBytes(p->surface);
+    if (b > ARC_KEEP_MAX_BYTES)
+        return;
+
+    arcKeepList.push_front(p);
+    p->keepIt = arcKeepList.begin();
+    p->kept = true;
+    arcKeepBytes += b;
+
+    while (arcKeepBytes > ARC_KEEP_MAX_BYTES && !arcKeepList.empty())
+    {
+        BitmapPrivate *old = arcKeepList.back();
+        if (old == p)
+            break;
+        arcKeepRemove(old);
+        if (old->surface)
+        {
+            old->flushPending();
+            SDL_FreeSurface(old->surface);
+            old->surface = 0;
+        }
+    }
+}
+
+/* ARC: shrink an ABGR8888 surface by an integer factor with an alpha-weighted
+ * (premultiplied) box filter, so transparent pixels (RGB 0) do not darken edges.
+ * Pure CPU work, safe on the preload worker thread. */
+static SDL_Surface *arcDownscaleSurface(SDL_Surface *src, int div)
+{
+    if (!src || div <= 1 || src->format->BytesPerPixel != 4)
+        return 0;
+
+    int w = src->w, h = src->h;
+    int dw = (w + div - 1) / div, dh = (h + div - 1) / div;
+
+    SDL_Surface *dst = SDL_CreateRGBSurface(0, dw, dh, 32,
+                                            src->format->Rmask, src->format->Gmask,
+                                            src->format->Bmask, src->format->Amask);
+    if (!dst)
+        return 0;
+
+    int ai = src->format->Ashift / 8;
+    int ci[3];
+    int nc = 0;
+    for (int i = 0; i < 4; ++i)
+        if (i != ai)
+            ci[nc++] = i;
+
+    const uint8_t *sp = (const uint8_t *) src->pixels;
+    uint8_t *dp = (uint8_t *) dst->pixels;
+
+    for (int dy = 0; dy < dh; ++dy)
+    {
+        int y0 = dy * div;
+        int y1 = std::min(y0 + div, h);
+        uint8_t *drow = dp + (size_t) dy * dst->pitch;
+
+        for (int dx = 0; dx < dw; ++dx)
+        {
+            int x0 = dx * div;
+            int x1 = std::min(x0 + div, w);
+            uint32_t sa = 0, sc0 = 0, sc1 = 0, sc2 = 0;
+            uint32_t n = 0;
+
+            for (int y = y0; y < y1; ++y)
+            {
+                const uint8_t *px = sp + (size_t) y * src->pitch + (size_t) x0 * 4;
+                for (int x = x0; x < x1; ++x, px += 4)
+                {
+                    uint32_t a = px[ai];
+                    sa += a;
+                    sc0 += px[ci[0]] * a;
+                    sc1 += px[ci[1]] * a;
+                    sc2 += px[ci[2]] * a;
+                    ++n;
+                }
+            }
+
+            uint8_t *out = drow + (size_t) dx * 4;
+            out[ai] = (uint8_t) ((sa + n / 2) / n);
+            out[ci[0]] = sa ? (uint8_t) ((sc0 + sa / 2) / sa) : 0;
+            out[ci[1]] = sa ? (uint8_t) ((sc1 + sa / 2) / sa) : 0;
+            out[ci[2]] = sa ? (uint8_t) ((sc2 + sa / 2) / sa) : 0;
+        }
+    }
+
+    return dst;
+}
+
+/* ARC: logical-size (nearest) copy of a scaled bitmap's small surface */
+static void arcUpscaleRaw(SDL_Surface *small, int div, int w, int h, void *output)
+{
+    uint8_t *out = (uint8_t *) output;
+    const uint8_t *sp = (const uint8_t *) small->pixels;
+
+    for (int y = 0; y < h; ++y)
+    {
+        const uint8_t *srow = sp + (size_t) std::min(y / div, small->h - 1) * small->pitch;
+        uint8_t *orow = out + (size_t) y * w * 4;
+        for (int x = 0; x < w; ++x)
+            memcpy(orow + (size_t) x * 4, srow + (size_t) std::min(x / div, small->w - 1) * 4, 4);
+    }
+}
 
 /* ARC: counters shown in the _log/engine_gfx.txt summary lines */
 uint32_t arcImgCount = 0;
@@ -608,8 +774,20 @@ namespace
         ArcPreItem() : stage(PRE_QUEUED), surf(0) {}
     };
 
-    const size_t PRE_MAX_DONE = 8;
-    const size_t PRE_MAX_BYTES = 64u * 1024u * 1024u;
+    const size_t PRE_MAX_DONE = 16;
+    const size_t PRE_MAX_BYTES = 96u * 1024u * 1024u;
+
+    /* queue key: "<file>" or "<file>\x01<scale>" for a picture wanted at 1/scale */
+    std::string arcPreKey(const char *filename, int lscale)
+    {
+        std::string key(filename);
+        if (lscale > 1)
+        {
+            key += '\x01';
+            key += std::to_string(lscale);
+        }
+        return key;
+    }
 
     struct ArcPreState
     {
@@ -670,11 +848,21 @@ namespace
             }
 
             SDL_Surface *surf = 0;
+            std::string file = name;
+            int lscale = 1;
+            {
+                size_t sep = name.find('\x01');
+                if (sep != std::string::npos)
+                {
+                    lscale = atoi(name.c_str() + sep + 1);
+                    file = name.substr(0, sep);
+                }
+            }
 
             try
             {
                 ArcPreHandler h;
-                shState->fileSystem().openRead(h, name.c_str());
+                shState->fileSystem().openRead(h, file.c_str());
 
                 if (h.surface && !h.isGif)
                 {
@@ -684,6 +872,15 @@ namespace
                         SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ABGR8888, 0);
                         SDL_FreeSurface(surf);
                         surf = conv;
+                    }
+                    if (surf && lscale > 1)
+                    {
+                        SDL_Surface *small = arcDownscaleSurface(surf, lscale);
+                        if (small)
+                        {
+                            SDL_FreeSurface(surf);
+                            surf = small;
+                        }
                     }
                 }
                 else if (h.surface)
@@ -724,7 +921,7 @@ namespace
 
     /* game thread: returns the decoded surface if the file was preloaded.
      * A file still waiting in the queue is not waited for (the caller loads it itself) */
-    SDL_Surface *arcPreTake(const char *filename, double *waitedMs)
+    SDL_Surface *arcPreTake(const char *filename, int lscale, double *waitedMs)
     {
         *waitedMs = -1.0;
 
@@ -732,7 +929,7 @@ namespace
             return 0;
 
         ArcPreState *st = arcPre;
-        std::string name(filename);
+        std::string name = arcPreKey(filename, lscale);
         Uint64 t0 = 0;
         bool waited = false;
 
@@ -781,7 +978,15 @@ namespace
     }
 }
 
-void Bitmap::preload(const char *filename)
+void Bitmap::preloadLimits(int *maxDone, unsigned long long *maxBytes)
+{
+    if (maxDone)
+        *maxDone = (int) PRE_MAX_DONE;
+    if (maxBytes)
+        *maxBytes = (unsigned long long) PRE_MAX_BYTES;
+}
+
+void Bitmap::preload(const char *filename, int lscale)
 {
     if (!filename || !*filename)
         return;
@@ -790,15 +995,16 @@ void Bitmap::preload(const char *filename)
         arcPre = new ArcPreState();
 
     ArcPreState *st = arcPre;
+    std::string key = arcPreKey(filename, lscale < 1 ? 1 : lscale);
 
     {
         std::lock_guard<std::mutex> lk(st->lock);
 
-        if (st->quit || st->items.count(filename))
+        if (st->quit || st->items.count(key))
             return;
 
-        st->items[filename] = ArcPreItem();
-        st->queue.push_back(filename);
+        st->items[key] = ArcPreItem();
+        st->queue.push_back(key);
 
         if (!st->worker.joinable())
             st->worker = std::thread(arcPreWorkerMain, st);
@@ -859,12 +1065,15 @@ void Bitmap::preloadShutdown()
     delete st;
 }
 
-Bitmap::Bitmap(const char *filename)
+Bitmap::Bitmap(const char *filename, int lscale)
 {
     Uint64 arcT0 = SDL_GetPerformanceCounter();
     BitmapOpenHandler handler;
     double arcPreWaitMs = -1.0;
-    handler.surface = arcPreTake(filename, &arcPreWaitMs);
+    if (lscale < 1)
+        lscale = 1;
+    handler.surface = arcPreTake(filename, lscale, &arcPreWaitMs);
+    bool arcPreScaled = handler.surface != 0;   /* a preloaded picture is already at 1/lscale */
     if (!handler.surface)
         shState->fileSystem().openRead(handler, filename);
     Uint64 arcT1 = SDL_GetPerformanceCounter();
@@ -973,13 +1182,25 @@ Bitmap::Bitmap(const char *filename)
     }
     
     SDL_Surface *imgSurf = handler.surface;
-    
-    
+
+
     p->ensureFormat(imgSurf, SDL_PIXELFORMAT_ABGR8888);
-    
+
+    if (lscale > 1 && !arcPreScaled)
+    {
+        SDL_Surface *small = arcDownscaleSurface(imgSurf, lscale);
+        if (small)
+        {
+            SDL_FreeSurface(imgSurf);
+            imgSurf = small;
+        }
+        else
+            lscale = 1;
+    }
+
     if (imgSurf->w > glState.caps.maxTexSize || imgSurf->h > glState.caps.maxTexSize)
     {
-        /* Mega surface */
+        /* Mega surface (a scaled picture that is still too large keeps its small size; lscale stays 1) */
         p = new BitmapPrivate(this);
         p->megaSurface = imgSurf;
         SDL_SetSurfaceBlendMode(p->megaSurface, SDL_BLENDMODE_NONE);
@@ -1001,11 +1222,21 @@ Bitmap::Bitmap(const char *filename)
         
         p = new BitmapPrivate(this);
         p->gl = tex;
-        
+        p->lscale = lscale;
+
         TEX::bind(p->gl.tex);
         TEX::uploadImage(p->gl.width, p->gl.height, imgSurf->pixels, GL_RGBA);
-        
-        SDL_FreeSurface(imgSurf);
+        if (lscale > 1)
+            TEX::setSmooth(true);
+
+        /* keep the decoded pixels (bounded) instead of freeing them */
+        p->surface = imgSurf;
+        arcKeepRegister(p);
+        if (!p->kept)
+        {
+            SDL_FreeSurface(imgSurf);
+            p->surface = 0;
+        }
     }
     
     p->addTaintedArea(rect());
@@ -1120,7 +1351,8 @@ Bitmap::Bitmap(const Bitmap &other, int frame)
             auto &frames = other.getFrames();
             GLMeta::blitSource(frames[clamp(frame, 0, (int)frames.size() - 1)]);
         }
-        GLMeta::blitRectangle(rect(), rect(), true);
+        GLMeta::blitRectangle(other.p->lscale > 1 ? IntRect(0, 0, other.p->gl.width, other.p->gl.height) : rect(),
+                              rect(), true);
         GLMeta::blitEnd();
     }
     else {
@@ -1172,7 +1404,7 @@ int Bitmap::width() const
         return p->animation.width;
     }
     
-    return p->gl.width;
+    return p->gl.width * p->lscale;
 }
 
 int Bitmap::height() const
@@ -1185,7 +1417,14 @@ int Bitmap::height() const
     if (p->animation.enabled)
         return p->animation.height;
     
-    return p->gl.height;
+    return p->gl.height * p->lscale;
+}
+
+int Bitmap::logicalScale() const
+{
+    guardDisposed();
+
+    return p->lscale;
 }
 
 bool Bitmap::isMega() const{
@@ -1238,6 +1477,7 @@ void Bitmap::stretchBlt(const IntRect &destRect,
     
     // Don't need this, right? This function is fine with megasurfaces it seems
     //GUARD_MEGA;
+    GUARD_SCALED;
     
     if (source.isDisposed())
         return;
@@ -1332,7 +1572,14 @@ void Bitmap::stretchBlt(const IntRect &destRect,
         /* Fast blit */
         GLMeta::blitBegin(getGLTypes());
         GLMeta::blitSource(source.getGLTypes());
-        GLMeta::blitRectangle(sourceRect, destRect);
+        if (source.p->lscale > 1)
+        {
+            int ls = source.p->lscale;
+            GLMeta::blitRectangle(IntRect(sourceRect.x / ls, sourceRect.y / ls, sourceRect.w / ls, sourceRect.h / ls),
+                                  destRect, true);
+        }
+        else
+            GLMeta::blitRectangle(sourceRect, destRect);
         GLMeta::blitEnd();
     }
     else
@@ -1387,6 +1634,7 @@ void Bitmap::fillRect(const IntRect &rect, const Vec4 &color)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     p->fillRect(rect, color);
@@ -1416,6 +1664,7 @@ void Bitmap::gradientFillRect(const IntRect &rect,
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     SimpleColorShader &shader = shState->shaders().simpleColor;
@@ -1463,6 +1712,7 @@ void Bitmap::clearRect(const IntRect &rect)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     p->fillRect(rect, Vec4());
@@ -1475,6 +1725,7 @@ void Bitmap::blur()
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     Quad &quad = shState->gpQuad();
@@ -1522,6 +1773,7 @@ void Bitmap::radialBlur(int angle, int divisions)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     angle     = clamp<int>(angle, 0, 359);
@@ -1618,6 +1870,7 @@ void Bitmap::clear()
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     p->bindFBO();
@@ -1654,17 +1907,19 @@ Color Bitmap::getPixel(int x, int y) const
     if (!p->surface)
     {
         p->allocSurface();
-        
+
         FBO::bind(p->gl.fbo);
-        
-        glState.viewport.pushSet(IntRect(0, 0, width(), height()));
-        
-        gl.ReadPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
-        
+
+        glState.viewport.pushSet(IntRect(0, 0, p->gl.width, p->gl.height));
+
+        gl.ReadPixels(0, 0, p->gl.width, p->gl.height, GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
+
         glState.viewport.pop();
+
+        arcKeepRegister(p);
     }
-    
-    uint32_t pixel = getPixelAt(p->surface, p->format, x, y);
+
+    uint32_t pixel = getPixelAt(p->surface, p->format, x / p->lscale, y / p->lscale);
     
     return Color((pixel >> p->format->Rshift) & 0xFF,
                  (pixel >> p->format->Gshift) & 0xFF,
@@ -1677,6 +1932,7 @@ void Bitmap::setPixel(int x, int y, const Color &color)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     uint8_t pixel[] =
@@ -1698,14 +1954,16 @@ void Bitmap::setPixel(int x, int y, const Color &color)
         if (!p->surface)
         {
             p->allocSurface();
-            
+
             FBO::bind(p->gl.fbo);
-            
+
             glState.viewport.pushSet(IntRect(0, 0, width(), height()));
-            
+
             gl.ReadPixels(0, 0, width(), height(), GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
-            
+
             glState.viewport.pop();
+
+            arcKeepRegister(p);
         }
         
         uint32_t &surfPixel = getPixelAt(p->surface, p->format, x, y);
@@ -1756,9 +2014,36 @@ bool Bitmap::getRaw(void *output, int output_size)
     
     guardDisposed();
     
-    if (!p->animation.enabled && (p->surface || p->megaSurface)) {
+    if (p->lscale > 1 && !p->animation.enabled && !p->megaSurface) {
+        /* ARC: scaled bitmap -> the logical-size picture (nearest upscale of the small texture) */
+        if (!p->surface) {
+            p->allocSurface();
+            FBO::bind(p->gl.fbo);
+            glState.viewport.pushSet(IntRect(0, 0, p->gl.width, p->gl.height));
+            gl.ReadPixels(0, 0, p->gl.width, p->gl.height, GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
+            glState.viewport.pop();
+            arcKeepRegister(p);
+        }
+        arcUpscaleRaw(p->surface, p->lscale, width(), height(), output);
+    }
+    else if (!p->animation.enabled && (p->surface || p->megaSurface)) {
         void *src = (p->megaSurface) ? p->megaSurface->pixels : p->surface->pixels;
         memcpy(output, src, output_size);
+    }
+    else if (!p->animation.enabled) {
+        /* ARC: read back once, keep the copy (bounded) so repeated raw_data calls are memcpy */
+        p->flushPending();
+        p->allocSurface();
+        FBO::bind(p->gl.fbo);
+        glState.viewport.pushSet(IntRect(0, 0, p->gl.width, p->gl.height));
+        gl.ReadPixels(0, 0, p->gl.width, p->gl.height, GL_RGBA, GL_UNSIGNED_BYTE, p->surface->pixels);
+        glState.viewport.pop();
+        memcpy(output, p->surface->pixels, output_size);
+        arcKeepRegister(p);
+        if (!p->kept) {
+            SDL_FreeSurface(p->surface);
+            p->surface = 0;
+        }
     }
     else {
         FBO::bind(getGLTypes().fbo);
@@ -1772,6 +2057,7 @@ void Bitmap::replaceRaw(void *pixel_data, int size)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     
     int w = width();
     int h = height();
@@ -1848,6 +2134,7 @@ void Bitmap::hueChange(int hue)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     if ((hue % 360) == 0)
@@ -1996,6 +2283,7 @@ void Bitmap::drawText(const IntRect &rect, const char *str, int align)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     GUARD_ANIMATED;
     
     p->flushPending();   /* ARC: batched setPixel data goes to the GPU first */
@@ -2407,6 +2695,7 @@ int Bitmap::addFrame(Bitmap &source, int position)
     guardDisposed();
     
     GUARD_MEGA;
+    GUARD_SCALED;
     
     if (source.height() != height() || source.width() != width())
         throw Exception(Exception::MKXPError, "Animations with varying dimensions are not supported (%ix%i vs %ix%i)",
@@ -2415,8 +2704,11 @@ int Bitmap::addFrame(Bitmap &source, int position)
     p->flushPending();
     source.p->flushPending();
     
+    if (source.p->lscale > 1)
+        throw Exception(Exception::MKXPError, "Operation not supported for scaled bitmaps");
+
     TEXFBO newframe = shState->texPool().request(source.width(), source.height());
-    
+
     // Convert the bitmap into an animated bitmap if it isn't already one
     if (!p->animation.enabled) {
         p->animation.width = p->gl.width;
@@ -2430,16 +2722,20 @@ int Bitmap::addFrame(Bitmap &source, int position)
             p->animation.fps = shState->graphics().getFrameRate();
         
         p->animation.frames.push_back(p->gl);
-        
+
+        arcKeepRemove(p);
         if (p->surface)
             SDL_FreeSurface(p->surface);
+        p->surface = 0;
         p->gl = TEXFBO();
     }
-    
+
     if (source.surface()) {
         TEX::bind(newframe.tex);
         TEX::uploadImage(source.width(), source.height(), source.surface()->pixels, GL_RGBA);
-        SDL_FreeSurface(p->surface);
+        arcKeepRemove(p);
+        if (p->surface)
+            SDL_FreeSurface(p->surface);
         p->surface = 0;
     }
     else {
@@ -2593,8 +2889,15 @@ void Bitmap::releaseResources()
             shState->texPool().release(tex);
     }
     else
+    {
+        if (p->lscale > 1)
+        {
+            TEX::bind(p->gl.tex);
+            TEX::setSmooth(false);
+        }
         shState->texPool().release(p->gl);
-    
+    }
+
     delete p;
 }
 
