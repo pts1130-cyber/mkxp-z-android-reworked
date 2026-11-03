@@ -62,6 +62,13 @@ jobs:
           git apply --check ../patchrepo/windows-engine/fast-mutex.patch
           git apply ../patchrepo/windows-engine/fast-mutex.patch
 
+      - name: Apply Ruby GC limits patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/gc-env.patch
+          git apply ../patchrepo/windows-engine/gc-env.patch
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

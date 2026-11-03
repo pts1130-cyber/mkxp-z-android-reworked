@@ -1132,6 +1132,15 @@ static void mriBindingExecute() {
     int argc = 0;
     char **argv = 0;
     ruby_sysinit(&argc, &argv);
+
+    /* ARC: give the Ruby GC more room (a game keeps about a million objects alive and
+     * the default limits trigger full collections every few battles); values the user
+     * already set in the environment win */
+    SDL_setenv("RUBY_GC_HEAP_INIT_SLOTS", "1000000", SDL_FALSE);
+    SDL_setenv("RUBY_GC_MALLOC_LIMIT", "33554432", SDL_FALSE);
+    SDL_setenv("RUBY_GC_MALLOC_LIMIT_MAX", "67108864", SDL_FALSE);
+    SDL_setenv("RUBY_GC_OLDMALLOC_LIMIT", "67108864", SDL_FALSE);
+    SDL_setenv("RUBY_GC_OLDMALLOC_LIMIT_MAX", "134217728", SDL_FALSE);
     
     RUBY_INIT_STACK;
     ruby_init();

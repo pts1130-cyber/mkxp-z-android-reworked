@@ -930,6 +930,7 @@ struct ArcGfxProf
     uint64_t tComp;      /* end of composite (0 = no composite this frame) */
 
     double msComp, msBlit, msDelay, msSwap, msSkipDelay;
+    double msSwapCpu;
     uint32_t skipped;
     uint64_t seq;
 
@@ -1027,11 +1028,11 @@ struct ArcGfxProf
         }
 
         arcLogLine(2, ARC_GFX_LOG, 1000000,
-            "[%s 엔진 %.1f초] 느린 프레임 #%llu %.0fms | 루비 %.1f 합성 %.1f 그림 %.1f 대기 %.1f 교체 %.1f 건너뜀 %u"
+            "[%s 엔진 %.1f초] 느린 프레임 #%llu %.0fms | 루비 %.1f 합성 %.1f 그림 %.1f 대기 %.1f 교체 %.1f(CPU %.1f) 건너뜀 %u"
             " | 그리기 %u FBO %u 프로그램 %u 올림 %u+%u(%.1fMB %.1fms) 읽어오기 %u(%.1fms) GPU(최근) %s"
             " | 요소: %s",
             arcClockStr(clk), SDL_GetTicks() / 1000.0,
-            (unsigned long long) seq, interval, ruby, msComp, msBlit, msDelay, msSwap, skipped,
+            (unsigned long long) seq, interval, ruby, msComp, msBlit, msDelay, msSwap, msSwapCpu, skipped,
             g.draws - glPrev.draws, g.fboBinds - glPrev.fboBinds,
             g.progSwitches - glPrev.progSwitches,
             g.texImages - glPrev.texImages, g.texSubImages - glPrev.texSubImages,
@@ -1086,10 +1087,11 @@ struct ArcGfxProf
         resetWindow();
     }
 
-    void frameEnd(uint64_t tEnd, double delayMs, double swapMs)
+    void frameEnd(uint64_t tEnd, double delayMs, double swapMs, double swapCpuMs)
     {
         msDelay = delayMs;
         msSwap = swapMs;
+        msSwapCpu = swapCpuMs;
         ++seq;
 
         if (!started)
@@ -1447,7 +1449,20 @@ struct GraphicsPrivate {
         
         uint64_t arcT1 = SDL_GetPerformanceCounter();
         
+        /* ARC: CPU time of this thread inside the swap; a long swap with little CPU time
+         * means the thread was blocked (GPU or display behind), not busy */
+        double arcSwapCpu = 0.0;
+#ifdef __ANDROID__
+        struct timespec arcC0, arcC1;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &arcC0);
+#endif
+        
         SDL_GL_SwapWindow(threadData->window);
+        
+#ifdef __ANDROID__
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &arcC1);
+        arcSwapCpu = (arcC1.tv_sec - arcC0.tv_sec) * 1000.0 + (arcC1.tv_nsec - arcC0.tv_nsec) / 1000000.0;
+#endif
         
         uint64_t arcT2 = SDL_GetPerformanceCounter();
         
@@ -1460,7 +1475,7 @@ struct GraphicsPrivate {
         if (!arcGfx.headerDone)
             arcLogHeader();
         
-        arcGfx.frameEnd(arcT2, arcTicksToMs(arcT1 - arcT0), arcTicksToMs(arcT2 - arcT1));
+        arcGfx.frameEnd(arcT2, arcTicksToMs(arcT1 - arcT0), arcTicksToMs(arcT2 - arcT1), arcSwapCpu);
     }
     
     void compositeToBuffer(TEXFBO &buffer) {

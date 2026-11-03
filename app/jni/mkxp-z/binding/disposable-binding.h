@@ -28,51 +28,61 @@
 
 /* 'Children' are disposables that are disposed together
  * with their parent. Currently this is only used by Viewport
- * in RGSS1. */
+ * in RGSS1. A child leaves the list when it is disposed. */
 inline void
 disposableAddChild(VALUE disp, VALUE child)
 {
-    GFX_LOCK;
-    if (NIL_P(disp) || NIL_P(child)) {
-        return;
-    }
-    
+	if (NIL_P(disp) || NIL_P(child))
+		return;
+
+	GFX_LOCK;
+
 	VALUE children = rb_iv_get(disp, "children");
-    
-    bool exists = false;
 
 	if (NIL_P(children))
 	{
 		children = rb_ary_new();
 		rb_iv_set(disp, "children", children);
 	}
-    else {
-        exists = RTEST(rb_funcall(children, rb_intern("include?"), 1, child));
-    }
+	else
+	{
+		for (long i = RARRAY_LEN(children) - 1; i >= 0; --i)
+		{
+			if (RARRAY_AREF(children, i) == child)
+			{
+				GFX_UNLOCK;
+				return;
+			}
+		}
+	}
 
-	if (!exists)
-        rb_ary_push(children, child);
-    GFX_UNLOCK;
+	rb_ary_push(children, child);
+	GFX_UNLOCK;
 }
 
 inline void
 disposableRemoveChild(VALUE disp, VALUE child)
 {
-    GFX_LOCK;
-    if (NIL_P(disp) || NIL_P(child)) {
-        return;
-    }
-    
-    VALUE children = rb_iv_get(disp, "children");
-    if (NIL_P(children))
-        return;
-    
-    VALUE index = rb_funcall(children, rb_intern("index"), 1, child);
-    if (NIL_P(index))
-        return;
-    
-    rb_funcall(children, rb_intern("delete_at"), 1, index);
-    GFX_UNLOCK;
+	if (NIL_P(disp) || NIL_P(child))
+		return;
+
+	GFX_LOCK;
+
+	VALUE children = rb_iv_get(disp, "children");
+
+	if (!NIL_P(children))
+	{
+		for (long i = RARRAY_LEN(children) - 1; i >= 0; --i)
+		{
+			if (RARRAY_AREF(children, i) == child)
+			{
+				rb_ary_delete_at(children, i);
+				break;
+			}
+		}
+	}
+
+	GFX_UNLOCK;
 }
 
 inline void
@@ -85,8 +95,12 @@ disposableDisposeChildren(VALUE disp)
 
 	ID dispFun = rb_intern("_mkxp_dispose_alias");
 
-	for (long i = 0; i < RARRAY_LEN(children); ++i)
-		rb_funcall2(rb_ary_entry(children, i), dispFun, 0, 0);
+	/* A child removes itself from the parent's list when it is disposed,
+	 * so walk a copy */
+	VALUE copy = rb_ary_dup(children);
+
+	for (long i = 0; i < RARRAY_LEN(copy); ++i)
+		rb_funcall2(rb_ary_entry(copy, i), dispFun, 0, 0);
 }
 
 template<class C>
@@ -104,7 +118,17 @@ RB_METHOD(disposableDispose)
 		return Qnil;
 
 	if (rgssVer == 1)
+	{
 		disposableDisposeChildren(self);
+
+		/* Leave the viewport's child list, otherwise every disposed sprite
+		 * (and the bitmap it still points at) stays alive as long as the
+		 * viewport does */
+		VALUE parent = rb_iv_get(self, "viewport");
+
+		if (!NIL_P(parent))
+			disposableRemoveChild(parent, self);
+	}
 
     GFX_LOCK;
 	d->dispose();

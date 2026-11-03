@@ -1065,6 +1065,137 @@ void Bitmap::preloadShutdown()
     delete st;
 }
 
+/* ARC: small memory of decoded pictures. Loading the same file again after the game
+ * dropped its Bitmap (scene changes, cache clears) skips the file read and the PNG
+ * inflate. Entries hold final ABGR8888 pixels (already scaled); the total is capped and
+ * the least recently used entry goes first. A hit hands out a private copy. */
+namespace
+{
+    struct ArcDecEntry
+    {
+        std::string key;
+        SDL_Surface *surf;
+        int lscale;
+    };
+
+    std::list<ArcDecEntry> arcDec;
+    size_t arcDecBytes = 0;
+    std::mutex arcDecMx;
+
+    const size_t DEC_MAX_BYTES = 32u * 1024u * 1024u;
+    const size_t DEC_MAX_ONE = 6u * 1024u * 1024u;
+
+    std::string arcDecKey(const char *filename, int lscale)
+    {
+        std::string key(filename);
+        key += '\x02';
+        key += std::to_string(lscale);
+        return key;
+    }
+
+    SDL_Surface *arcCopySurface(SDL_Surface *src)
+    {
+        if (!src || src->format->BytesPerPixel != 4)
+            return 0;
+
+        SDL_Surface *dst = SDL_CreateRGBSurface(0, src->w, src->h, 32,
+                                                src->format->Rmask, src->format->Gmask,
+                                                src->format->Bmask, src->format->Amask);
+        if (!dst)
+            return 0;
+
+        const uint8_t *sp = (const uint8_t *) src->pixels;
+        uint8_t *dp = (uint8_t *) dst->pixels;
+        size_t row = (size_t) src->w * 4;
+
+        for (int y = 0; y < src->h; ++y)
+            memcpy(dp + (size_t) y * dst->pitch, sp + (size_t) y * src->pitch, row);
+
+        return dst;
+    }
+
+    SDL_Surface *arcDecGet(const char *filename, int lscale, int *effLscale)
+    {
+        std::lock_guard<std::mutex> lk(arcDecMx);
+
+        if (arcDec.empty())
+            return 0;
+
+        std::string key = arcDecKey(filename, lscale);
+
+        for (std::list<ArcDecEntry>::iterator it = arcDec.begin(); it != arcDec.end(); ++it)
+        {
+            if (it->key != key)
+                continue;
+
+            SDL_Surface *copy = arcCopySurface(it->surf);
+
+            if (!copy)
+                return 0;
+
+            *effLscale = it->lscale;
+            arcDec.splice(arcDec.begin(), arcDec, it);
+            return copy;
+        }
+
+        return 0;
+    }
+
+    void arcDecPut(const char *filename, int lscale, SDL_Surface *surf, int effLscale)
+    {
+        if (!surf || surf->format->BytesPerPixel != 4)
+            return;
+
+        size_t bytes = (size_t) surf->pitch * (size_t) surf->h;
+
+        if (bytes > DEC_MAX_ONE)
+            return;
+
+        std::string key = arcDecKey(filename, lscale);
+        std::lock_guard<std::mutex> lk(arcDecMx);
+
+        for (std::list<ArcDecEntry>::iterator it = arcDec.begin(); it != arcDec.end(); ++it)
+        {
+            if (it->key == key)
+            {
+                arcDec.splice(arcDec.begin(), arcDec, it);
+                return;
+            }
+        }
+
+        SDL_Surface *copy = arcCopySurface(surf);
+
+        if (!copy)
+            return;
+
+        ArcDecEntry e;
+        e.key = key;
+        e.surf = copy;
+        e.lscale = effLscale;
+        arcDec.push_front(e);
+        arcDecBytes += bytes;
+
+        while (arcDecBytes > DEC_MAX_BYTES && !arcDec.empty())
+        {
+            ArcDecEntry &last = arcDec.back();
+            arcDecBytes -= (size_t) last.surf->pitch * (size_t) last.surf->h;
+            SDL_FreeSurface(last.surf);
+            arcDec.pop_back();
+        }
+    }
+
+    void arcDecClear()
+    {
+        std::lock_guard<std::mutex> lk(arcDecMx);
+
+        for (std::list<ArcDecEntry>::iterator it = arcDec.begin(); it != arcDec.end(); ++it)
+            SDL_FreeSurface(it->surf);
+
+        arcDec.clear();
+        arcDecBytes = 0;
+    }
+}
+
 Bitmap::Bitmap(const char *filename, int lscale)
 {
     Uint64 arcT0 = SDL_GetPerformanceCounter();
@@ -1072,8 +1203,21 @@ Bitmap::Bitmap(const char *filename, int lscale)
     double arcPreWaitMs = -1.0;
     if (lscale < 1)
         lscale = 1;
+    const int arcReqLscale = lscale;
     handler.surface = arcPreTake(filename, lscale, &arcPreWaitMs);
     bool arcPreScaled = handler.surface != 0;   /* a preloaded picture is already at 1/lscale */
+    bool arcFromCache = false;
+    if (!handler.surface)
+    {
+        int cachedLscale = 1;
+        handler.surface = arcDecGet(filename, lscale, &cachedLscale);
+        if (handler.surface)
+        {
+            arcFromCache = true;
+            arcPreScaled = true;
+            lscale = cachedLscale;
+        }
+    }
     if (!handler.surface)
         shState->fileSystem().openRead(handler, filename);
     Uint64 arcT1 = SDL_GetPerformanceCounter();
@@ -1198,6 +1342,9 @@ Bitmap::Bitmap(const char *filename, int lscale)
             lscale = 1;
     }
 
+    if (!arcFromCache)
+        arcDecPut(filename, arcReqLscale, imgSurf, lscale);
+
     if (imgSurf->w > glState.caps.maxTexSize || imgSurf->h > glState.caps.maxTexSize)
     {
         /* Mega surface (a scaled picture that is still too large keeps its small size; lscale stays 1) */
@@ -1263,7 +1410,7 @@ Bitmap::Bitmap(const char *filename, int lscale)
                         total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
                         handler.readMs, handler.readBytes, handler.readCalls,
                         handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename,
-                        arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]"));
+                        arcFromCache ? " [그림기억 적중]" : (arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]")));
                 fclose(lf);
             }
         }
@@ -2076,6 +2223,7 @@ void Bitmap::replaceRaw(void *pixel_data, int size)
 void Bitmap::saveToFile(const char *filename)
 {
     guardDisposed();
+    arcDecClear();
     
     SDL_Surface *surf;
     
