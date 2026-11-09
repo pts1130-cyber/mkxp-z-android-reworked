@@ -49,6 +49,13 @@ public class MainActivity extends SDLActivity
     // In-screen gamepad
     private final Gamepad mGamepad = new Gamepad();
     private boolean mGamepadInvisible = false;
+    private final Handler mGamepadHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mGamepadRestore = () -> {
+        if (mGamepadInvisible) {
+            mGamepad.showView();
+            mGamepadInvisible = false;
+        }
+    };
     private boolean mCaptureHidden = false;
     private long mLastVolumeUpMs = 0;
 
@@ -258,6 +265,13 @@ public class MainActivity extends SDLActivity
     @Override
     public boolean dispatchKeyEvent(KeyEvent evt)
     {
+        if (evt.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN && evt.getAction() == KeyEvent.ACTION_DOWN) {
+            mGamepad.hideNow();
+            mGamepadInvisible = true;
+            mGamepadHandler.removeCallbacks(mGamepadRestore);
+            mGamepadHandler.postDelayed(mGamepadRestore, 2500);
+        }
+
         if (evt.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP && evt.getAction() == KeyEvent.ACTION_DOWN && evt.getRepeatCount() == 0) {
             long now = android.os.SystemClock.uptimeMillis();
             if (now - mLastVolumeUpMs < 600) {

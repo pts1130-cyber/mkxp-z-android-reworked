@@ -136,6 +136,15 @@ public class Gamepad
         mGamepadLayout.setAlpha(hidden ? 0 : 1);
     }
 
+    public void hideNow()
+    {
+        if (mGamepadLayout == null)
+            return;
+
+        mGamepadLayout.clearAnimation();
+        mGamepadLayout.setAlpha(0);
+    }
+
     public void showView()
     {
         if (mGamepadLayout != null) {
