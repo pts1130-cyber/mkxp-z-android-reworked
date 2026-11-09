@@ -127,6 +127,15 @@ public class Gamepad
         gpadBtn.setOnKeyUpListener(key -> mOnKeyUpListener.onKeyUp(key));
     }
 
+    public void setCaptureHidden(boolean hidden)
+    {
+        if (mGamepadLayout == null)
+            return;
+
+        mGamepadLayout.clearAnimation();
+        mGamepadLayout.setAlpha(hidden ? 0 : 1);
+    }
+
     public void showView()
     {
         if (mGamepadLayout != null) {
