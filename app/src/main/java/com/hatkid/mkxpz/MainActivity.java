@@ -56,8 +56,6 @@ public class MainActivity extends SDLActivity
             mGamepadInvisible = false;
         }
     };
-    private boolean mCaptureHidden = false;
-    private long mLastVolumeUpMs = 0;
 
     private void runSDLThread()
     {
@@ -219,7 +217,7 @@ public class MainActivity extends SDLActivity
 
         // Rotation: re-inflate gamepad so layout / layout-port is picked up
         if (mLayout != null) {
-            boolean hidden = (isAndroidTV() || isChromebook()) || mCaptureHidden;
+            boolean hidden = (isAndroidTV() || isChromebook());
             mGamepad.detachFrom(mLayout);
             mGamepad.init(new GamepadConfig(), hidden);
             mGamepad.attachTo(this, mLayout);
@@ -272,18 +270,6 @@ public class MainActivity extends SDLActivity
             mGamepadHandler.postDelayed(mGamepadRestore, 2500);
         }
 
-        if (evt.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP && evt.getAction() == KeyEvent.ACTION_DOWN && evt.getRepeatCount() == 0) {
-            long now = android.os.SystemClock.uptimeMillis();
-            if (now - mLastVolumeUpMs < 600) {
-                mCaptureHidden = !mCaptureHidden;
-                mGamepadInvisible = mCaptureHidden;
-                mGamepad.setCaptureHidden(mCaptureHidden);
-                mLastVolumeUpMs = 0;
-                return true;
-            }
-            mLastVolumeUpMs = now;
-        }
-
         if (
             evt.getKeyCode() != KeyEvent.KEYCODE_BACK &&
             evt.getKeyCode() != KeyEvent.KEYCODE_VOLUME_UP &&
@@ -291,7 +277,7 @@ public class MainActivity extends SDLActivity
             evt.getKeyCode() != KeyEvent.KEYCODE_VOLUME_MUTE
         ) {
             // Hide gamepad view on key events when visible
-            if (!mGamepadInvisible && !mCaptureHidden) {
+            if (!mGamepadInvisible) {
                 mGamepad.hideView();
                 mGamepadInvisible = true;
             }
@@ -307,7 +293,7 @@ public class MainActivity extends SDLActivity
     public boolean dispatchTouchEvent(MotionEvent evt)
     {
         // Show gamepad view on touch when hidden
-        if (mGamepadInvisible && !mCaptureHidden) {
+        if (mGamepadInvisible) {
             mGamepad.showView();
             mGamepadInvisible = false;
         }
