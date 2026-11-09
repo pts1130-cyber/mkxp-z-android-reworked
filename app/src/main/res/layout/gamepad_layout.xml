@@ -134,6 +134,14 @@
             tools:ignore="ImageContrastCheck"
         />
         <com.hatkid.mkxpz.gamepad.GamepadButton
+            android:id="@+id/button_HIDE"
+            android:layout_width="@dimen/_31sdp"
+            android:layout_height="@dimen/_15sdp"
+            android:layout_centerHorizontal="true"
+            app:bgDrawable="@drawable/gamepad_button_square"
+            tools:ignore="ImageContrastCheck"
+        />
+        <com.hatkid.mkxpz.gamepad.GamepadButton
             android:id="@+id/button_SHIFT"
             android:layout_width="@dimen/_1sdp"
             android:layout_height="@dimen/_1sdp"

@@ -20,6 +20,7 @@ public class Gamepad
 
     private OnKeyDownListener mOnKeyDownListener = key -> {};
     private OnKeyUpListener mOnKeyUpListener = key -> {};
+    private Runnable mOnHideListener = () -> {};
 
     public interface OnKeyDownListener
     {
@@ -41,6 +42,11 @@ public class Gamepad
         mOnKeyUpListener = onKeyUpListener;
     }
 
+    public void setOnHideListener(Runnable onHideListener)
+    {
+        mOnHideListener = onHideListener;
+    }
+
     private RelativeLayout mGamepadLayout;
 
     // Gamepad buttons
@@ -55,6 +61,7 @@ public class Gamepad
     private GamepadButton gpadBtnCTRL;
     private GamepadButton gpadBtnALT;
     private GamepadButton gpadBtnSHIFT;
+    private GamepadButton gpadBtnHIDE;
 
     public void init(GamepadConfig gpadConfig, boolean invisible)
     {
@@ -87,6 +94,7 @@ public class Gamepad
         gpadBtnCTRL = layout.findViewById(R.id.button_CTRL);
         gpadBtnALT = layout.findViewById(R.id.button_ALT);
         gpadBtnSHIFT = layout.findViewById(R.id.button_SHIFT);
+        gpadBtnHIDE = layout.findViewById(R.id.button_HIDE);
 
         // Setup in-screen gamepad listeners
         mGamepadLayout.setOnTouchListener((view, motionEvent) -> false);
@@ -172,6 +180,9 @@ public class Gamepad
         setGamepadButtonKey(gpadBtnCTRL, mGamepadConfig.keycodeCTRL);
         setGamepadButtonKey(gpadBtnALT, mGamepadConfig.keycodeALT);
         setGamepadButtonKey(gpadBtnSHIFT, mGamepadConfig.keycodeSHIFT);
+
+        gpadBtnHIDE.setForegroundText("HIDE");
+        gpadBtnHIDE.setOnKeyDownListener(key -> mOnHideListener.run());
     }
 
     public boolean processGamepadEvent(KeyEvent evt)

@@ -49,13 +49,6 @@ public class MainActivity extends SDLActivity
     // In-screen gamepad
     private final Gamepad mGamepad = new Gamepad();
     private boolean mGamepadInvisible = false;
-    private final Handler mGamepadHandler = new Handler(Looper.getMainLooper());
-    private final Runnable mGamepadRestore = () -> {
-        if (mGamepadInvisible) {
-            mGamepad.showView();
-            mGamepadInvisible = false;
-        }
-    };
 
     private void runSDLThread()
     {
@@ -149,6 +142,10 @@ public class MainActivity extends SDLActivity
         mGamepadInvisible = (isAndroidTV() || isChromebook());
         GamepadConfig gpadConfig = new GamepadConfig();
         mGamepad.init(gpadConfig, mGamepadInvisible);
+        mGamepad.setOnHideListener(() -> {
+            mGamepad.hideNow();
+            mGamepadInvisible = true;
+        });
         // v1.0.13: while a text-entry (name/search) is active, the on-screen X (cancel) button
         // also sends Escape, which is what the game's text-entry screens use to cancel.
         mGamepad.setOnKeyDownListener(key -> {
@@ -263,13 +260,6 @@ public class MainActivity extends SDLActivity
     @Override
     public boolean dispatchKeyEvent(KeyEvent evt)
     {
-        if (evt.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN && evt.getAction() == KeyEvent.ACTION_DOWN) {
-            mGamepad.hideNow();
-            mGamepadInvisible = true;
-            mGamepadHandler.removeCallbacks(mGamepadRestore);
-            mGamepadHandler.postDelayed(mGamepadRestore, 2500);
-        }
-
         if (
             evt.getKeyCode() != KeyEvent.KEYCODE_BACK &&
             evt.getKeyCode() != KeyEvent.KEYCODE_VOLUME_UP &&
@@ -293,7 +283,7 @@ public class MainActivity extends SDLActivity
     public boolean dispatchTouchEvent(MotionEvent evt)
     {
         // Show gamepad view on touch when hidden
-        if (mGamepadInvisible) {
+        if (mGamepadInvisible && evt.getActionMasked() == MotionEvent.ACTION_DOWN) {
             mGamepad.showView();
             mGamepadInvisible = false;
         }
