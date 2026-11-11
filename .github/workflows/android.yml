@@ -44,11 +44,16 @@ jobs:
       # ── 3. System dependencies ───────────────────────────────────────────────
       - name: Install system dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
+          sudo apt-get update -y || true
+          if ! sudo apt-get install -y \
             build-essential cmake curl gpg xxd \
             ruby-full autoconf automake libtool pkg-config \
-            python3 git unzip
+            python3 git unzip; then
+            echo "apt install failed (mirror unreachable); falling back to pip cmake"
+            command -v cmake >/dev/null || pip3 install --user cmake
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            command -v pkg-config >/dev/null || command -v pkgconf >/dev/null
+          fi
 
       # ── 4. Ruby  ──────────────────────────────────────
       - name: Set up Ruby
