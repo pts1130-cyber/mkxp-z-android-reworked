@@ -805,6 +805,8 @@ namespace
 
     ArcPreState *arcPre = 0;
 
+    char arcPreMiss[96] = "";
+
     struct ArcPreHandler : FileSystem::OpenHandler
     {
         SDL_Surface *surface;
@@ -924,6 +926,7 @@ namespace
     SDL_Surface *arcPreTake(const char *filename, int lscale, double *waitedMs)
     {
         *waitedMs = -1.0;
+        arcPreMiss[0] = 0;
 
         if (!arcPre)
             return 0;
@@ -940,10 +943,16 @@ namespace
             std::map<std::string, ArcPreItem>::iterator it = st->items.find(name);
 
             if (it == st->items.end())
+            {
+                snprintf(arcPreMiss, sizeof(arcPreMiss), " [선읽기 표에 없음 완료%zu개 %zuMB 대기%zu]",
+                         st->doneCount, st->doneBytes >> 20, st->queue.size());
                 return 0;
+            }
 
             if (it->second.stage == PRE_QUEUED)
             {
+                snprintf(arcPreMiss, sizeof(arcPreMiss), " [선읽기 못 끝냄 완료%zu개 %zuMB 대기%zu]",
+                         st->doneCount, st->doneBytes >> 20, st->queue.size());
                 st->items.erase(it);
                 for (std::deque<std::string>::iterator q = st->queue.begin(); q != st->queue.end(); ++q)
                 {
@@ -1405,12 +1414,13 @@ Bitmap::Bitmap(const char *filename, int lscale)
             {
                 char clk[16];
                 ++arcImgLines;
-                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s%s\n",
+                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s%s%s\n",
                         arcClockStr(clk), SDL_GetTicks() / 1000.0,
                         total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
                         handler.readMs, handler.readBytes, handler.readCalls,
                         handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename,
-                        arcFromCache ? " [그림기억 적중]" : (arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]")));
+                        arcFromCache ? " [그림기억 적중]" : (arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]")),
+                        arcPreMiss);
                 fclose(lf);
             }
         }
