@@ -134,14 +134,6 @@
             tools:ignore="ImageContrastCheck"
         />
         <com.hatkid.mkxpz.gamepad.GamepadButton
-            android:id="@+id/button_HIDE"
-            android:layout_width="@dimen/_31sdp"
-            android:layout_height="@dimen/_15sdp"
-            android:layout_centerHorizontal="true"
-            app:bgDrawable="@drawable/gamepad_button_square"
-            tools:ignore="ImageContrastCheck"
-        />
-        <com.hatkid.mkxpz.gamepad.GamepadButton
             android:id="@+id/button_SHIFT"
             android:layout_width="@dimen/_1sdp"
             android:layout_height="@dimen/_1sdp"
@@ -149,4 +141,17 @@
             app:bgDrawable="@drawable/gamepad_button_square"
         />
     </RelativeLayout>
+
+    <!-- HIDE 는 왼쪽 아래 구석(7시 방향) -->
+    <com.hatkid.mkxpz.gamepad.GamepadButton
+        android:id="@+id/button_HIDE"
+        android:layout_width="@dimen/_31sdp"
+        android:layout_height="@dimen/_15sdp"
+        android:layout_alignParentStart="true"
+        android:layout_alignParentBottom="true"
+        android:layout_marginStart="@dimen/_8sdp"
+        android:layout_marginBottom="@dimen/_8sdp"
+        app:bgDrawable="@drawable/gamepad_button_square"
+        tools:ignore="ImageContrastCheck"
+    />
 </RelativeLayout>
