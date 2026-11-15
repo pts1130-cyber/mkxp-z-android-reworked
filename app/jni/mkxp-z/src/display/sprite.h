@@ -71,10 +71,20 @@ public:
     DECL_ATTR( PatternZoomX, float  )
     DECL_ATTR( PatternZoomY, float  )
     DECL_ATTR( Invert,      bool    )
+	DECL_ATTR( MaterialMap,  Bitmap* )
+	DECL_ATTR( MaterialEnv,  Bitmap* )
+	DECL_ATTR( MaterialRamp, Bitmap* )
+	DECL_ATTR( MaterialMode, int     )
+	DECL_ATTR( MaterialRect, Rect&   )
 	DECL_ATTR( WaveAmp,     int     )
 	DECL_ATTR( WaveLength,  int     )
 	DECL_ATTR( WaveSpeed,   int     )
 	DECL_ATTR( WavePhase,   float   )
+
+	enum { MaterialParamCount = 16 };
+	float getMaterialParam(int index) const;
+	void setMaterialParams(const float *values, int count);
+	static bool materialAvailable();
 
 	void initDynAttribs();
 

@@ -1,0 +1,942 @@
+diff --git a/binding/sprite-binding.cpp b/binding/sprite-binding.cpp
+index 096464e..750bed5 100644
+--- a/binding/sprite-binding.cpp
++++ b/binding/sprite-binding.cpp
+@@ -46,6 +46,7 @@ RB_METHOD(spriteInitialize) {
+     wrapProperty(self, &s->getSrcRect(), "src_rect", RectType);
+     wrapProperty(self, &s->getColor(), "color", ColorType);
+     wrapProperty(self, &s->getTone(), "tone", ToneType);
++    wrapProperty(self, &s->getMaterialRect(), "material_rect", RectType);
+     
+     GFX_UNLOCK;
+     return self;
+@@ -53,6 +54,10 @@ RB_METHOD(spriteInitialize) {
+ 
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Bitmap, "bitmap")
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Pattern, "pattern")
++DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialMap, "material_map")
++DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialEnv, "material_env")
++DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialRamp, "material_ramp")
++DEF_GFX_PROP_OBJ_VAL(Sprite, Rect, MaterialRect, "material_rect")
+ DEF_GFX_PROP_OBJ_VAL(Sprite, Rect, SrcRect, "src_rect")
+ DEF_GFX_PROP_OBJ_VAL(Sprite, Color, Color, "color")
+ DEF_GFX_PROP_OBJ_VAL(Sprite, Tone, Tone, "tone")
+@@ -72,6 +77,7 @@ DEF_GFX_PROP_I(Sprite, PatternScrollY)
+ DEF_GFX_PROP_I(Sprite, WaveAmp)
+ DEF_GFX_PROP_I(Sprite, WaveLength)
+ DEF_GFX_PROP_I(Sprite, WaveSpeed)
++DEF_GFX_PROP_I(Sprite, MaterialMode)
+ 
+ DEF_GFX_PROP_F(Sprite, ZoomX)
+ DEF_GFX_PROP_F(Sprite, ZoomY)
+@@ -84,6 +90,49 @@ DEF_GFX_PROP_B(Sprite, Mirror)
+ DEF_GFX_PROP_B(Sprite, PatternTile)
+ DEF_GFX_PROP_B(Sprite, Invert)
+ 
++RB_METHOD_GUARD(spriteMaterialAvailable) {
++    RB_UNUSED_PARAM;
++    
++    bool value = false;
++    GFX_GUARD_EXC(value = Sprite::materialAvailable();)
++    
++    return rb_bool_new(value);
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteGetMaterialParams) {
++    RB_UNUSED_PARAM;
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    VALUE ary = rb_ary_new2(Sprite::MaterialParamCount);
++    for (int i = 0; i < Sprite::MaterialParamCount; ++i)
++        rb_ary_push(ary, rb_float_new(s->getMaterialParam(i)));
++    
++    return ary;
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteSetMaterialParams) {
++    rb_check_argc(argc, 1);
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    VALUE ary = rb_Array(argv[0]);
++    long n = RARRAY_LEN(ary);
++    if (n > Sprite::MaterialParamCount)
++        n = Sprite::MaterialParamCount;
++    
++    float values[Sprite::MaterialParamCount];
++    for (long i = 0; i < n; ++i)
++        values[i] = (float) NUM2DBL(rb_ary_entry(ary, i));
++    
++    GFX_GUARD_EXC(s->setMaterialParams(values, (int) n);)
++    
++    return argv[0];
++}
++RB_METHOD_GUARD_END
++
+ RB_METHOD_GUARD(spriteWidth) {
+     RB_UNUSED_PARAM;
+     
+@@ -153,6 +202,15 @@ void spriteBindingInit() {
+     INIT_PROP_BIND(Sprite, PatternZoomY, "pattern_zoom_y");
+     INIT_PROP_BIND(Sprite, Invert, "invert");
+     
++    INIT_PROP_BIND(Sprite, MaterialMap, "material_map");
++    INIT_PROP_BIND(Sprite, MaterialEnv, "material_env");
++    INIT_PROP_BIND(Sprite, MaterialRamp, "material_ramp");
++    INIT_PROP_BIND(Sprite, MaterialMode, "material_mode");
++    INIT_PROP_BIND(Sprite, MaterialRect, "material_rect");
++    _rb_define_method(klass, "material_params", spriteGetMaterialParams);
++    _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
++    rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
++    
+     INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
+     INIT_PROP_BIND(Sprite, WaveLength, "wave_length");
+     INIT_PROP_BIND(Sprite, WaveSpeed, "wave_speed");
+diff --git a/shader/meson.build b/shader/meson.build
+index 9a8cf6a..69ac290 100644
+--- a/shader/meson.build
++++ b/shader/meson.build
+@@ -5,6 +5,7 @@ embedded_shaders = [
+     'trans.frag',
+     'hue.frag',
+     'sprite.frag',
++    'spriteMaterial.frag',
+     'plane.frag',
+     'gray.frag',
+     'bitmapBlit.frag',
+@@ -21,6 +22,7 @@ embedded_shaders = [
+     'simple.vert',
+     'simpleColor.vert',
+     'sprite.vert',
++    'spriteMaterial.vert',
+     'tilemap.vert',
+     'tilemapvx.vert',
+     'blur.frag',
+diff --git a/shader/spriteMaterial.frag b/shader/spriteMaterial.frag
+new file mode 100644
+index 0000000..8b71d52
+--- /dev/null
++++ b/shader/spriteMaterial.frag
+@@ -0,0 +1,244 @@
++
++uniform sampler2D texture;
++
++uniform lowp vec4 tone;
++uniform lowp float opacity;
++uniform lowp vec4 color;
++
++uniform bool bushY;
++uniform bool bushUnder;
++uniform float bushSlope;
++uniform float bushIntercept;
++uniform lowp float bushOpacity;
++
++uniform sampler2D pattern;
++uniform int patternBlendType;
++uniform lowp float patternOpacity;
++uniform bool renderPattern;
++
++uniform bool invert;
++
++/* Material stage.
++ * mode 1 surface: map r=value g=hue b=saturation a=weight
++ * mode 2 lit:     map r=level g,b=normal xy (0.5 = facing) a=weight
++ * mode 3 halo:    sprite alpha neighbourhood, output glow colour */
++uniform int materialMode;
++uniform sampler2D materialMap;
++uniform sampler2D materialEnv;
++uniform sampler2D materialRamp;
++uniform sampler2D materialBack;
++uniform vec2 materialMapTexel;
++uniform vec2 materialSrcTexel;
++uniform vec2 materialBackInv;
++uniform bool materialHasEnv;
++uniform bool materialHasRamp;
++uniform bool materialHasBack;
++uniform float materialMirror;
++uniform vec4 materialP0;
++uniform vec4 materialP1;
++uniform vec4 materialP2;
++uniform vec4 materialP3;
++
++varying vec2 v_texCoord;
++varying vec2 v_patCoord;
++varying vec2 v_matCoord;
++varying vec2 v_scrCoord;
++
++const vec3 lumaF = vec3(.299, .587, .114);
++const vec2 repeat = vec2(1, 1);
++
++vec3 blendNormal(vec3 base, vec3 blend, float o) { return blend * o + base * (1.0 - o); }
++vec3 blendAdd(vec3 base, vec3 blend, float o) { return min(base + blend, vec3(1.0)) * o + base * (1.0 - o); }
++vec3 blendSubtract(vec3 base, vec3 blend, float o) { return max(base - blend, vec3(0.0)) * o + base * (1.0 - o); }
++
++vec3 rgb2hsv(vec3 c)
++{
++	vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
++	vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
++	vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
++	float d = q.x - min(q.w, q.y);
++	float e = 1.0e-10;
++	return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
++}
++
++vec3 hsv2rgb(vec3 c)
++{
++	vec3 p = abs(fract(c.xxx + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
++	return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
++}
++
++/* keep HSL saturation and lightness of base, take hue h */
++vec3 withHue(vec3 base, float h)
++{
++	float mx = max(max(base.r, base.g), base.b);
++	float mn = min(min(base.r, base.g), base.b);
++	float l = (mx + mn) * 0.5;
++	float d = mx - mn;
++	float s = (d <= 0.0) ? 0.0 : d / (1.0 - abs(2.0 * l - 1.0) + 1.0e-10);
++	vec3 p = abs(fract(vec3(h) + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
++	float C = (1.0 - abs(2.0 * l - 1.0)) * s;
++	return l + C * (clamp(p - 1.0, 0.0, 1.0) - 0.5);
++}
++
++vec3 overlay(vec3 a, vec3 b)
++{
++	return mix(2.0 * a * b, 1.0 - 2.0 * (1.0 - a) * (1.0 - b), step(0.5, a));
++}
++
++vec3 softLight(vec3 a, vec3 b)
++{
++	return mix(2.0 * a * b + a * a * (1.0 - 2.0 * b),
++	           sqrt(a) * (2.0 * b - 1.0) + 2.0 * a * (1.0 - b), step(0.5, b));
++}
++
++vec3 screenB(vec3 a, vec3 b) { return 1.0 - (1.0 - a) * (1.0 - b); }
++
++vec3 blendKind(vec3 a, vec3 b, float kind)
++{
++	if (kind < 0.5) return overlay(a, b);
++	if (kind < 1.5) return softLight(a, b);
++	if (kind < 2.5) return screenB(a, b);
++	return min(a + b, vec3(1.0));
++}
++
++/* map normal, optionally bilinear (weighted by map alpha so the silhouette does not pull it to 0) */
++vec2 mapNormal(vec4 m)
++{
++	if (materialP1.w < 0.5)
++		return m.gb * 2.0 - 1.0;
++
++	vec2 px = v_matCoord / materialMapTexel - 0.5;
++	vec2 f = fract(px);
++	vec2 b = (floor(px) + 0.5) * materialMapTexel;
++	vec4 t00 = texture2D(materialMap, b);
++	vec4 t10 = texture2D(materialMap, b + vec2(materialMapTexel.x, 0.0));
++	vec4 t01 = texture2D(materialMap, b + vec2(0.0, materialMapTexel.y));
++	vec4 t11 = texture2D(materialMap, b + materialMapTexel);
++	float w00 = (1.0 - f.x) * (1.0 - f.y) * t00.a;
++	float w10 = f.x * (1.0 - f.y) * t10.a;
++	float w01 = (1.0 - f.x) * f.y * t01.a;
++	float w11 = f.x * f.y * t11.a;
++	float ws = w00 + w10 + w01 + w11;
++	if (ws <= 0.0)
++		return m.gb * 2.0 - 1.0;
++	vec2 g = (t00.gb * w00 + t10.gb * w10 + t01.gb * w01 + t11.gb * w11) / ws;
++	return g * 2.0 - 1.0;
++}
++
++vec3 surfaceStage(vec3 orig, vec4 m)
++{
++	float s = materialP0.x * m.a;
++	float L = dot(orig, lumaF);
++	vec3 tint = materialP1.rgb;
++	vec3 hsv = rgb2hsv(orig);
++
++	vec3 col1 = mix(orig, withHue(orig, rgb2hsv(tint).x), materialP1.w * s);
++	col1 += (tint - col1) * (materialP2.x * s * (1.0 - L));
++
++	if (materialP2.y >= 0.0) {
++		float dh = abs(fract(hsv.x - materialP2.y + 0.5) - 0.5);
++		float isMain = step(dh, materialP2.z) * step(0.2, hsv.y);
++		col1 += (1.0 - col1) * (materialP2.w * s * isMain);
++	}
++
++	float v = clamp(materialP3.y + (m.r - materialP3.y) * materialP3.x, 0.05, 1.0);
++	float sat = (materialP3.z >= 0.0 && L < materialP3.w) ? materialP3.z : m.b;
++	vec3 pat = hsv2rgb(vec3(fract(m.g + materialP0.z), sat, v));
++	pat = mix(pat, tint, materialP0.w);
++
++	return mix(col1, blendKind(col1, pat, materialP0.y), s);
++}
++
++vec3 litStage(vec3 orig, vec4 m)
++{
++	float s = materialP0.x * m.a;
++	vec3 tint = materialP3.rgb;
++	vec2 n = mapNormal(m);
++	n.x *= materialMirror;
++
++	float t = clamp(m.r + (dot(orig, lumaF) - materialP0.w) * materialP0.z, 0.0, 1.0);
++	vec3 col = materialHasRamp ? texture2D(materialRamp, vec2(t, materialP0.y)).rgb : tint * t;
++
++	if (materialHasEnv) {
++		vec2 e = clamp(n * (0.5 * materialP1.z) + 0.5 + materialP2.xy, 0.0, 1.0);
++		col = screenB(col, texture2D(materialEnv, e).rgb * materialP1.y);
++	}
++
++	if (materialP2.w > 0.0) {
++		float lc = dot(col, lumaF);
++		float lt = max(dot(tint, lumaF), 1.0e-3);
++		col = mix(col, clamp(tint * (lc / lt), 0.0, 1.0), materialP2.w);
++	}
++
++	if (materialHasBack && materialP3.w > 0.0) {
++		vec3 bg = texture2D(materialBack, v_scrCoord + n * (materialP3.w * materialBackInv)).rgb;
++		col = mix(col, bg * mix(vec3(1.0), tint, 0.5), materialP2.z * (1.0 - m.r));
++	}
++
++	col = mix(col, softLight(col, orig), materialP1.x);
++	return mix(orig, col, s);
++}
++
++vec4 haloStage(vec4 frag)
++{
++	float r = materialP0.y;
++	vec2 tx = v_texCoord;
++	vec2 d = r * materialSrcTexel;
++	float acc = 0.0;
++	/* two rings of 8 taps, gaussian weights for 1 and 2 sigma */
++	acc += 0.6065 * (texture2D(texture, tx + vec2( d.x, 0.0)).a + texture2D(texture, tx + vec2(-d.x, 0.0)).a
++	              +  texture2D(texture, tx + vec2(0.0,  d.y)).a + texture2D(texture, tx + vec2(0.0, -d.y)).a);
++	acc += 0.6065 * (texture2D(texture, tx + d * 0.7071).a + texture2D(texture, tx - d * 0.7071).a
++	              +  texture2D(texture, tx + vec2(d.x, -d.y) * 0.7071).a + texture2D(texture, tx + vec2(-d.x, d.y) * 0.7071).a);
++	vec2 e = d * 2.0;
++	acc += 0.1353 * (texture2D(texture, tx + vec2( e.x, 0.0)).a + texture2D(texture, tx + vec2(-e.x, 0.0)).a
++	              +  texture2D(texture, tx + vec2(0.0,  e.y)).a + texture2D(texture, tx + vec2(0.0, -e.y)).a);
++	acc += 0.1353 * (texture2D(texture, tx + e * 0.7071).a + texture2D(texture, tx - e * 0.7071).a
++	              +  texture2D(texture, tx + vec2(e.x, -e.y) * 0.7071).a + texture2D(texture, tx + vec2(-e.x, e.y) * 0.7071).a);
++	float g = (acc + frag.a) / (1.0 + 8.0 * 0.6065 + 8.0 * 0.1353);
++	g *= 1.0 - frag.a * materialP0.z;
++	return vec4(materialP3.rgb, clamp(g * materialP0.x, 0.0, 1.0));
++}
++
++void main()
++{
++	vec4 frag = texture2D(texture, v_texCoord);
++
++	if (renderPattern) {
++		vec4 pattfrag = texture2D(pattern, mod(v_patCoord, repeat));
++		if (patternBlendType == 1)
++			frag.rgb = blendAdd(frag.rgb, pattfrag.rgb, pattfrag.a * patternOpacity);
++		else if (patternBlendType == 2)
++			frag.rgb = blendSubtract(frag.rgb, pattfrag.rgb, pattfrag.a * patternOpacity);
++		else
++			frag.rgb = blendNormal(frag.rgb, pattfrag.rgb, pattfrag.a * patternOpacity);
++	}
++
++	if (materialMode == 3) {
++		frag = haloStage(frag);
++	}
++	else if (materialMode > 0) {
++		vec4 m = texture2D(materialMap, v_matCoord);
++		if (m.a > 0.0 && frag.a > 0.0) {
++			if (materialMode == 1)
++				frag.rgb = surfaceStage(frag.rgb, m);
++			else
++				frag.rgb = litStage(frag.rgb, m);
++		}
++	}
++
++	float luma = dot(frag.rgb, lumaF);
++	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);
++	frag.rgb += tone.rgb;
++	frag.a *= opacity;
++	frag.rgb = mix(frag.rgb, color.rgb, color.a);
++
++	if (invert)
++		frag.rgb = vec3(1.0) - frag.rgb;
++
++	bool underBush = (float(bushY) * v_texCoord.y + float(!bushY) * v_texCoord.x) <
++	                 (bushSlope * (float(bushY) * v_texCoord.x + float(!bushY) * v_texCoord.y) + bushIntercept);
++	frag.a *= clamp(bushOpacity + float(underBush == bushUnder), 0.0, 1.0);
++
++	gl_FragColor = frag;
++}
+diff --git a/shader/spriteMaterial.vert b/shader/spriteMaterial.vert
+new file mode 100644
+index 0000000..8af4321
+--- /dev/null
++++ b/shader/spriteMaterial.vert
+@@ -0,0 +1,40 @@
++
++uniform mat4 projMat;
++
++uniform mat4 spriteMat;
++
++uniform vec2 texSizeInv;
++uniform vec2 patternSizeInv;
++uniform vec2 patternScroll;
++uniform vec2 patternZoom;
++uniform bool renderPattern;
++uniform bool patternTile;
++
++/* xy: scale, zw: offset (texture pixel -> map uv) */
++uniform vec4 materialXform;
++
++attribute vec2 position;
++attribute vec2 texCoord;
++
++varying vec2 v_texCoord;
++varying vec2 v_patCoord;
++varying vec2 v_matCoord;
++varying vec2 v_scrCoord;
++
++void main()
++{
++	gl_Position = projMat * spriteMat * vec4(position, 0, 1);
++
++	v_texCoord = texCoord * texSizeInv;
++	v_matCoord = texCoord * materialXform.xy + materialXform.zw;
++	v_scrCoord = gl_Position.xy * 0.5 + 0.5;
++
++	v_patCoord = vec2(0.0);
++	if (renderPattern) {
++		vec2 scroll = patternScroll * (patternSizeInv / texSizeInv);
++		if (patternTile)
++			v_patCoord = (texCoord * (patternSizeInv / patternZoom)) - (scroll * patternSizeInv);
++		else
++			v_patCoord = (texCoord * (texSizeInv / patternZoom)) - (scroll * texSizeInv);
++	}
++}
+diff --git a/src/display/gl/gl-fun.h b/src/display/gl/gl-fun.h
+index 634da66..4d12b1f 100644
+--- a/src/display/gl/gl-fun.h
++++ b/src/display/gl/gl-fun.h
+@@ -52,6 +52,7 @@ typedef void (APIENTRYP _PFNGLDELETETEXTURESPROC) (GLsizei n, const GLuint *text
+ typedef void (APIENTRYP _PFNGLBINDTEXTUREPROC) (GLenum target, GLuint texture);
+ typedef void (APIENTRYP _PFNGLTEXIMAGE2DPROC) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels);
+ typedef void (APIENTRYP _PFNGLTEXSUBIMAGE2DPROC) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels);
++typedef void (APIENTRYP _PFNGLCOPYTEXSUBIMAGE2DPROC) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
+ typedef void (APIENTRYP _PFNGLTEXPARAMETERIPROC) (GLenum target, GLenum pname, GLint param);
+ typedef void (APIENTRYP _PFNGLACTIVETEXTUREPROC) (GLenum texture);
+ typedef void (APIENTRYP _PFNGLGENERATEMIPMAPPROC) (GLenum target);
+@@ -148,6 +149,7 @@ typedef void (APIENTRYP _PFNGLRELEASESHADERCOMPILERPROC) (void);
+ 	GL_FUN(BindTexture, _PFNGLBINDTEXTUREPROC) \
+ 	GL_FUN(TexImage2D, _PFNGLTEXIMAGE2DPROC) \
+ 	GL_FUN(TexSubImage2D, _PFNGLTEXSUBIMAGE2DPROC) \
++	GL_FUN(CopyTexSubImage2D, _PFNGLCOPYTEXSUBIMAGE2DPROC) \
+ 	GL_FUN(TexParameteri, _PFNGLTEXPARAMETERIPROC) \
+ 	GL_FUN(ActiveTexture, _PFNGLACTIVETEXTUREPROC) \
+ 	GL_FUN(GenerateMipmap, _PFNGLGENERATEMIPMAPPROC) \
+diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
+index 980d995..4e96f66 100644
+--- a/src/display/gl/shader.cpp
++++ b/src/display/gl/shader.cpp
+@@ -55,6 +55,8 @@
+ #include "simple.vert.xxd"
+ #include "simpleColor.vert.xxd"
+ #include "sprite.vert.xxd"
++#include "spriteMaterial.vert.xxd"
++#include "spriteMaterial.frag.xxd"
+ #include "tilemap.vert.xxd"
+ #include "blur.frag.xxd"
+ #include "simpleMatrix.vert.xxd"
+@@ -651,6 +653,175 @@ void SpriteShader::setInvert(bool value)
+ }
+ 
+ 
++SpriteMaterialShader::SpriteMaterialShader()
++{
++	INIT_SHADER(spriteMaterial, spriteMaterial, SpriteMaterialShader);
++
++	ShaderBase::init();
++
++	GET_U(spriteMat);
++	GET_U(tone);
++	GET_U(color);
++	GET_U(opacity);
++	GET_U(bushY);
++	GET_U(bushUnder);
++	GET_U(bushSlope);
++	GET_U(bushIntercept);
++	GET_U(bushOpacity);
++    GET_U(pattern);
++    GET_U(patternBlendType);
++    GET_U(patternTile);
++    GET_U(renderPattern);
++    GET_U(patternSizeInv);
++    GET_U(patternOpacity);
++    GET_U(patternScroll);
++    GET_U(patternZoom);
++    GET_U(invert);
++	GET_U(materialMode);
++	GET_U(materialMap);
++	GET_U(materialEnv);
++	GET_U(materialRamp);
++	GET_U(materialBack);
++	GET_U(materialMapTexel);
++	GET_U(materialSrcTexel);
++	GET_U(materialBackInv);
++	GET_U(materialHasEnv);
++	GET_U(materialHasRamp);
++	GET_U(materialHasBack);
++	GET_U(materialMirror);
++	GET_U(materialXform);
++	u_materialP[0] = gl.GetUniformLocation(program, "materialP0");
++	u_materialP[1] = gl.GetUniformLocation(program, "materialP1");
++	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
++	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
++}
++
++void SpriteMaterialShader::setSpriteMat(const float value[16])
++{
++	gl.UniformMatrix4fv(u_spriteMat, 1, GL_FALSE, value);
++}
++
++void SpriteMaterialShader::setTone(const Vec4 &tone)
++{
++	setVec4Uniform(u_tone, tone);
++}
++
++void SpriteMaterialShader::setColor(const Vec4 &color)
++{
++	setVec4Uniform(u_color, color);
++}
++
++void SpriteMaterialShader::setOpacity(float value)
++{
++	gl.Uniform1f(u_opacity, value);
++}
++
++void SpriteMaterialShader::setBushDepth(bool bushY, bool bushUnder, float bushSlope, float bushIntercept)
++{
++	gl.Uniform1f(u_bushY, bushY);
++	gl.Uniform1f(u_bushUnder, bushUnder);
++	gl.Uniform1f(u_bushSlope, bushSlope);
++	gl.Uniform1f(u_bushIntercept, bushIntercept);
++}
++
++void SpriteMaterialShader::setBushOpacity(float value)
++{
++	gl.Uniform1f(u_bushOpacity, value);
++}
++
++void SpriteMaterialShader::setPattern(const TEX::ID pattern, const Vec2 &dimensions)
++{
++    setTexUniform(u_pattern, 1, pattern);
++    gl.Uniform2f(u_patternSizeInv, 1.f / dimensions.x, 1.f / dimensions.y);
++}
++
++void SpriteMaterialShader::setPatternBlendType(int blendType)
++{
++    gl.Uniform1i(u_patternBlendType, blendType);
++}
++
++void SpriteMaterialShader::setPatternTile(bool value)
++{
++    gl.Uniform1i(u_patternTile, value);
++}
++
++void SpriteMaterialShader::setShouldRenderPattern(bool value)
++{
++    gl.Uniform1i(u_renderPattern, value);
++}
++
++void SpriteMaterialShader::setPatternOpacity(float value)
++{
++    gl.Uniform1f(u_patternOpacity, value);
++}
++
++void SpriteMaterialShader::setPatternScroll(const Vec2 &scroll)
++{
++    setVec2Uniform(u_patternScroll, scroll);
++}
++
++void SpriteMaterialShader::setPatternZoom(const Vec2 &zoom)
++{
++    setVec2Uniform(u_patternZoom, zoom);
++}
++
++void SpriteMaterialShader::setInvert(bool value)
++{
++    gl.Uniform1i(u_invert, value);
++}
++
++void SpriteMaterialShader::setMode(int value)
++{
++	gl.Uniform1i(u_materialMode, value);
++}
++
++void SpriteMaterialShader::setSrcTexel(const Vec2 &value)
++{
++	setVec2Uniform(u_materialSrcTexel, value);
++}
++
++void SpriteMaterialShader::setMap(const TEX::ID tex, const Vec2 &texel, const Vec4 &xform)
++{
++	setTexUniform(u_materialMap, 2, tex);
++	setVec2Uniform(u_materialMapTexel, texel);
++	setVec4Uniform(u_materialXform, xform);
++}
++
++void SpriteMaterialShader::setEnv(const TEX::ID tex, bool enabled)
++{
++	if (enabled)
++		setTexUniform(u_materialEnv, 3, tex);
++	gl.Uniform1i(u_materialHasEnv, enabled);
++}
++
++void SpriteMaterialShader::setRamp(const TEX::ID tex, bool enabled)
++{
++	if (enabled)
++		setTexUniform(u_materialRamp, 4, tex);
++	gl.Uniform1i(u_materialHasRamp, enabled);
++}
++
++void SpriteMaterialShader::setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled)
++{
++	if (enabled) {
++		setTexUniform(u_materialBack, 5, tex);
++		setVec2Uniform(u_materialBackInv, sizeInv);
++	}
++	gl.Uniform1i(u_materialHasBack, enabled);
++}
++
++void SpriteMaterialShader::setMirror(bool value)
++{
++	gl.Uniform1f(u_materialMirror, value ? -1.f : 1.f);
++}
++
++void SpriteMaterialShader::setParams(const float value[16])
++{
++	for (int i = 0; i < 4; ++i)
++		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
++}
++
++
+ PlaneShader::PlaneShader()
+ {
+ 	INIT_SHADER(simple, plane, PlaneShader);
+diff --git a/src/display/gl/shader.h b/src/display/gl/shader.h
+index adc6f12..13d88fc 100644
+--- a/src/display/gl/shader.h
++++ b/src/display/gl/shader.h
+@@ -212,6 +212,44 @@ private:
+     u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
+ };
+ 
++class SpriteMaterialShader : public ShaderBase
++{
++public:
++	SpriteMaterialShader();
++
++	void setSpriteMat(const float value[16]);
++	void setTone(const Vec4 &value);
++	void setColor(const Vec4 &value);
++	void setOpacity(float value);
++	void setBushDepth(bool bushY, bool bushUnder, float bushSlope, float bushIntercept);
++	void setBushOpacity(float value);
++    void setPattern(const TEX::ID pattern, const Vec2 &dimensions);
++    void setPatternBlendType(int blendType);
++    void setPatternTile(bool value);
++    void setShouldRenderPattern(bool value);
++    void setPatternOpacity(float value);
++    void setPatternScroll(const Vec2 &scroll);
++    void setPatternZoom(const Vec2 &zoom);
++    void setInvert(bool value);
++
++	void setMode(int value);
++	void setSrcTexel(const Vec2 &value);
++	void setMap(const TEX::ID tex, const Vec2 &texel, const Vec4 &xform);
++	void setEnv(const TEX::ID tex, bool enabled);
++	void setRamp(const TEX::ID tex, bool enabled);
++	void setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled);
++	void setMirror(bool value);
++	void setParams(const float value[16]);
++
++private:
++	GLint u_spriteMat, u_tone, u_opacity, u_color,
++    u_bushY, u_bushUnder, u_bushSlope, u_bushIntercept, u_bushOpacity, u_pattern, u_renderPattern,
++    u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
++	GLint u_materialMode, u_materialMap, u_materialEnv, u_materialRamp, u_materialBack, u_materialMapTexel,
++	u_materialSrcTexel, u_materialBackInv, u_materialHasEnv, u_materialHasRamp, u_materialHasBack,
++	u_materialMirror, u_materialXform, u_materialP[4];
++};
++
+ class PlaneShader : public ShaderBase
+ {
+ public:
+diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
+index a266559..bd26a33 100644
+--- a/src/display/sprite.cpp
++++ b/src/display/sprite.cpp
+@@ -33,6 +33,7 @@
+ #include "quad.h"
+ #include "transform.h"
+ #include "shader.h"
++#include "exception.h"
+ #include "glstate.h"
+ #include "quadarray.h"
+ 
+@@ -84,6 +85,14 @@ struct SpritePrivate
+     Vec2 patternZoom;
+     
+     bool invert;
++
++    Bitmap *materialMap;
++    Bitmap *materialEnv;
++    Bitmap *materialRamp;
++    int materialMode;
++    Rect *materialRect;
++    Rect materialRectTmp;
++    float materialParams[Sprite::MaterialParamCount];
+     
+     Scene::Geometry sceneGeo;
+     
+@@ -129,6 +138,11 @@ struct SpritePrivate
+     patternTile(true),
+     patternOpacity(255),
+     invert(false),
++    materialMap(0),
++    materialEnv(0),
++    materialRamp(0),
++    materialMode(0),
++    materialRect(&materialRectTmp),
+     isVisible(false),
+     color(&tmp.color),
+     tone(&tmp.tone)
+@@ -142,6 +156,9 @@ struct SpritePrivate
+         patternScroll = Vec2(0,0);
+         patternZoom = Vec2(1, 1);
+         
++        for (int i = 0; i < Sprite::MaterialParamCount; ++i)
++            materialParams[i] = 0.f;
++        
+         wave.amp = 0;
+         wave.length = 180;
+         wave.speed = 360;
+@@ -568,6 +585,47 @@ DEF_ATTR_SIMPLE(Sprite, PatternScrollY, int, p->patternScroll.y)
+ DEF_ATTR_SIMPLE(Sprite, PatternZoomX, float, p->patternZoom.x)
+ DEF_ATTR_SIMPLE(Sprite, PatternZoomY, float, p->patternZoom.y)
+ DEF_ATTR_SIMPLE(Sprite, Invert,      bool,    p->invert)
++DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
++DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
++DEF_ATTR_RD_SIMPLE(Sprite, MaterialRamp, Bitmap*, p->materialRamp)
++DEF_ATTR_RD_SIMPLE(Sprite, MaterialMode, int,     p->materialMode)
++DEF_ATTR_SIMPLE(Sprite, MaterialRect, Rect&,   *p->materialRect)
++
++#define DEF_MATERIAL_BITMAP_SETTER(Name, field) \
++void Sprite::setMaterial##Name(Bitmap *value) \
++{ \
++    guardDisposed(); \
++    p->field = value; \
++    if (!nullOrDisposed(value)) \
++        value->ensureNonMega(); \
++}
++
++DEF_MATERIAL_BITMAP_SETTER(Map,  materialMap)
++DEF_MATERIAL_BITMAP_SETTER(Env,  materialEnv)
++DEF_MATERIAL_BITMAP_SETTER(Ramp, materialRamp)
++
++#undef DEF_MATERIAL_BITMAP_SETTER
++
++void Sprite::setMaterialMode(int value)
++{
++    guardDisposed();
++    p->materialMode = clamp(value, 0, 3);
++}
++
++float Sprite::getMaterialParam(int index) const
++{
++    guardDisposed();
++    if (index < 0 || index >= MaterialParamCount)
++        return 0.f;
++    return p->materialParams[index];
++}
++
++void Sprite::setMaterialParams(const float *values, int count)
++{
++    guardDisposed();
++    for (int i = 0; i < MaterialParamCount; ++i)
++        p->materialParams[i] = (i < count) ? values[i] : 0.f;
++}
+ 
+ void Sprite::setBitmap(Bitmap *bitmap)
+ {
+@@ -782,6 +840,7 @@ DEF_WAVE_SETTER(Phase,  phase,  float)
+ void Sprite::initDynAttribs()
+ {
+     p->srcRect = new Rect;
++    p->materialRect = new Rect;
+     p->color = new Color;
+     p->tone = new Tone;
+     
+@@ -803,6 +862,59 @@ void Sprite::update()
+ }
+ 
+ /* SceneElement */
++/* Built on first use so a driver that rejects it only turns materials off */
++static SpriteMaterialShader *materialShader;
++static bool materialShaderFailed;
++
++static SpriteMaterialShader *getMaterialShader()
++{
++    if (materialShader || materialShaderFailed)
++        return materialShader;
++
++    try {
++        materialShader = new SpriteMaterialShader();
++    } catch (const Exception &e) {
++        materialShaderFailed = true;
++        Debug() << "Sprite material shader unavailable:" << e.msg;
++    }
++
++    return materialShader;
++}
++
++bool Sprite::materialAvailable()
++{
++    return getMaterialShader() != 0;
++}
++
++/* Copy of what is already drawn under the current render target,
++ * read by material mode 2 for refraction */
++static TEX::ID materialBackTex;
++static Vec2i materialBackSize;
++
++static bool grabMaterialBackdrop(Vec2 &sizeInv)
++{
++    const IntRect &vp = glState.viewport.get();
++    if (vp.w <= 0 || vp.h <= 0)
++        return false;
++
++    if (materialBackTex == TEX::ID(0)) {
++        materialBackTex = TEX::gen();
++        TEX::bind(materialBackTex);
++        TEX::setRepeat(false);
++        TEX::setSmooth(true);
++    }
++
++    TEX::bind(materialBackTex);
++    if (materialBackSize.x != vp.w || materialBackSize.y != vp.h) {
++        TEX::allocEmpty(vp.w, vp.h);
++        materialBackSize = Vec2i(vp.w, vp.h);
++    }
++
++    gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vp.x, vp.y, vp.w, vp.h);
++    sizeInv = Vec2(1.f / vp.w, 1.f / vp.h);
++    return true;
++}
++
+ void Sprite::draw()
+ {
+     if (!p->isVisible)
+@@ -859,7 +971,78 @@ void Sprite::draw()
+         scalingMethod = shState->config().bitmapSmoothScaling;
+     }
+ 
+-    if (renderEffect)
++    bool useMaterial = (p->materialMode == 3 ||
++    (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
++
++    if (useMaterial)
++    {
++        SpriteMaterialShader &shader = *materialShader;
++        scalingMethod = NearestNeighbor;
++        const float *mp = p->materialParams;
++
++        Vec2 backInv;
++        bool back = p->materialMode == 2 && mp[15] > 0.f && grabMaterialBackdrop(backInv);
++
++        shader.bind();
++        shader.applyViewportProj();
++        shader.setSpriteMat(p->trans.getMatrix());
++
++        shader.setTone(p->tone->norm);
++        shader.setOpacity(p->opacity.norm);
++        shader.setBushDepth(p->bushY, p->bushUnder, p->bushSlope, p->bushIntercept);
++        shader.setBushOpacity(p->bushOpacity.norm);
++
++        if (p->pattern && !p->pattern->isDisposed() && p->patternOpacity > 0) {
++            shader.setPattern(p->pattern->getGLTypes().tex, Vec2(p->pattern->width(), p->pattern->height()));
++            shader.setPatternBlendType(p->patternBlendType);
++            shader.setPatternTile(p->patternTile);
++            shader.setPatternZoom(p->patternZoom);
++            shader.setPatternOpacity(p->patternOpacity.norm);
++            shader.setPatternScroll(p->patternScroll);
++            shader.setShouldRenderPattern(true);
++        }
++        else {
++            shader.setShouldRenderPattern(false);
++        }
++
++        shader.setInvert(p->invert);
++
++        const Vec4 *blend = (flashing && flashColor.w > p->color->norm.w) ?
++        &flashColor : &p->color->norm;
++        shader.setColor(*blend);
++
++        const float bw = (float) sourceWidthHires;
++        const float bh = (float) sourceHeightHires;
++        const TEXFBO &bt = p->bitmap->getGLTypes();
++        shader.setSrcTexel(Vec2(1.f / bt.width, 1.f / bt.height));
++        shader.setMode(p->materialMode);
++        shader.setMirror(p->mirrored);
++        shader.setParams(mp);
++
++        if (!nullOrDisposed(p->materialMap)) {
++            Bitmap *m = p->materialMap;
++            const TEXFBO &mt = m->getGLTypes();
++            const Rect &r = *p->materialRect;
++            const float mw = (float) m->width();
++            const float mh = (float) m->height();
++            const float rw = (r.width  > 0) ? (float) r.width  : bw;
++            const float rh = (r.height > 0) ? (float) r.height : bh;
++            shader.setMap(mt.tex, Vec2(1.f / mt.width, 1.f / mt.height),
++                          Vec4(rw / (bw * mw), rh / (bh * mh), r.x / mw, r.y / mh));
++        }
++        else {
++            shader.setMap(bt.tex, Vec2(1.f / bt.width, 1.f / bt.height), Vec4(0, 0, 0, 0));
++        }
++
++        bool env = !nullOrDisposed(p->materialEnv);
++        shader.setEnv(env ? p->materialEnv->getGLTypes().tex : TEX::ID(0), env);
++        bool ramp = !nullOrDisposed(p->materialRamp);
++        shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
++        shader.setBack(materialBackTex, backInv, back);
++
++        base = &shader;
++    }
++    else if (renderEffect)
+     {
+         if (scalingMethod != NearestNeighbor)
+         {
+diff --git a/src/display/sprite.h b/src/display/sprite.h
+index 1b5068c..315912b 100644
+--- a/src/display/sprite.h
++++ b/src/display/sprite.h
+@@ -71,11 +71,21 @@ public:
+     DECL_ATTR( PatternZoomX, float  )
+     DECL_ATTR( PatternZoomY, float  )
+     DECL_ATTR( Invert,      bool    )
++	DECL_ATTR( MaterialMap,  Bitmap* )
++	DECL_ATTR( MaterialEnv,  Bitmap* )
++	DECL_ATTR( MaterialRamp, Bitmap* )
++	DECL_ATTR( MaterialMode, int     )
++	DECL_ATTR( MaterialRect, Rect&   )
+ 	DECL_ATTR( WaveAmp,     int     )
+ 	DECL_ATTR( WaveLength,  int     )
+ 	DECL_ATTR( WaveSpeed,   int     )
+ 	DECL_ATTR( WavePhase,   float   )
+ 
++	enum { MaterialParamCount = 16 };
++	float getMaterialParam(int index) const;
++	void setMaterialParams(const float *values, int count);
++	static bool materialAvailable();
++
+ 	void initDynAttribs();
+ 
+ private:

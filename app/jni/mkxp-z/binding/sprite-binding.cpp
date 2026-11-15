@@ -46,6 +46,7 @@ RB_METHOD(spriteInitialize) {
     wrapProperty(self, &s->getSrcRect(), "src_rect", RectType);
     wrapProperty(self, &s->getColor(), "color", ColorType);
     wrapProperty(self, &s->getTone(), "tone", ToneType);
+    wrapProperty(self, &s->getMaterialRect(), "material_rect", RectType);
     
     GFX_UNLOCK;
     return self;
@@ -53,6 +54,10 @@ RB_METHOD(spriteInitialize) {
 
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Bitmap, "bitmap")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Pattern, "pattern")
+DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialMap, "material_map")
+DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialEnv, "material_env")
+DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialRamp, "material_ramp")
+DEF_GFX_PROP_OBJ_VAL(Sprite, Rect, MaterialRect, "material_rect")
 DEF_GFX_PROP_OBJ_VAL(Sprite, Rect, SrcRect, "src_rect")
 DEF_GFX_PROP_OBJ_VAL(Sprite, Color, Color, "color")
 DEF_GFX_PROP_OBJ_VAL(Sprite, Tone, Tone, "tone")
@@ -72,6 +77,7 @@ DEF_GFX_PROP_I(Sprite, PatternScrollY)
 DEF_GFX_PROP_I(Sprite, WaveAmp)
 DEF_GFX_PROP_I(Sprite, WaveLength)
 DEF_GFX_PROP_I(Sprite, WaveSpeed)
+DEF_GFX_PROP_I(Sprite, MaterialMode)
 
 DEF_GFX_PROP_F(Sprite, ZoomX)
 DEF_GFX_PROP_F(Sprite, ZoomY)
@@ -83,6 +89,48 @@ DEF_GFX_PROP_F(Sprite, PatternZoomY)
 DEF_GFX_PROP_B(Sprite, Mirror)
 DEF_GFX_PROP_B(Sprite, PatternTile)
 DEF_GFX_PROP_B(Sprite, Invert)
+
+RB_METHOD(spriteMaterialAvailable) {
+    RB_UNUSED_PARAM;
+    
+    bool value = false;
+    GFX_GUARD_EXC(value = Sprite::materialAvailable();)
+    
+    return rb_bool_new(value);
+}
+
+RB_METHOD(spriteGetMaterialParams) {
+    RB_UNUSED_PARAM;
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    VALUE ary = rb_ary_new2(Sprite::MaterialParamCount);
+    GUARD_EXC(
+        for (int i = 0; i < Sprite::MaterialParamCount; ++i)
+            rb_ary_push(ary, rb_float_new(s->getMaterialParam(i)));
+    )
+    
+    return ary;
+}
+
+RB_METHOD(spriteSetMaterialParams) {
+    rb_check_argc(argc, 1);
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    VALUE ary = rb_Array(argv[0]);
+    long n = RARRAY_LEN(ary);
+    if (n > Sprite::MaterialParamCount)
+        n = Sprite::MaterialParamCount;
+    
+    float values[Sprite::MaterialParamCount];
+    for (long i = 0; i < n; ++i)
+        values[i] = (float) NUM2DBL(rb_ary_entry(ary, i));
+    
+    GFX_GUARD_EXC(s->setMaterialParams(values, (int) n);)
+    
+    return argv[0];
+}
 
 RB_METHOD(spriteWidth) {
     RB_UNUSED_PARAM;
@@ -150,6 +198,15 @@ void spriteBindingInit() {
     INIT_PROP_BIND(Sprite, PatternZoomX, "pattern_zoom_x");
     INIT_PROP_BIND(Sprite, PatternZoomY, "pattern_zoom_y");
     INIT_PROP_BIND(Sprite, Invert, "invert");
+    
+    INIT_PROP_BIND(Sprite, MaterialMap, "material_map");
+    INIT_PROP_BIND(Sprite, MaterialEnv, "material_env");
+    INIT_PROP_BIND(Sprite, MaterialRamp, "material_ramp");
+    INIT_PROP_BIND(Sprite, MaterialMode, "material_mode");
+    INIT_PROP_BIND(Sprite, MaterialRect, "material_rect");
+    _rb_define_method(klass, "material_params", spriteGetMaterialParams);
+    _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
+    rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
     
     INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
     INIT_PROP_BIND(Sprite, WaveLength, "wave_length");

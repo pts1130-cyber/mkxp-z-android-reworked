@@ -52,6 +52,7 @@ typedef void (APIENTRYP _PFNGLDELETETEXTURESPROC) (GLsizei n, const GLuint *text
 typedef void (APIENTRYP _PFNGLBINDTEXTUREPROC) (GLenum target, GLuint texture);
 typedef void (APIENTRYP _PFNGLTEXIMAGE2DPROC) (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels);
 typedef void (APIENTRYP _PFNGLTEXSUBIMAGE2DPROC) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels);
+typedef void (APIENTRYP _PFNGLCOPYTEXSUBIMAGE2DPROC) (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
 typedef void (APIENTRYP _PFNGLTEXPARAMETERIPROC) (GLenum target, GLenum pname, GLint param);
 typedef void (APIENTRYP _PFNGLACTIVETEXTUREPROC) (GLenum texture);
 
@@ -146,6 +147,7 @@ typedef void (APIENTRYP _PFNGLRELEASESHADERCOMPILERPROC) (void);
 	GL_FUN(BindTexture, _PFNGLBINDTEXTUREPROC) \
 	GL_FUN(TexImage2D, _PFNGLTEXIMAGE2DPROC) \
 	GL_FUN(TexSubImage2D, _PFNGLTEXSUBIMAGE2DPROC) \
+	GL_FUN(CopyTexSubImage2D, _PFNGLCOPYTEXSUBIMAGE2DPROC) \
 	GL_FUN(TexParameteri, _PFNGLTEXPARAMETERIPROC) \
 	GL_FUN(ActiveTexture, _PFNGLACTIVETEXTUREPROC) \
 	/* Buffer object */ \

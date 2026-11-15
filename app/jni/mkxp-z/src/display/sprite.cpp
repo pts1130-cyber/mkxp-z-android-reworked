@@ -31,6 +31,8 @@
 #include "quad.h"
 #include "transform.h"
 #include "shader.h"
+#include "debugwriter.h"
+#include "exception.h"
 #include "glstate.h"
 #include "quadarray.h"
 
@@ -68,6 +70,14 @@ struct SpritePrivate
     Vec2 patternZoom;
     
     bool invert;
+
+    Bitmap *materialMap;
+    Bitmap *materialEnv;
+    Bitmap *materialRamp;
+    int materialMode;
+    Rect *materialRect;
+    Rect materialRectTmp;
+    float materialParams[Sprite::MaterialParamCount];
     
     IntRect sceneRect;
     Vec2i sceneOrig;
@@ -110,6 +120,11 @@ struct SpritePrivate
     patternTile(true),
     patternOpacity(255),
     invert(false),
+    materialMap(0),
+    materialEnv(0),
+    materialRamp(0),
+    materialMode(0),
+    materialRect(&materialRectTmp),
     isVisible(false),
     color(&tmp.color),
     tone(&tmp.tone)
@@ -124,6 +139,9 @@ struct SpritePrivate
         
         patternScroll = Vec2(0,0);
         patternZoom = Vec2(1, 1);
+        
+        for (int i = 0; i < Sprite::MaterialParamCount; ++i)
+            materialParams[i] = 0.f;
         
         wave.amp = 0;
         wave.length = 180;
@@ -357,6 +375,47 @@ DEF_ATTR_SIMPLE(Sprite, PatternScrollY, int, p->patternScroll.y)
 DEF_ATTR_SIMPLE(Sprite, PatternZoomX, float, p->patternZoom.x)
 DEF_ATTR_SIMPLE(Sprite, PatternZoomY, float, p->patternZoom.y)
 DEF_ATTR_SIMPLE(Sprite, Invert,      bool,    p->invert)
+DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
+DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
+DEF_ATTR_RD_SIMPLE(Sprite, MaterialRamp, Bitmap*, p->materialRamp)
+DEF_ATTR_RD_SIMPLE(Sprite, MaterialMode, int,     p->materialMode)
+DEF_ATTR_SIMPLE(Sprite, MaterialRect, Rect&,   *p->materialRect)
+
+#define DEF_MATERIAL_BITMAP_SETTER(Name, field) \
+void Sprite::setMaterial##Name(Bitmap *value) \
+{ \
+    guardDisposed(); \
+    p->field = value; \
+    if (!nullOrDisposed(value)) \
+        value->ensureNonMega(); \
+}
+
+DEF_MATERIAL_BITMAP_SETTER(Map,  materialMap)
+DEF_MATERIAL_BITMAP_SETTER(Env,  materialEnv)
+DEF_MATERIAL_BITMAP_SETTER(Ramp, materialRamp)
+
+#undef DEF_MATERIAL_BITMAP_SETTER
+
+void Sprite::setMaterialMode(int value)
+{
+    guardDisposed();
+    p->materialMode = clamp(value, 0, 3);
+}
+
+float Sprite::getMaterialParam(int index) const
+{
+    guardDisposed();
+    if (index < 0 || index >= MaterialParamCount)
+        return 0.f;
+    return p->materialParams[index];
+}
+
+void Sprite::setMaterialParams(const float *values, int count)
+{
+    guardDisposed();
+    for (int i = 0; i < MaterialParamCount; ++i)
+        p->materialParams[i] = (i < count) ? values[i] : 0.f;
+}
 
 void Sprite::setBitmap(Bitmap *bitmap)
 {
@@ -552,6 +611,7 @@ DEF_WAVE_SETTER(Phase,  phase,  float)
 void Sprite::initDynAttribs()
 {
     p->srcRect = new Rect;
+    p->materialRect = new Rect;
     p->color = new Color;
     p->tone = new Tone;
     
@@ -570,6 +630,65 @@ void Sprite::update()
 }
 
 /* SceneElement */
+/* Built on first use so a driver that rejects it only turns materials off */
+static SpriteMaterialShader *materialShader;
+static bool materialShaderFailed;
+
+static SpriteMaterialShader *getMaterialShader()
+{
+    if (materialShader || materialShaderFailed)
+        return materialShader;
+
+    try {
+        materialShader = new SpriteMaterialShader();
+    } catch (const Exception &e) {
+        materialShaderFailed = true;
+        Debug() << "Sprite material shader unavailable:" << e.msg;
+    }
+
+    return materialShader;
+}
+
+bool Sprite::materialAvailable()
+{
+    return getMaterialShader() != 0;
+}
+
+/* Copy of what is already drawn under the current render target,
+ * read by material mode 2 for refraction */
+static TEX::ID materialBackTex;
+static Vec2i materialBackSize;
+
+static bool grabMaterialBackdrop(Vec2 &sizeInv)
+{
+    const IntRect &vp = glState.viewport.get();
+    if (vp.w <= 0 || vp.h <= 0)
+        return false;
+
+    if (materialBackTex == TEX::ID(0)) {
+        materialBackTex = TEX::gen();
+        TEX::bind(materialBackTex);
+        TEX::setRepeat(false);
+        TEX::setSmooth(true);
+    }
+
+    TEX::bind(materialBackTex);
+    if (materialBackSize.x != vp.w || materialBackSize.y != vp.h) {
+        TEX::allocEmpty(vp.w, vp.h);
+        materialBackSize = Vec2i(vp.w, vp.h);
+    }
+
+    /* a native blit may have left another read framebuffer bound */
+    if (gl.BlitFramebuffer) {
+        GLint cur = 0;
+        gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &cur);
+        gl.BindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint) cur);
+    }
+    gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vp.x, vp.y, vp.w, vp.h);
+    sizeInv = Vec2(1.f / vp.w, 1.f / vp.h);
+    return true;
+}
+
 void Sprite::draw()
 {
     if (!p->isVisible)
@@ -587,7 +706,77 @@ void Sprite::draw()
     p->invert             ||
     (p->pattern && !p->pattern->isDisposed());
     
-    if (renderEffect)
+    bool useMaterial = (p->materialMode == 3 ||
+    (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
+
+    if (useMaterial)
+    {
+        SpriteMaterialShader &shader = *materialShader;
+        const float *mp = p->materialParams;
+
+        Vec2 backInv;
+        bool back = p->materialMode == 2 && mp[15] > 0.f && grabMaterialBackdrop(backInv);
+
+        shader.bind();
+        shader.applyViewportProj();
+        shader.setSpriteMat(p->trans.getMatrix());
+
+        shader.setTone(p->tone->norm);
+        shader.setOpacity(p->opacity.norm);
+        shader.setBushDepth(p->efBushDepth);
+        shader.setBushOpacity(p->bushOpacity.norm);
+
+        if (p->pattern && !p->pattern->isDisposed() && p->patternOpacity > 0) {
+            shader.setPattern(p->pattern->getGLTypes().tex, Vec2(p->pattern->width(), p->pattern->height()));
+            shader.setPatternBlendType(p->patternBlendType);
+            shader.setPatternTile(p->patternTile);
+            shader.setPatternZoom(p->patternZoom);
+            shader.setPatternOpacity(p->patternOpacity.norm);
+            shader.setPatternScroll(p->patternScroll);
+            shader.setShouldRenderPattern(true);
+        }
+        else {
+            shader.setShouldRenderPattern(false);
+        }
+
+        shader.setInvert(p->invert);
+
+        const Vec4 *blend = (flashing && flashColor.w > p->color->norm.w) ?
+        &flashColor : &p->color->norm;
+        shader.setColor(*blend);
+
+        const float bw = (float) p->bitmap->width();
+        const float bh = (float) p->bitmap->height();
+        const TEXFBO &bt = p->bitmap->getGLTypes();
+        shader.setSrcTexel(Vec2(1.f / bt.width, 1.f / bt.height));
+        shader.setMode(p->materialMode);
+        shader.setMirror(p->mirrored);
+        shader.setParams(mp);
+
+        if (!nullOrDisposed(p->materialMap)) {
+            Bitmap *m = p->materialMap;
+            const TEXFBO &mt = m->getGLTypes();
+            const Rect &r = *p->materialRect;
+            const float mw = (float) m->width();
+            const float mh = (float) m->height();
+            const float rw = (r.width  > 0) ? (float) r.width  : bw;
+            const float rh = (r.height > 0) ? (float) r.height : bh;
+            shader.setMap(mt.tex, Vec2(1.f / mt.width, 1.f / mt.height),
+                          Vec4(rw / (bw * mw), rh / (bh * mh), r.x / mw, r.y / mh));
+        }
+        else {
+            shader.setMap(bt.tex, Vec2(1.f / bt.width, 1.f / bt.height), Vec4(0, 0, 0, 0));
+        }
+
+        bool env = !nullOrDisposed(p->materialEnv);
+        shader.setEnv(env ? p->materialEnv->getGLTypes().tex : TEX::ID(0), env);
+        bool ramp = !nullOrDisposed(p->materialRamp);
+        shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
+        shader.setBack(materialBackTex, backInv, back);
+
+        base = &shader;
+    }
+    else if (renderEffect)
     {
         SpriteShader &shader = shState->shaders().sprite;
         

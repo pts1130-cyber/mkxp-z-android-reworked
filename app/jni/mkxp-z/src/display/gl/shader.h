@@ -205,6 +205,43 @@ private:
     u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
 };
 
+class SpriteMaterialShader : public ShaderBase
+{
+public:
+	SpriteMaterialShader();
+
+	void setSpriteMat(const float value[16]);
+	void setTone(const Vec4 &value);
+	void setColor(const Vec4 &value);
+	void setOpacity(float value);
+	void setBushDepth(float value);
+	void setBushOpacity(float value);
+	void setPattern(const TEX::ID pattern, const Vec2 &dimensions);
+	void setPatternBlendType(int blendType);
+	void setPatternTile(bool value);
+	void setShouldRenderPattern(bool value);
+	void setPatternOpacity(float value);
+	void setPatternScroll(const Vec2 &scroll);
+	void setPatternZoom(const Vec2 &zoom);
+	void setInvert(bool value);
+
+	void setMode(int value);
+	void setSrcTexel(const Vec2 &value);
+	void setMap(const TEX::ID tex, const Vec2 &texel, const Vec4 &xform);
+	void setEnv(const TEX::ID tex, bool enabled);
+	void setRamp(const TEX::ID tex, bool enabled);
+	void setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled);
+	void setMirror(bool value);
+	void setParams(const float value[16]);
+
+private:
+	GLint u_spriteMat, u_tone, u_opacity, u_color, u_bushDepth, u_bushOpacity, u_pattern, u_renderPattern,
+	u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
+	GLint u_materialMode, u_materialMap, u_materialEnv, u_materialRamp, u_materialBack, u_materialMapTexel,
+	u_materialSrcTexel, u_materialBackInv, u_materialHasEnv, u_materialHasRamp, u_materialHasBack,
+	u_materialMirror, u_materialXform, u_materialP[4];
+};
+
 class PlaneShader : public ShaderBase
 {
 public:

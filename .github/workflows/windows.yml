@@ -82,6 +82,14 @@ jobs:
           git apply ../patchrepo/windows-engine/arc-bitmap.patch
           git diff --stat
 
+      - name: Apply sprite material patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/sprite-material.patch
+          git apply ../patchrepo/windows-engine/sprite-material.patch
+          git diff --stat
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

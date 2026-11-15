@@ -48,6 +48,8 @@
 #include "simple.vert.xxd"
 #include "simpleColor.vert.xxd"
 #include "sprite.vert.xxd"
+#include "spriteMaterial.vert.xxd"
+#include "spriteMaterial.frag.xxd"
 #include "tilemap.vert.xxd"
 #include "blur.frag.xxd"
 #include "simpleMatrix.vert.xxd"
@@ -546,6 +548,169 @@ void SpriteShader::setPatternZoom(const Vec2 &zoom)
 void SpriteShader::setInvert(bool value)
 {
     gl.Uniform1i(u_invert, value);
+}
+
+
+SpriteMaterialShader::SpriteMaterialShader()
+{
+	INIT_SHADER(spriteMaterial, spriteMaterial, SpriteMaterialShader);
+
+	ShaderBase::init();
+
+	GET_U(spriteMat);
+	GET_U(tone);
+	GET_U(color);
+	GET_U(opacity);
+	GET_U(bushDepth);
+	GET_U(bushOpacity);
+    GET_U(pattern);
+    GET_U(patternBlendType);
+    GET_U(patternTile);
+    GET_U(renderPattern);
+    GET_U(patternSizeInv);
+    GET_U(patternOpacity);
+    GET_U(patternScroll);
+    GET_U(patternZoom);
+    GET_U(invert);
+	GET_U(materialMode);
+	GET_U(materialMap);
+	GET_U(materialEnv);
+	GET_U(materialRamp);
+	GET_U(materialBack);
+	GET_U(materialMapTexel);
+	GET_U(materialSrcTexel);
+	GET_U(materialBackInv);
+	GET_U(materialHasEnv);
+	GET_U(materialHasRamp);
+	GET_U(materialHasBack);
+	GET_U(materialMirror);
+	GET_U(materialXform);
+	u_materialP[0] = gl.GetUniformLocation(program, "materialP0");
+	u_materialP[1] = gl.GetUniformLocation(program, "materialP1");
+	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
+	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
+}
+
+void SpriteMaterialShader::setSpriteMat(const float value[16])
+{
+	gl.UniformMatrix4fv(u_spriteMat, 1, GL_FALSE, value);
+}
+
+void SpriteMaterialShader::setTone(const Vec4 &tone)
+{
+	setVec4Uniform(u_tone, tone);
+}
+
+void SpriteMaterialShader::setColor(const Vec4 &color)
+{
+	setVec4Uniform(u_color, color);
+}
+
+void SpriteMaterialShader::setOpacity(float value)
+{
+	gl.Uniform1f(u_opacity, value);
+}
+
+void SpriteMaterialShader::setBushDepth(float value)
+{
+	gl.Uniform1f(u_bushDepth, value);
+}
+
+void SpriteMaterialShader::setBushOpacity(float value)
+{
+	gl.Uniform1f(u_bushOpacity, value);
+}
+
+void SpriteMaterialShader::setPattern(const TEX::ID pattern, const Vec2 &dimensions)
+{
+    setTexUniform(u_pattern, 1, pattern);
+    gl.Uniform2f(u_patternSizeInv, 1.f / dimensions.x, 1.f / dimensions.y);
+}
+
+void SpriteMaterialShader::setPatternBlendType(int blendType)
+{
+    gl.Uniform1i(u_patternBlendType, blendType);
+}
+
+void SpriteMaterialShader::setPatternTile(bool value)
+{
+    gl.Uniform1i(u_patternTile, value);
+}
+
+void SpriteMaterialShader::setShouldRenderPattern(bool value)
+{
+    gl.Uniform1i(u_renderPattern, value);
+}
+
+void SpriteMaterialShader::setPatternOpacity(float value)
+{
+    gl.Uniform1f(u_patternOpacity, value);
+}
+
+void SpriteMaterialShader::setPatternScroll(const Vec2 &scroll)
+{
+    setVec2Uniform(u_patternScroll, scroll);
+}
+
+void SpriteMaterialShader::setPatternZoom(const Vec2 &zoom)
+{
+    setVec2Uniform(u_patternZoom, zoom);
+}
+
+void SpriteMaterialShader::setInvert(bool value)
+{
+    gl.Uniform1i(u_invert, value);
+}
+
+void SpriteMaterialShader::setMode(int value)
+{
+	gl.Uniform1i(u_materialMode, value);
+}
+
+void SpriteMaterialShader::setSrcTexel(const Vec2 &value)
+{
+	setVec2Uniform(u_materialSrcTexel, value);
+}
+
+void SpriteMaterialShader::setMap(const TEX::ID tex, const Vec2 &texel, const Vec4 &xform)
+{
+	setTexUniform(u_materialMap, 2, tex);
+	setVec2Uniform(u_materialMapTexel, texel);
+	setVec4Uniform(u_materialXform, xform);
+}
+
+void SpriteMaterialShader::setEnv(const TEX::ID tex, bool enabled)
+{
+	if (enabled)
+		setTexUniform(u_materialEnv, 3, tex);
+	gl.Uniform1i(u_materialHasEnv, enabled);
+}
+
+void SpriteMaterialShader::setRamp(const TEX::ID tex, bool enabled)
+{
+	if (enabled)
+		setTexUniform(u_materialRamp, 4, tex);
+	gl.Uniform1i(u_materialHasRamp, enabled);
+}
+
+void SpriteMaterialShader::setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled)
+{
+	if (enabled) {
+		setTexUniform(u_materialBack, 5, tex);
+		setVec2Uniform(u_materialBackInv, sizeInv);
+	}
+	gl.Uniform1i(u_materialHasBack, enabled);
+}
+
+void SpriteMaterialShader::setMirror(bool value)
+{
+	gl.Uniform1f(u_materialMirror, value ? -1.f : 1.f);
+}
+
+void SpriteMaterialShader::setParams(const float value[16])
+{
+	for (int i = 0; i < 4; ++i)
+		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
 }
 
 
