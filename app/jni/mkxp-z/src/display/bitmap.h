@@ -48,6 +48,7 @@ public:
 	static void preloadClear();
 	static void preloadShutdown();
 	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
+	void releasePixels();
 	int logicalScale() const;
 	Bitmap(int width, int height);
     Bitmap(void *pixeldata, int width, int height);
@@ -177,6 +178,7 @@ private:
 };
 
 /* ARC: native picture memory counter (see bitmap.cpp) */
+void arcMemStats(unsigned long long *keptBytes, unsigned long long *preDoneBytes, int *preDone, int *preQueued);
 void arcBitmapStats(unsigned long long *bytes, int *count,
                     int *bigW, int *bigH);
 

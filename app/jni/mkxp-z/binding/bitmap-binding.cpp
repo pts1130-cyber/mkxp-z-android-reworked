@@ -408,6 +408,13 @@ RB_METHOD(bitmapRadialBlur) {
     return Qnil;
 }
 
+RB_METHOD(bitmapReleasePixels) {
+    RB_UNUSED_PARAM;
+    Bitmap *b = getPrivateData<Bitmap>(self);
+    GFX_GUARD_EXC(b->releasePixels(););
+    return Qnil;
+}
+
 RB_METHOD(bitmapGetRawData) {
     RB_UNUSED_PARAM;
     
@@ -898,6 +905,7 @@ void bitmapBindingInit() {
     _rb_define_method(klass, "draw_text", bitmapDrawText);
     _rb_define_method(klass, "text_size", bitmapTextSize);
     
+    _rb_define_method(klass, "release_pixels", bitmapReleasePixels);
     _rb_define_method(klass, "raw_data", bitmapGetRawData);
     _rb_define_method(klass, "raw_data=", bitmapSetRawData);
     _rb_define_method(klass, "to_file", bitmapSaveToFile);

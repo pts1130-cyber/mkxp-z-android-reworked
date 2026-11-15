@@ -140,6 +140,7 @@ RB_METHOD(mkxpSettingsMenu);
 RB_METHOD(mkxpCpuCount);
 RB_METHOD(mkxpSystemMemory);
 RB_METHOD(arcBitmapStatsRb);
+RB_METHOD(arcMemStatsRb);
 RB_METHOD(mkxpReloadPathCache);
 RB_METHOD(mkxpAddPath);
 RB_METHOD(mkxpRemovePath);
@@ -254,6 +255,7 @@ static void mriBindingInit()
 	_rb_define_module_function(mod, "nproc", mkxpCpuCount);
 	_rb_define_module_function(mod, "memory", mkxpSystemMemory);
 	_rb_define_module_function(mod, "arc_bitmap_stats", arcBitmapStatsRb);
+	_rb_define_module_function(mod, "arc_mem_stats", arcMemStatsRb);
 
 	_rb_define_module_function(mod, "reload_cache", mkxpReloadPathCache);
 	_rb_define_module_function(mod, "mount", mkxpAddPath);
@@ -550,6 +552,22 @@ RB_METHOD(arcBitmapStatsRb) {
     rb_ary_push(ary, ULL2NUM(bytes));
     rb_ary_push(ary, INT2NUM(bw));
     rb_ary_push(ary, INT2NUM(bh));
+    return ary;
+}
+
+/* ARC: System.arc_mem_stats => [kept decoded bytes, finished preload bytes, finished preload count, queued preload count] */
+RB_METHOD(arcMemStatsRb) {
+    RB_UNUSED_PARAM;
+
+    unsigned long long kept = 0, pre = 0;
+    int done = 0, queued = 0;
+    arcMemStats(&kept, &pre, &done, &queued);
+
+    VALUE ary = rb_ary_new();
+    rb_ary_push(ary, ULL2NUM(kept));
+    rb_ary_push(ary, ULL2NUM(pre));
+    rb_ary_push(ary, INT2NUM(done));
+    rb_ary_push(ary, INT2NUM(queued));
     return ary;
 }
 

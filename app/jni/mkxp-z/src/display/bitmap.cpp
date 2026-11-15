@@ -987,6 +987,36 @@ namespace
     }
 }
 
+/* ARC: the game says this picture's pixels will not be read (an effect sheet that is only drawn):
+ * drop the RAM copy of the decoded file. raw_data/get_pixel still work (they read back from the texture) */
+void Bitmap::releasePixels()
+{
+    guardDisposed();
+
+    if (p->megaSurface || p->animation.enabled || !p->surface)
+        return;
+
+    p->flushPending();
+    arcKeepRemove(p);
+    SDL_FreeSurface(p->surface);
+    p->surface = 0;
+}
+
+/* ARC: RAM held by the engine outside textures: kept decoded pixels, finished preload pictures */
+void arcMemStats(unsigned long long *keptBytes, unsigned long long *preDoneBytes, int *preDone, int *preQueued)
+{
+    *keptBytes = (unsigned long long) arcKeepBytes;
+    *preDoneBytes = 0;
+    *preDone = 0;
+    *preQueued = 0;
+    if (!arcPre)
+        return;
+    std::lock_guard<std::mutex> lk(arcPre->lock);
+    *preDoneBytes = (unsigned long long) arcPre->doneBytes;
+    *preDone = (int) arcPre->doneCount;
+    *preQueued = (int) arcPre->queue.size();
+}
+
 void Bitmap::preloadLimits(int *maxDone, unsigned long long *maxBytes)
 {
     if (maxDone)

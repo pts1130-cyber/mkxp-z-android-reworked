@@ -1,0 +1,332 @@
+diff --git a/binding/bitmap-binding.cpp b/binding/bitmap-binding.cpp
+index 520af6b..b1bebe9 100644
+--- a/binding/bitmap-binding.cpp
++++ b/binding/bitmap-binding.cpp
+@@ -472,10 +472,44 @@ RB_METHOD_GUARD_END
+ RB_METHOD(bitmapPreload) {
+     RB_UNUSED_PARAM;
+ 
+-    const char *filename;
+-    rb_get_args(argc, argv, "z", &filename RB_ARG_END);
+-    Bitmap::preload(filename);
++    /* same call forms as the Android engine: paths or arrays of paths, then an optional Integer scale */
++    int scale = 1;
++    int n = argc;
++    if (n > 0 && FIXNUM_P(argv[n - 1])) {
++        scale = NUM2INT(argv[n - 1]);
++        --n;
++    }
++
++    for (int i = 0; i < n; ++i) {
++        VALUE arg = argv[i];
++        if (RB_TYPE_P(arg, T_ARRAY)) {
++            long m = RARRAY_LEN(arg);
++            for (long j = 0; j < m; ++j) {
++                VALUE e = rb_ary_entry(arg, j);
++                if (RB_TYPE_P(e, T_STRING))
++                    Bitmap::preload(StringValueCStr(e), scale);
++            }
++        } else if (RB_TYPE_P(arg, T_STRING)) {
++            Bitmap::preload(StringValueCStr(arg), scale);
++        }
++    }
++
++    return Qnil;
++}
++
++RB_METHOD(bitmapPreloadLimits) {
++    RB_UNUSED_PARAM;
++
++    int maxDone = 0;
++    unsigned long long maxBytes = 0;
++    Bitmap::preloadLimits(&maxDone, &maxBytes);
+ 
++    return rb_ary_new3(2, INT2NUM(maxDone), ULL2NUM(maxBytes));
++}
++
++RB_METHOD(bitmapPreloadClear) {
++    RB_UNUSED_PARAM;
++    Bitmap::preloadClear();
+     return Qnil;
+ }
+ 
+@@ -947,6 +981,8 @@ void bitmapBindingInit() {
+     
+     _rb_define_method(klass, "alpha_bounds", bitmapAlphaBounds);
+     rb_define_singleton_method(klass, "preload", RUBY_METHOD_FUNC(bitmapPreload), -1);
++    rb_define_singleton_method(klass, "preload_clear", RUBY_METHOD_FUNC(bitmapPreloadClear), -1);
++    rb_define_singleton_method(klass, "preload_limits", RUBY_METHOD_FUNC(bitmapPreloadLimits), -1);
+     _rb_define_method(klass, "raw_data", bitmapGetRawData);
+     _rb_define_method(klass, "raw_data=", bitmapSetRawData);
+     _rb_define_method(klass, "to_file", bitmapSaveToFile);
+diff --git a/src/display/bitmap.cpp b/src/display/bitmap.cpp
+index 676294d..ab75110 100644
+--- a/src/display/bitmap.cpp
++++ b/src/display/bitmap.cpp
+@@ -591,18 +591,30 @@ struct ArcImageHandler : FileSystem::OpenHandler
+ 
+ struct ArcImagePreload
+ {
+-    static const size_t MAX_BYTES = 192u * 1024u * 1024u;
++    enum Stage { QUEUED, WORKING, DONE };
++
++    struct Item
++    {
++        Stage stage;
++        SDL_Surface *surf;
++        Item() : stage(QUEUED), surf(0) {}
++    };
++
++    /* same limits as the Android engine: the worker pauses while this many
++     * finished pictures (or bytes) are waiting to be taken */
++    static const size_t MAX_DONE = 16;
++    static const size_t MAX_BYTES = 160u * 1024u * 1024u;
+ 
+     std::mutex lock;
+     std::condition_variable cond;
+     std::deque<std::string> queue;
+-    std::unordered_set<std::string> pending;
+-    std::unordered_map<std::string, SDL_Surface *> done;
++    std::unordered_map<std::string, Item> items;
++    size_t doneCount;
+     size_t doneBytes;
+     std::thread worker;
+     bool quit;
+ 
+-    ArcImagePreload() : doneBytes(0), quit(false) {}
++    ArcImagePreload() : doneCount(0), doneBytes(0), quit(false) {}
+ 
+     ~ArcImagePreload()
+     {
+@@ -613,6 +625,15 @@ struct ArcImagePreload
+         cond.notify_all();
+         if (worker.joinable())
+             worker.join();
++        for (auto &it : items)
++            if (it.second.surf)
++                SDL_FreeSurface(it.second.surf);
++        items.clear();
++    }
++
++    static size_t bytesOf(SDL_Surface *s)
++    {
++        return (size_t) s->pitch * (size_t) s->h;
+     }
+ 
+     void run()
+@@ -623,13 +644,20 @@ struct ArcImagePreload
+ 
+             {
+                 std::unique_lock<std::mutex> l(lock);
+-                cond.wait(l, [this] { return quit || !queue.empty(); });
++                cond.wait(l, [this] {
++                    return quit || (!queue.empty() && doneCount < MAX_DONE && doneBytes < MAX_BYTES);
++                });
+ 
+                 if (quit)
+                     return;
+ 
+                 name = queue.front();
+                 queue.pop_front();
++
++                auto it = items.find(name);
++                if (it == items.end() || it->second.stage != QUEUED)
++                    continue;
++                it->second.stage = WORKING;
+             }
+ 
+             SDL_Surface *surf = 0;
+@@ -639,30 +667,40 @@ struct ArcImagePreload
+                 ArcImageHandler handler;
+                 shState->fileSystem().openRead(handler, name.c_str());
+                 surf = handler.surface;
++                if (surf && surf->format->format != SDL_PIXELFORMAT_ABGR8888)
++                {
++                    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ABGR8888, 0);
++                    SDL_FreeSurface(surf);
++                    surf = conv;
++                }
+             }
+             catch (...)
+             {
++                if (surf)
++                    SDL_FreeSurface(surf);
++                surf = 0;
+             }
+ 
+             {
+                 std::lock_guard<std::mutex> l(lock);
++                auto it = items.find(name);
+ 
+-                if (surf)
++                if (it == items.end())
+                 {
+-                    size_t bytes = (size_t) surf->pitch * surf->h;
+-
+-                    if (doneBytes + bytes <= MAX_BYTES && !done.count(name))
+-                    {
+-                        done[name] = surf;
+-                        doneBytes += bytes;
+-                    }
+-                    else
+-                    {
++                    if (surf)
+                         SDL_FreeSurface(surf);
+-                    }
+                 }
+-
+-                pending.erase(name);
++                else if (!surf)
++                {
++                    items.erase(it);
++                }
++                else
++                {
++                    it->second.surf = surf;
++                    it->second.stage = DONE;
++                    ++doneCount;
++                    doneBytes += bytesOf(surf);
++                }
+             }
+ 
+             cond.notify_all();
+@@ -674,10 +712,10 @@ struct ArcImagePreload
+         {
+             std::lock_guard<std::mutex> l(lock);
+ 
+-            if (quit || pending.count(name) || done.count(name))
++            if (quit || items.count(name))
+                 return;
+ 
+-            pending.insert(name);
++            items[name] = Item();
+             queue.push_back(name);
+ 
+             if (!worker.joinable())
+@@ -687,25 +725,69 @@ struct ArcImagePreload
+         cond.notify_all();
+     }
+ 
+-    /* Returns the decoded surface (caller owns it) or 0. Waits if the
+-     * worker is decoding exactly this file right now. */
++    /* Returns the decoded surface (caller owns it) or 0. Waits only while the
++     * worker is decoding exactly this file; a file still in the queue is dropped
++     * from it and the caller loads it itself. */
+     SDL_Surface *take(const std::string &name)
+     {
+         std::unique_lock<std::mutex> l(lock);
+ 
+-        if (pending.count(name))
+-            cond.wait(l, [this, &name] { return pending.count(name) == 0; });
++        for (;;)
++        {
++            auto it = items.find(name);
+ 
+-        auto it = done.find(name);
++            if (it == items.end())
++                return 0;
+ 
+-        if (it == done.end())
+-            return 0;
++            if (it->second.stage == QUEUED)
++            {
++                items.erase(it);
++                for (auto q = queue.begin(); q != queue.end(); ++q)
++                {
++                    if (*q == name)
++                    {
++                        queue.erase(q);
++                        break;
++                    }
++                }
++                return 0;
++            }
+ 
+-        SDL_Surface *surf = it->second;
+-        doneBytes -= (size_t) surf->pitch * surf->h;
+-        done.erase(it);
++            if (it->second.stage == DONE)
++            {
++                SDL_Surface *surf = it->second.surf;
++                doneBytes -= bytesOf(surf);
++                --doneCount;
++                items.erase(it);
++                l.unlock();
++                cond.notify_all();
++                return surf;
++            }
+ 
+-        return surf;
++            cond.wait(l);
++        }
++    }
++
++    void clear()
++    {
++        {
++            std::lock_guard<std::mutex> l(lock);
++            queue.clear();
++            for (auto it = items.begin(); it != items.end();)
++            {
++                if (it->second.stage == WORKING)
++                {
++                    ++it;
++                    continue;
++                }
++                if (it->second.surf)
++                    SDL_FreeSurface(it->second.surf);
++                it = items.erase(it);
++            }
++            doneCount = 0;
++            doneBytes = 0;
++        }
++        cond.notify_all();
+     }
+ };
+ 
+@@ -715,11 +797,29 @@ static ArcImagePreload &arcImagePreload()
+     return instance;
+ }
+ 
+-void Bitmap::preload(const char *filename)
++void Bitmap::preload(const char *filename, int logicalScale)
+ {
++    /* this engine has no logical-scale loading: Bitmap.new(path, n) does not exist,
++     * so a request for 1/n pixels could never be taken */
++    if (!filename || !*filename || logicalScale > 1)
++        return;
++
+     arcImagePreload().request(filename);
+ }
+ 
++void Bitmap::preloadClear()
++{
++    arcImagePreload().clear();
++}
++
++void Bitmap::preloadLimits(int *maxDone, unsigned long long *maxBytes)
++{
++    if (maxDone)
++        *maxDone = (int) ArcImagePreload::MAX_DONE;
++    if (maxBytes)
++        *maxBytes = (unsigned long long) ArcImagePreload::MAX_BYTES;
++}
++
+ Bitmap::Bitmap(const char *filename)
+ {
+     std::string hiresPrefix = "Hires/";
+diff --git a/src/display/bitmap.h b/src/display/bitmap.h
+index 36586a9..13ecbf6 100644
+--- a/src/display/bitmap.h
++++ b/src/display/bitmap.h
+@@ -100,7 +100,9 @@ public:
+ 
+ 	Color getPixel(int x, int y) const;
+ 	IntRect alphaBounds(int threshold, const IntRect &region) const;
+-	static void preload(const char *filename);
++	static void preload(const char *filename, int logicalScale = 1);
++	static void preloadClear();
++	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
+ 	void setPixel(int x, int y, const Color &color);
+     
+     bool getRaw(void *output, int output_size);
