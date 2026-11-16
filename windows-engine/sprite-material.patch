@@ -117,10 +117,10 @@ index 9a8cf6a..69ac290 100644
      'blur.frag',
 diff --git a/shader/spriteMaterial.frag b/shader/spriteMaterial.frag
 new file mode 100644
-index 0000000..8b71d52
+index 0000000..a8982ff
 --- /dev/null
 +++ b/shader/spriteMaterial.frag
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,246 @@
 +
 +uniform sampler2D texture;
 +
@@ -161,6 +161,7 @@ index 0000000..8b71d52
 +uniform vec4 materialP1;
 +uniform vec4 materialP2;
 +uniform vec4 materialP3;
++uniform vec4 materialP4;
 +
 +varying vec2 v_texCoord;
 +varying vec2 v_patCoord;
@@ -299,6 +300,7 @@ index 0000000..8b71d52
 +	}
 +
 +	col = mix(col, softLight(col, orig), materialP1.x);
++	col = clamp(col + materialP4.x * (orig - vec3(dot(orig, lumaF))), 0.0, 1.0);
 +	return mix(orig, col, s);
 +}
 +
@@ -432,7 +434,7 @@ index 634da66..4d12b1f 100644
  	GL_FUN(ActiveTexture, _PFNGLACTIVETEXTUREPROC) \
  	GL_FUN(GenerateMipmap, _PFNGLGENERATEMIPMAPPROC) \
 diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
-index 980d995..4e96f66 100644
+index 980d995..4463801 100644
 --- a/src/display/gl/shader.cpp
 +++ b/src/display/gl/shader.cpp
 @@ -55,6 +55,8 @@
@@ -444,7 +446,7 @@ index 980d995..4e96f66 100644
  #include "tilemap.vert.xxd"
  #include "blur.frag.xxd"
  #include "simpleMatrix.vert.xxd"
-@@ -651,6 +653,175 @@ void SpriteShader::setInvert(bool value)
+@@ -651,6 +653,176 @@ void SpriteShader::setInvert(bool value)
  }
  
  
@@ -489,6 +491,7 @@ index 980d995..4e96f66 100644
 +	u_materialP[1] = gl.GetUniformLocation(program, "materialP1");
 +	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
 +	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
++	u_materialP[4] = gl.GetUniformLocation(program, "materialP4");
 +}
 +
 +void SpriteMaterialShader::setSpriteMat(const float value[16])
@@ -610,9 +613,9 @@ index 980d995..4e96f66 100644
 +	gl.Uniform1f(u_materialMirror, value ? -1.f : 1.f);
 +}
 +
-+void SpriteMaterialShader::setParams(const float value[16])
++void SpriteMaterialShader::setParams(const float value[20])
 +{
-+	for (int i = 0; i < 4; ++i)
++	for (int i = 0; i < 5; ++i)
 +		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
 +}
 +
@@ -621,7 +624,7 @@ index 980d995..4e96f66 100644
  {
  	INIT_SHADER(simple, plane, PlaneShader);
 diff --git a/src/display/gl/shader.h b/src/display/gl/shader.h
-index adc6f12..13d88fc 100644
+index adc6f12..c666a6e 100644
 --- a/src/display/gl/shader.h
 +++ b/src/display/gl/shader.h
 @@ -212,6 +212,44 @@ private:
@@ -655,7 +658,7 @@ index adc6f12..13d88fc 100644
 +	void setRamp(const TEX::ID tex, bool enabled);
 +	void setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled);
 +	void setMirror(bool value);
-+	void setParams(const float value[16]);
++	void setParams(const float value[20]);
 +
 +private:
 +	GLint u_spriteMat, u_tone, u_opacity, u_color,
@@ -663,7 +666,7 @@ index adc6f12..13d88fc 100644
 +    u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
 +	GLint u_materialMode, u_materialMap, u_materialEnv, u_materialRamp, u_materialBack, u_materialMapTexel,
 +	u_materialSrcTexel, u_materialBackInv, u_materialHasEnv, u_materialHasRamp, u_materialHasBack,
-+	u_materialMirror, u_materialXform, u_materialP[4];
++	u_materialMirror, u_materialXform, u_materialP[5];
 +};
 +
  class PlaneShader : public ShaderBase
@@ -915,7 +918,7 @@ index a266559..bd26a33 100644
          if (scalingMethod != NearestNeighbor)
          {
 diff --git a/src/display/sprite.h b/src/display/sprite.h
-index 1b5068c..315912b 100644
+index 1b5068c..0f81298 100644
 --- a/src/display/sprite.h
 +++ b/src/display/sprite.h
 @@ -71,11 +71,21 @@ public:
@@ -932,7 +935,7 @@ index 1b5068c..315912b 100644
  	DECL_ATTR( WaveSpeed,   int     )
  	DECL_ATTR( WavePhase,   float   )
  
-+	enum { MaterialParamCount = 16 };
++	enum { MaterialParamCount = 20 };
 +	float getMaterialParam(int index) const;
 +	void setMaterialParams(const float *values, int count);
 +	static bool materialAvailable();

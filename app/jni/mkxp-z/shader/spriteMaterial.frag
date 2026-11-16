@@ -35,6 +35,7 @@ uniform vec4 materialP0;
 uniform vec4 materialP1;
 uniform vec4 materialP2;
 uniform vec4 materialP3;
+uniform vec4 materialP4;
 
 varying vec2 v_texCoord;
 varying vec2 v_patCoord;
@@ -173,6 +174,7 @@ vec3 litStage(vec3 orig, vec4 m)
 	}
 
 	col = mix(col, softLight(col, orig), materialP1.x);
+	col = clamp(col + materialP4.x * (orig - vec3(dot(orig, lumaF))), 0.0, 1.0);
 	return mix(orig, col, s);
 }
 

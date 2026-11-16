@@ -81,7 +81,7 @@ public:
 	DECL_ATTR( WaveSpeed,   int     )
 	DECL_ATTR( WavePhase,   float   )
 
-	enum { MaterialParamCount = 16 };
+	enum { MaterialParamCount = 20 };
 	float getMaterialParam(int index) const;
 	void setMaterialParams(const float *values, int count);
 	static bool materialAvailable();

@@ -589,6 +589,7 @@ SpriteMaterialShader::SpriteMaterialShader()
 	u_materialP[1] = gl.GetUniformLocation(program, "materialP1");
 	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
 	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
+	u_materialP[4] = gl.GetUniformLocation(program, "materialP4");
 }
 
 void SpriteMaterialShader::setSpriteMat(const float value[16])
@@ -707,9 +708,9 @@ void SpriteMaterialShader::setMirror(bool value)
 	gl.Uniform1f(u_materialMirror, value ? -1.f : 1.f);
 }
 
-void SpriteMaterialShader::setParams(const float value[16])
+void SpriteMaterialShader::setParams(const float value[20])
 {
-	for (int i = 0; i < 4; ++i)
+	for (int i = 0; i < 5; ++i)
 		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
 }
 
