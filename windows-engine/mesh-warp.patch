@@ -1,9 +1,9 @@
 diff --git a/binding/sprite-binding.cpp b/binding/sprite-binding.cpp
-index 750bed5..2e7d76e 100644
+index 4befb70..7923ae9 100644
 --- a/binding/sprite-binding.cpp
 +++ b/binding/sprite-binding.cpp
-@@ -28,6 +28,9 @@
- #include "sprite.h"
+@@ -29,6 +29,9 @@
+ #include "arcshader.h"
  #include "viewportelement-binding.h"
  
 +#include <string.h>
@@ -12,7 +12,7 @@ index 750bed5..2e7d76e 100644
  #if RAPI_FULL > 187
  DEF_TYPE(Sprite);
  #else
-@@ -133,6 +136,119 @@ RB_METHOD_GUARD(spriteSetMaterialParams) {
+@@ -136,6 +139,119 @@ RB_METHOD_GUARD(spriteSetMaterialParams) {
  }
  RB_METHOD_GUARD_END
  
@@ -132,7 +132,7 @@ index 750bed5..2e7d76e 100644
  RB_METHOD_GUARD(spriteWidth) {
      RB_UNUSED_PARAM;
      
-@@ -211,6 +327,13 @@ void spriteBindingInit() {
+@@ -216,6 +332,13 @@ void spriteBindingInit() {
      _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
      rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
      
@@ -325,10 +325,10 @@ index 0000000..7e816c9
 +
 +#endif // MESHWARP_H
 diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
-index bd26a33..edb3ff2 100644
+index 1a9f494..b681c76 100644
 --- a/src/display/sprite.cpp
 +++ b/src/display/sprite.cpp
-@@ -36,6 +36,7 @@
+@@ -37,6 +37,7 @@
  #include "exception.h"
  #include "glstate.h"
  #include "quadarray.h"
@@ -336,7 +336,7 @@ index bd26a33..edb3ff2 100644
  
  #include <math.h>
  #ifndef M_PI
-@@ -117,6 +118,9 @@ struct SpritePrivate
+@@ -123,6 +124,9 @@ struct SpritePrivate
          SimpleQuadArray qArray;
      } wave;
      
@@ -346,7 +346,7 @@ index bd26a33..edb3ff2 100644
      EtcTemps tmp;
      
      sigslot::connection prepareCon;
-@@ -143,6 +147,7 @@ struct SpritePrivate
+@@ -152,6 +156,7 @@ struct SpritePrivate
      materialRamp(0),
      materialMode(0),
      materialRect(&materialRectTmp),
@@ -354,7 +354,7 @@ index bd26a33..edb3ff2 100644
      isVisible(false),
      color(&tmp.color),
      tone(&tmp.tone)
-@@ -170,6 +175,7 @@ struct SpritePrivate
+@@ -179,6 +184,7 @@ struct SpritePrivate
      {
          srcRectCon.disconnect();
          prepareCon.disconnect();
@@ -362,15 +362,15 @@ index bd26a33..edb3ff2 100644
          
          bitmapDisposal();
      }
-@@ -330,6 +336,7 @@ struct SpritePrivate
-         
+@@ -340,6 +346,7 @@ struct SpritePrivate
          quad.setPosRect(FloatRect(0, 0, rect.w, rect.h));
          bushDirty = true;
+         padDirty = true;
 +        mesh.dirty = true;
          
          if (wave.active)
              wave.dirty = true;
-@@ -354,6 +361,12 @@ struct SpritePrivate
+@@ -364,6 +371,12 @@ struct SpritePrivate
          if (!opacity)
              return;
          
@@ -383,10 +383,10 @@ index bd26a33..edb3ff2 100644
          if (wave.active)
          {
              /* Don't do expensive wave bounding box
-@@ -527,6 +540,26 @@ struct SpritePrivate
-         wave.qArray.commit();
+@@ -587,6 +600,26 @@ struct SpritePrivate
+         padQuad.draw();
      }
-     
+ 
 +    void updateMesh()
 +    {
 +        mesh.dirty = false;
@@ -410,7 +410,7 @@ index bd26a33..edb3ff2 100644
      void prepare()
      {
          if (wave.dirty)
-@@ -534,6 +567,9 @@ struct SpritePrivate
+@@ -594,6 +627,9 @@ struct SpritePrivate
              updateWave();
          }
          
@@ -420,7 +420,7 @@ index bd26a33..edb3ff2 100644
          updateVisibility();
          
          if (isVisible && bushDirty)
-@@ -627,6 +663,57 @@ void Sprite::setMaterialParams(const float *values, int count)
+@@ -711,6 +747,57 @@ void Sprite::setMaterialParams(const float *values, int count)
          p->materialParams[i] = (i < count) ? values[i] : 0.f;
  }
  
@@ -478,7 +478,7 @@ index bd26a33..edb3ff2 100644
  void Sprite::setBitmap(Bitmap *bitmap)
  {
      guardDisposed();
-@@ -1172,7 +1259,13 @@ void Sprite::draw()
+@@ -1272,7 +1359,13 @@ void Sprite::draw()
      
      TEX::setSmooth(scalingMethod == Bilinear);
  
@@ -491,13 +491,13 @@ index bd26a33..edb3ff2 100644
 +    }
 +    else if (p->wave.active)
          p->wave.qArray.draw();
-     else
-         p->quad.draw();
+     else if (user && p->shaderPad > 0)
+         p->drawPadded();
 diff --git a/src/display/sprite.h b/src/display/sprite.h
-index 315912b..4b8f2ff 100644
+index 86aa9d9..85f0a2e 100644
 --- a/src/display/sprite.h
 +++ b/src/display/sprite.h
-@@ -86,6 +86,16 @@ public:
+@@ -89,6 +89,16 @@ public:
  	void setMaterialParams(const float *values, int count);
  	static bool materialAvailable();
  

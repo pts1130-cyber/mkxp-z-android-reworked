@@ -196,7 +196,7 @@ index 0000000..1a1906c
 +    rb_define_singleton_method(klass, "available?", RUBY_METHOD_FUNC(arcShaderAvailable), -1);
 +}
 diff --git a/binding/binding-mri.cpp b/binding/binding-mri.cpp
-index b6202bd..fcbcdb4 100644
+index 54ea4f1..99f6d7b 100644
 --- a/binding/binding-mri.cpp
 +++ b/binding/binding-mri.cpp
 @@ -85,6 +85,7 @@ void etcBindingInit();
@@ -207,7 +207,7 @@ index b6202bd..fcbcdb4 100644
  void viewportBindingInit();
  void planeBindingInit();
  void windowBindingInit();
-@@ -165,6 +166,7 @@ static void mriBindingInit() {
+@@ -166,6 +167,7 @@ static void mriBindingInit() {
      fontBindingInit();
      bitmapBindingInit();
      spriteBindingInit();
@@ -236,7 +236,7 @@ index 6a022d1..56763ae 100644
  #define PlaneType "Plane"
  #define ViewportType "Viewport"
 diff --git a/binding/meson.build b/binding/meson.build
-index 933a72d..50974f2 100644
+index b56668a..b5e9408 100644
 --- a/binding/meson.build
 +++ b/binding/meson.build
 @@ -24,6 +24,7 @@ binding_source = [files(
@@ -486,10 +486,10 @@ index 012a8a6..dda6f6f 100644
  	
  	gl_FragColor = frag;
 diff --git a/shader/spriteMaterial.frag b/shader/spriteMaterial.frag
-index 8b71d52..cf02fc8 100644
+index a8982ff..533d23d 100644
 --- a/shader/spriteMaterial.frag
 +++ b/shader/spriteMaterial.frag
-@@ -200,6 +200,31 @@ vec4 haloStage(vec4 frag)
+@@ -202,6 +202,31 @@ vec4 haloStage(vec4 frag)
  	return vec4(materialP3.rgb, clamp(g * materialP0.x, 0.0, 1.0));
  }
  
@@ -521,7 +521,7 @@ index 8b71d52..cf02fc8 100644
  void main()
  {
  	vec4 frag = texture2D(texture, v_texCoord);
-@@ -227,6 +252,10 @@ void main()
+@@ -229,6 +254,10 @@ void main()
  		}
  	}
  
@@ -532,7 +532,7 @@ index 8b71d52..cf02fc8 100644
  	float luma = dot(frag.rgb, lumaF);
  	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);
  	frag.rgb += tone.rgb;
-@@ -236,8 +265,8 @@ void main()
+@@ -238,8 +267,8 @@ void main()
  	if (invert)
  		frag.rgb = vec3(1.0) - frag.rgb;
  
@@ -1354,7 +1354,7 @@ index 0353e6a..33ae902 100644
  	const Geometry &getGeometry() const { return geometry; }
  
 diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
-index 4e96f66..ce679e4 100644
+index 4463801..2518513 100644
 --- a/src/display/gl/shader.cpp
 +++ b/src/display/gl/shader.cpp
 @@ -26,6 +26,7 @@
@@ -1473,7 +1473,7 @@ index 4e96f66..ce679e4 100644
  
  	gl.ShaderSource(shader, i, shaderSrc, shaderSrcSize);
  }
-@@ -822,6 +879,14 @@ void SpriteMaterialShader::setParams(const float value[16])
+@@ -823,6 +880,14 @@ void SpriteMaterialShader::setParams(const float value[20])
  }
  
  
@@ -1489,7 +1489,7 @@ index 4e96f66..ce679e4 100644
  {
  	INIT_SHADER(simple, plane, PlaneShader);
 diff --git a/src/display/gl/shader.h b/src/display/gl/shader.h
-index 13d88fc..8f1b90c 100644
+index c666a6e..b5f358d 100644
 --- a/src/display/gl/shader.h
 +++ b/src/display/gl/shader.h
 @@ -43,6 +43,17 @@ public:
@@ -1511,7 +1511,7 @@ index 13d88fc..8f1b90c 100644
  	Shader();
  	~Shader();
 @@ -250,6 +261,12 @@ private:
- 	u_materialMirror, u_materialXform, u_materialP[4];
+ 	u_materialMirror, u_materialXform, u_materialP[5];
  };
  
 +class ARCPostShader : public ShaderBase
@@ -1751,7 +1751,7 @@ index bd26a33..1a9f494 100644
          p->quad.draw();
      
 diff --git a/src/display/sprite.h b/src/display/sprite.h
-index 315912b..5d48dc9 100644
+index 0f81298..86aa9d9 100644
 --- a/src/display/sprite.h
 +++ b/src/display/sprite.h
 @@ -29,6 +29,7 @@
@@ -1888,7 +1888,7 @@ index 20fdddd..2e234bf 100644
  
  private:
 diff --git a/src/meson.build b/src/meson.build
-index 4ce97ae..3a1e1b8 100755
+index 4eec066..92fe820 100755
 --- a/src/meson.build
 +++ b/src/meson.build
 @@ -140,6 +140,7 @@ main_source = files(
