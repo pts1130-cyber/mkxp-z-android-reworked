@@ -16,6 +16,7 @@ include $(L_PATH)/libiconv.mk
 include $(L_PATH)/openssl.mk
 include $(L_PATH)/ruby.mk
 include $(L_PATH)/arcfog.mk
+include $(L_PATH)/arctmap.mk
 
 # Include main library
 include $(L_PATH)/mkxp-z.mk

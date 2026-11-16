@@ -154,6 +154,21 @@ jobs:
           cp -r ../../scripts .
           ls -la
 
+      - name: Build arctmap.dll
+        shell: msys2 {0}
+        run: |
+          DLL=mkxp-z/build/artifact/arctmap.dll
+          g++ -std=c++17 -O3 -ffp-contract=off -shared -static -o "$DLL" patchrepo/app/jni/arctmap/tmap.cpp
+          strip --strip-unneeded "$DLL"
+          objdump -p "$DLL" > arctmap-pe.txt
+          for f in tmap_version tmap_frame tmap_job_new tmap_job_step tmap_job_take tmap_job_free; do
+            grep -q -E "\] $f\$" arctmap-pe.txt || { echo "::error title=arctmap::missing export $f"; exit 1; }
+          done
+          if grep -i -E "DLL Name: (libstdc|libgcc|libwinpthread)" arctmap-pe.txt; then
+            echo "::error title=arctmap::depends on a MinGW runtime DLL"; exit 1
+          fi
+          grep "DLL Name" arctmap-pe.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
