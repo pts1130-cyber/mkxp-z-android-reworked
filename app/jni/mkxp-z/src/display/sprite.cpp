@@ -36,6 +36,7 @@
 #include "exception.h"
 #include "glstate.h"
 #include "quadarray.h"
+#include "meshwarp.h"
 
 #include <math.h>
 #ifndef M_PI
@@ -109,6 +110,10 @@ struct SpritePrivate
         SimpleQuadArray qArray;
     } wave;
     
+    MeshWarp mesh;
+    SimpleQuadArray *meshArray;
+    FloatRect meshSrc;
+    
     EtcTemps tmp;
     
     sigslot::connection prepareCon;
@@ -134,6 +139,7 @@ struct SpritePrivate
     materialRamp(0),
     materialMode(0),
     materialRect(&materialRectTmp),
+    meshArray(0),
     isVisible(false),
     color(&tmp.color),
     tone(&tmp.tone)
@@ -163,6 +169,7 @@ struct SpritePrivate
     {
         srcRectCon.disconnect();
         prepareCon.disconnect();
+        delete meshArray;
     }
     
     void recomputeBushDepth()
@@ -196,6 +203,8 @@ struct SpritePrivate
         quad.setPosRect(FloatRect(0, 0, rect.w, rect.h));
         recomputeBushDepth();
         
+        meshSrc = rect;
+        mesh.dirty = true;
         wave.dirty = true;
         padDirty = true;
     }
@@ -219,7 +228,7 @@ struct SpritePrivate
         if (!opacity)
             return;
         
-        if (wave.active)
+        if (wave.active || mesh.deforms())
         {
             /* Don't do expensive wave bounding box
              * calculations */
@@ -374,6 +383,19 @@ struct SpritePrivate
         padQuad.draw();
     }
 
+    void updateMesh()
+    {
+        mesh.dirty = false;
+        
+        if (!meshArray)
+            meshArray = new SimpleQuadArray;
+        
+        meshArray->resize(mesh.quadCount());
+        mesh.build(dataPtr(meshArray->vertices), meshSrc.x, meshSrc.y,
+                   meshSrc.w, meshSrc.h, mirrored, 1.f, 1.f);
+        meshArray->commit();
+    }
+    
     void prepare()
     {
         if (wave.dirty)
@@ -381,6 +403,9 @@ struct SpritePrivate
             updateWave();
             wave.dirty = false;
         }
+        
+        if (mesh.deforms() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
+            updateMesh();
         
         updateVisibility();
     }
@@ -494,6 +519,57 @@ void Sprite::setMaterialParams(const float *values, int count)
     guardDisposed();
     for (int i = 0; i < MaterialParamCount; ++i)
         p->materialParams[i] = (i < count) ? values[i] : 0.f;
+}
+
+void Sprite::setMeshGrid(int cols, int rows)
+{
+    guardDisposed();
+    p->mesh.setGrid(cols, rows);
+}
+
+int Sprite::getMeshCols() const
+{
+    guardDisposed();
+    return p->mesh.cols;
+}
+
+int Sprite::getMeshRows() const
+{
+    guardDisposed();
+    return p->mesh.rows;
+}
+
+int Sprite::getMeshVertexCount() const
+{
+    guardDisposed();
+    return p->mesh.vertexCount();
+}
+
+void Sprite::setMeshOffsets(const float *values, int count)
+{
+    guardDisposed();
+    p->mesh.setOffsets(values, count);
+}
+
+void Sprite::setMeshUVOffsets(const float *values, int count)
+{
+    guardDisposed();
+    p->mesh.setUVOffsets(values, count);
+}
+
+bool Sprite::hasMeshUVOffsets() const
+{
+    guardDisposed();
+    return !p->mesh.uvOffsets.empty();
+}
+
+float Sprite::getMeshOffset(int index, bool uv) const
+{
+    guardDisposed();
+    const std::vector<float> &v = uv ? p->mesh.uvOffsets : p->mesh.offsets;
+    if (index < 0 || index >= (int) v.size())
+        return 0.f;
+    return v[index];
 }
 
 void Sprite::setBitmap(Bitmap *bitmap)
@@ -929,7 +1005,13 @@ void Sprite::draw()
     
     p->bitmap->bindTex(*base);
     
-    if (p->wave.active)
+    if (p->mesh.deforms())
+    {
+        if (p->mesh.dirty || !p->meshArray)
+            p->updateMesh();
+        p->meshArray->draw();
+    }
+    else if (p->wave.active)
         p->wave.qArray.draw();
     else if (user && p->shaderPad > 0)
         p->drawPadded();

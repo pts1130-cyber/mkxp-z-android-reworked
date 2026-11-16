@@ -29,6 +29,9 @@
 #include "arcshader.h"
 #include "viewportelement-binding.h"
 
+#include <string.h>
+#include <vector>
+
 #if RAPI_FULL > 187
 DEF_TYPE(Sprite);
 #else
@@ -135,6 +138,114 @@ RB_METHOD(spriteSetMaterialParams) {
     return argv[0];
 }
 
+static std::vector<float> meshScratch;
+
+/* Array of numbers or a String packed with 'f*'; false for nil */
+static bool meshReadFloats(VALUE v)
+{
+    static const long cap = 2L * (Sprite::MeshMaxCells + 1) * (Sprite::MeshMaxCells + 1);
+    
+    meshScratch.clear();
+    if (NIL_P(v))
+        return false;
+    
+    if (RB_TYPE_P(v, T_STRING))
+    {
+        long n = RSTRING_LEN(v) / (long) sizeof(float);
+        if (n > cap)
+            n = cap;
+        meshScratch.resize(n);
+        if (n > 0)
+            memcpy(&meshScratch[0], RSTRING_PTR(v), n * sizeof(float));
+        return true;
+    }
+    
+    VALUE ary = rb_Array(v);
+    long n = RARRAY_LEN(ary);
+    if (n > cap)
+        n = cap;
+    meshScratch.resize(n);
+    for (long i = 0; i < n; ++i)
+        meshScratch[i] = (float) NUM2DBL(rb_ary_entry(ary, i));
+    return true;
+}
+
+static VALUE meshOffsetArray(Sprite *s, bool uv)
+{
+    int n = 0;
+    GUARD_EXC(n = s->getMeshVertexCount() * 2;)
+    
+    VALUE ary = rb_ary_new2(n);
+    for (int i = 0; i < n; ++i)
+        rb_ary_push(ary, rb_float_new(s->getMeshOffset(i, uv)));
+    
+    return ary;
+}
+
+RB_METHOD(spriteMeshGrid) {
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    if (argc == 2)
+    {
+        int cols = NUM2INT(argv[0]);
+        int rows = NUM2INT(argv[1]);
+        GFX_GUARD_EXC(s->setMeshGrid(cols, rows);)
+        return Qnil;
+    }
+    
+    if (argc != 0)
+        rb_raise(rb_eArgError, "wrong number of arguments (%d for 0 or 2)", argc);
+    
+    int cols = 0, rows = 0;
+    GUARD_EXC(cols = s->getMeshCols(); rows = s->getMeshRows();)
+    
+    return rb_ary_new3(2, INT2FIX(cols), INT2FIX(rows));
+}
+
+RB_METHOD(spriteGetMeshOffsets) {
+    RB_UNUSED_PARAM;
+    
+    return meshOffsetArray(getPrivateData<Sprite>(self), false);
+}
+
+RB_METHOD(spriteSetMeshOffsets) {
+    rb_check_argc(argc, 1);
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    bool given = meshReadFloats(argv[0]);
+    int n = (int) meshScratch.size();
+    const float *v = (given && n > 0) ? &meshScratch[0] : 0;
+    GFX_GUARD_EXC(s->setMeshOffsets(v, n);)
+    
+    return argv[0];
+}
+
+RB_METHOD(spriteGetMeshUVOffsets) {
+    RB_UNUSED_PARAM;
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    bool has = false;
+    GUARD_EXC(has = s->hasMeshUVOffsets();)
+    
+    return has ? meshOffsetArray(s, true) : Qnil;
+}
+
+RB_METHOD(spriteSetMeshUVOffsets) {
+    rb_check_argc(argc, 1);
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    static const float zero = 0.f;
+    bool given = meshReadFloats(argv[0]);
+    int n = (int) meshScratch.size();
+    const float *v = given ? (n > 0 ? &meshScratch[0] : &zero) : 0;
+    GFX_GUARD_EXC(s->setMeshUVOffsets(v, n);)
+    
+    return argv[0];
+}
+
 RB_METHOD(spriteWidth) {
     RB_UNUSED_PARAM;
     
@@ -212,6 +323,13 @@ void spriteBindingInit() {
     _rb_define_method(klass, "material_params", spriteGetMaterialParams);
     _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
     rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
+    
+    _rb_define_method(klass, "mesh_grid", spriteMeshGrid);
+    _rb_define_method(klass, "mesh_offsets", spriteGetMeshOffsets);
+    _rb_define_method(klass, "mesh_offsets=", spriteSetMeshOffsets);
+    _rb_define_method(klass, "mesh_uv_offsets", spriteGetMeshUVOffsets);
+    _rb_define_method(klass, "mesh_uv_offsets=", spriteSetMeshUVOffsets);
+    rb_define_const(klass, "MESH_MAX_CELLS", INT2FIX(Sprite::MeshMaxCells));
     
     INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
     INIT_PROP_BIND(Sprite, WaveLength, "wave_length");

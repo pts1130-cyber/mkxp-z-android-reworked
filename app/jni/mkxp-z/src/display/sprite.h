@@ -89,6 +89,16 @@ public:
 	void setMaterialParams(const float *values, int count);
 	static bool materialAvailable();
 
+	enum { MeshMaxCells = 64 };
+	void setMeshGrid(int cols, int rows);
+	int getMeshCols() const;
+	int getMeshRows() const;
+	int getMeshVertexCount() const;
+	void setMeshOffsets(const float *values, int count);
+	void setMeshUVOffsets(const float *values, int count);
+	bool hasMeshUVOffsets() const;
+	float getMeshOffset(int index, bool uv) const;
+
 	void initDynAttribs();
 
 private:

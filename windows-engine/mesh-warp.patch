@@ -1,0 +1,516 @@
+diff --git a/binding/sprite-binding.cpp b/binding/sprite-binding.cpp
+index 750bed5..2e7d76e 100644
+--- a/binding/sprite-binding.cpp
++++ b/binding/sprite-binding.cpp
+@@ -28,6 +28,9 @@
+ #include "sprite.h"
+ #include "viewportelement-binding.h"
+ 
++#include <string.h>
++#include <vector>
++
+ #if RAPI_FULL > 187
+ DEF_TYPE(Sprite);
+ #else
+@@ -133,6 +136,119 @@ RB_METHOD_GUARD(spriteSetMaterialParams) {
+ }
+ RB_METHOD_GUARD_END
+ 
++static std::vector<float> meshScratch;
++
++/* Array of numbers or a String packed with 'f*'; false for nil */
++static bool meshReadFloats(VALUE v)
++{
++    static const long cap = 2L * (Sprite::MeshMaxCells + 1) * (Sprite::MeshMaxCells + 1);
++    
++    meshScratch.clear();
++    if (NIL_P(v))
++        return false;
++    
++    if (RB_TYPE_P(v, T_STRING))
++    {
++        long n = RSTRING_LEN(v) / (long) sizeof(float);
++        if (n > cap)
++            n = cap;
++        meshScratch.resize(n);
++        if (n > 0)
++            memcpy(&meshScratch[0], RSTRING_PTR(v), n * sizeof(float));
++        return true;
++    }
++    
++    VALUE ary = rb_Array(v);
++    long n = RARRAY_LEN(ary);
++    if (n > cap)
++        n = cap;
++    meshScratch.resize(n);
++    for (long i = 0; i < n; ++i)
++        meshScratch[i] = (float) NUM2DBL(rb_ary_entry(ary, i));
++    return true;
++}
++
++static VALUE meshOffsetArray(Sprite *s, bool uv)
++{
++    int n = 0;
++    GFX_GUARD_EXC(n = s->getMeshVertexCount() * 2;)
++    
++    VALUE ary = rb_ary_new2(n);
++    for (int i = 0; i < n; ++i)
++        rb_ary_push(ary, rb_float_new(s->getMeshOffset(i, uv)));
++    
++    return ary;
++}
++
++RB_METHOD_GUARD(spriteMeshGrid) {
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    if (argc == 2)
++    {
++        int cols = NUM2INT(argv[0]);
++        int rows = NUM2INT(argv[1]);
++        GFX_GUARD_EXC(s->setMeshGrid(cols, rows);)
++        return Qnil;
++    }
++    
++    if (argc != 0)
++        rb_raise(rb_eArgError, "wrong number of arguments (%d for 0 or 2)", argc);
++    
++    int cols = 0, rows = 0;
++    GFX_GUARD_EXC(cols = s->getMeshCols(); rows = s->getMeshRows();)
++    
++    return rb_ary_new3(2, INT2FIX(cols), INT2FIX(rows));
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteGetMeshOffsets) {
++    RB_UNUSED_PARAM;
++    
++    return meshOffsetArray(getPrivateData<Sprite>(self), false);
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteSetMeshOffsets) {
++    rb_check_argc(argc, 1);
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    bool given = meshReadFloats(argv[0]);
++    int n = (int) meshScratch.size();
++    const float *v = (given && n > 0) ? &meshScratch[0] : 0;
++    GFX_GUARD_EXC(s->setMeshOffsets(v, n);)
++    
++    return argv[0];
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteGetMeshUVOffsets) {
++    RB_UNUSED_PARAM;
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    bool has = false;
++    GFX_GUARD_EXC(has = s->hasMeshUVOffsets();)
++    
++    return has ? meshOffsetArray(s, true) : Qnil;
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteSetMeshUVOffsets) {
++    rb_check_argc(argc, 1);
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    static const float zero = 0.f;
++    bool given = meshReadFloats(argv[0]);
++    int n = (int) meshScratch.size();
++    const float *v = given ? (n > 0 ? &meshScratch[0] : &zero) : 0;
++    GFX_GUARD_EXC(s->setMeshUVOffsets(v, n);)
++    
++    return argv[0];
++}
++RB_METHOD_GUARD_END
++
+ RB_METHOD_GUARD(spriteWidth) {
+     RB_UNUSED_PARAM;
+     
+@@ -211,6 +327,13 @@ void spriteBindingInit() {
+     _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
+     rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
+     
++    _rb_define_method(klass, "mesh_grid", spriteMeshGrid);
++    _rb_define_method(klass, "mesh_offsets", spriteGetMeshOffsets);
++    _rb_define_method(klass, "mesh_offsets=", spriteSetMeshOffsets);
++    _rb_define_method(klass, "mesh_uv_offsets", spriteGetMeshUVOffsets);
++    _rb_define_method(klass, "mesh_uv_offsets=", spriteSetMeshUVOffsets);
++    rb_define_const(klass, "MESH_MAX_CELLS", INT2FIX(Sprite::MeshMaxCells));
++    
+     INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
+     INIT_PROP_BIND(Sprite, WaveLength, "wave_length");
+     INIT_PROP_BIND(Sprite, WaveSpeed, "wave_speed");
+diff --git a/src/display/meshwarp.h b/src/display/meshwarp.h
+new file mode 100644
+index 0000000..7e816c9
+--- /dev/null
++++ b/src/display/meshwarp.h
+@@ -0,0 +1,172 @@
++/*
++ ** meshwarp.h
++ **
++ ** This file is part of mkxp.
++ **
++ ** mkxp is free software: you can redistribute it and/or modify
++ ** it under the terms of the GNU General Public License as published by
++ ** the Free Software Foundation, either version 2 of the License, or
++ ** (at your option) any later version.
++ */
++
++#ifndef MESHWARP_H
++#define MESHWARP_H
++
++#include <cstddef>
++#include <vector>
++
++/* Sprite grid deformation: (cols+1)*(rows+1) vertices, each displaced in
++ * source pixel units, drawn as cols*rows quads. Every grid vertex is
++ * computed once and copied into the quads that touch it, so neighbouring
++ * cells meet on bit-identical edges. */
++struct MeshWarp
++{
++    enum { MaxCells = 64 };
++
++    int cols;
++    int rows;
++    std::vector<float> offsets;
++    std::vector<float> uvOffsets;
++    bool dirty;
++    bool warped;
++
++    MeshWarp()
++    : cols(0), rows(0), dirty(false), warped(false)
++    {}
++
++    bool active() const { return cols > 0; }
++    /* All-zero offsets draw through the plain quad, so they match it exactly */
++    bool deforms() const { return cols > 0 && warped; }
++    int vertexCount() const { return active() ? (cols + 1) * (rows + 1) : 0; }
++    int quadCount() const { return cols * rows; }
++
++    void setGrid(int c, int r)
++    {
++        c = clampi(c, 0, MaxCells);
++        r = clampi(r, 0, MaxCells);
++        if (c == 0 || r == 0)
++            c = r = 0;
++        if (c == cols && r == rows)
++            return;
++
++        cols = c;
++        rows = r;
++        offsets.assign(vertexCount() * 2, 0.f);
++        uvOffsets.clear();
++        warped = false;
++        dirty = true;
++    }
++
++    void setOffsets(const float *values, int count)
++    {
++        copyIn(offsets, values, count);
++        updateWarped();
++        dirty = true;
++    }
++
++    /* values == 0 turns texture displacement off */
++    void setUVOffsets(const float *values, int count)
++    {
++        if (!values || !active())
++            uvOffsets.clear();
++        else
++            copyIn(uvOffsets, values, count);
++        updateWarped();
++        dirty = true;
++    }
++
++    /* (sx, sy, sw, sh): clamped src_rect in bitmap pixels. Offsets follow
++     * the picture, so a mirrored sprite moves mirrored. */
++    template<class V>
++    void build(V *vert, float sx, float sy, float sw, float sh,
++               bool mirrored, float texScaleX, float texScaleY) const
++    {
++        const int vc = cols + 1;
++        const int n = vertexCount();
++        const bool uv = !uvOffsets.empty();
++
++        grid.resize(n * 4);
++        for (int j = 0; j <= rows; ++j)
++        {
++            const float v = sh * (float) j / (float) rows;
++            for (int i = 0; i <= cols; ++i)
++            {
++                const float u = sw * (float) i / (float) cols;
++                const int k = j * vc + i;
++                float *g = &grid[k * 4];
++
++                float px = u + offsets[k * 2];
++                const float py = v + offsets[k * 2 + 1];
++                if (mirrored)
++                    px = sw - px;
++
++                float tu = u, tv = v;
++                if (uv)
++                {
++                    tu = shiftTex(u, uvOffsets[k * 2], sw);
++                    tv = shiftTex(v, uvOffsets[k * 2 + 1], sh);
++                }
++
++                g[0] = px;
++                g[1] = py;
++                g[2] = (sx + tu) * texScaleX;
++                g[3] = (sy + tv) * texScaleY;
++            }
++        }
++
++        /* Same corner order as Quad::setPosRect: TL, TR, BR, BL */
++        static const int corner[4][2] = { {0, 0}, {1, 0}, {1, 1}, {0, 1} };
++        for (int j = 0; j < rows; ++j)
++            for (int i = 0; i < cols; ++i)
++                for (int c = 0; c < 4; ++c, ++vert)
++                {
++                    const float *g = &grid[((j + corner[c][1]) * vc + i + corner[c][0]) * 4];
++                    vert->pos.x = g[0];
++                    vert->pos.y = g[1];
++                    vert->texPos.x = g[2];
++                    vert->texPos.y = g[3];
++                }
++    }
++
++private:
++    mutable std::vector<float> grid;
++
++    void updateWarped()
++    {
++        warped = false;
++        for (size_t i = 0; i < offsets.size() && !warped; ++i)
++            warped = offsets[i] != 0.f;
++        for (size_t i = 0; i < uvOffsets.size() && !warped; ++i)
++            warped = uvOffsets[i] != 0.f;
++    }
++
++    static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
++    static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
++
++    /* A moved texture corner stays half a texel inside the src_rect, so
++     * nearest sampling never reaches the next cell of a sheet */
++    static float shiftTex(float base, float d, float size)
++    {
++        if (d == 0.f)
++            return base;
++        return size > 1.f ? clampf(base + d, 0.5f, size - 0.5f) : size * 0.5f;
++    }
++
++    void copyIn(std::vector<float> &dst, const float *values, int count) const
++    {
++        const int n = vertexCount() * 2;
++        dst.assign(n, 0.f);
++        if (!values)
++            return;
++        if (count > n)
++            count = n;
++        for (int i = 0; i < count; ++i)
++        {
++            const float f = values[i];
++            /* NaN reads as 0, anything huge is held to a sane range */
++            dst[i] = (f == f) ? clampf(f, -16384.f, 16384.f) : 0.f;
++        }
++    }
++};
++
++#endif // MESHWARP_H
+diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
+index bd26a33..edb3ff2 100644
+--- a/src/display/sprite.cpp
++++ b/src/display/sprite.cpp
+@@ -36,6 +36,7 @@
+ #include "exception.h"
+ #include "glstate.h"
+ #include "quadarray.h"
++#include "meshwarp.h"
+ 
+ #include <math.h>
+ #ifndef M_PI
+@@ -117,6 +118,9 @@ struct SpritePrivate
+         SimpleQuadArray qArray;
+     } wave;
+     
++    MeshWarp mesh;
++    SimpleQuadArray *meshArray;
++    
+     EtcTemps tmp;
+     
+     sigslot::connection prepareCon;
+@@ -143,6 +147,7 @@ struct SpritePrivate
+     materialRamp(0),
+     materialMode(0),
+     materialRect(&materialRectTmp),
++    meshArray(0),
+     isVisible(false),
+     color(&tmp.color),
+     tone(&tmp.tone)
+@@ -170,6 +175,7 @@ struct SpritePrivate
+     {
+         srcRectCon.disconnect();
+         prepareCon.disconnect();
++        delete meshArray;
+         
+         bitmapDisposal();
+     }
+@@ -330,6 +336,7 @@ struct SpritePrivate
+         
+         quad.setPosRect(FloatRect(0, 0, rect.w, rect.h));
+         bushDirty = true;
++        mesh.dirty = true;
+         
+         if (wave.active)
+             wave.dirty = true;
+@@ -354,6 +361,12 @@ struct SpritePrivate
+         if (!opacity)
+             return;
+         
++        if (mesh.deforms())
++        {
++            isVisible = true;
++            return;
++        }
++        
+         if (wave.active)
+         {
+             /* Don't do expensive wave bounding box
+@@ -527,6 +540,26 @@ struct SpritePrivate
+         wave.qArray.commit();
+     }
+     
++    void updateMesh()
++    {
++        mesh.dirty = false;
++        
++        if (!meshArray)
++            meshArray = new SimpleQuadArray;
++        
++        float tsx = 1.f, tsy = 1.f;
++        if (!nullOrDisposed(bitmap) && bitmap->hasHires() && bitmap->width() && bitmap->height())
++        {
++            tsx = (float) bitmap->getHires()->width() / bitmap->width();
++            tsy = (float) bitmap->getHires()->height() / bitmap->height();
++        }
++        
++        const FloatRect &r = adjustedSrcRect;
++        meshArray->resize(mesh.quadCount());
++        mesh.build(dataPtr(meshArray->vertices), r.x, r.y, r.w, r.h, mirrored, tsx, tsy);
++        meshArray->commit();
++    }
++    
+     void prepare()
+     {
+         if (wave.dirty)
+@@ -534,6 +567,9 @@ struct SpritePrivate
+             updateWave();
+         }
+         
++        if (mesh.deforms() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
++            updateMesh();
++        
+         updateVisibility();
+         
+         if (isVisible && bushDirty)
+@@ -627,6 +663,57 @@ void Sprite::setMaterialParams(const float *values, int count)
+         p->materialParams[i] = (i < count) ? values[i] : 0.f;
+ }
+ 
++void Sprite::setMeshGrid(int cols, int rows)
++{
++    guardDisposed();
++    p->mesh.setGrid(cols, rows);
++}
++
++int Sprite::getMeshCols() const
++{
++    guardDisposed();
++    return p->mesh.cols;
++}
++
++int Sprite::getMeshRows() const
++{
++    guardDisposed();
++    return p->mesh.rows;
++}
++
++int Sprite::getMeshVertexCount() const
++{
++    guardDisposed();
++    return p->mesh.vertexCount();
++}
++
++void Sprite::setMeshOffsets(const float *values, int count)
++{
++    guardDisposed();
++    p->mesh.setOffsets(values, count);
++}
++
++void Sprite::setMeshUVOffsets(const float *values, int count)
++{
++    guardDisposed();
++    p->mesh.setUVOffsets(values, count);
++}
++
++bool Sprite::hasMeshUVOffsets() const
++{
++    guardDisposed();
++    return !p->mesh.uvOffsets.empty();
++}
++
++float Sprite::getMeshOffset(int index, bool uv) const
++{
++    guardDisposed();
++    const std::vector<float> &v = uv ? p->mesh.uvOffsets : p->mesh.offsets;
++    if (index < 0 || index >= (int) v.size())
++        return 0.f;
++    return v[index];
++}
++
+ void Sprite::setBitmap(Bitmap *bitmap)
+ {
+     guardDisposed();
+@@ -1172,7 +1259,13 @@ void Sprite::draw()
+     
+     TEX::setSmooth(scalingMethod == Bilinear);
+ 
+-    if (p->wave.active)
++    if (p->mesh.deforms())
++    {
++        if (p->mesh.dirty || !p->meshArray)
++            p->updateMesh();
++        p->meshArray->draw();
++    }
++    else if (p->wave.active)
+         p->wave.qArray.draw();
+     else
+         p->quad.draw();
+diff --git a/src/display/sprite.h b/src/display/sprite.h
+index 315912b..4b8f2ff 100644
+--- a/src/display/sprite.h
++++ b/src/display/sprite.h
+@@ -86,6 +86,16 @@ public:
+ 	void setMaterialParams(const float *values, int count);
+ 	static bool materialAvailable();
+ 
++	enum { MeshMaxCells = 64 };
++	void setMeshGrid(int cols, int rows);
++	int getMeshCols() const;
++	int getMeshRows() const;
++	int getMeshVertexCount() const;
++	void setMeshOffsets(const float *values, int count);
++	void setMeshUVOffsets(const float *values, int count);
++	bool hasMeshUVOffsets() const;
++	float getMeshOffset(int index, bool uv) const;
++
+ 	void initDynAttribs();
+ 
+ private:
