@@ -24,6 +24,7 @@
 #include "glstate.h"
 #include "exception.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <string.h>
 #include <iostream>
@@ -50,6 +51,8 @@
 #include "sprite.vert.xxd"
 #include "spriteMaterial.vert.xxd"
 #include "spriteMaterial.frag.xxd"
+#include "arcPost.vert.xxd"
+#include "arcPost.frag.xxd"
 #include "tilemap.vert.xxd"
 #include "blur.frag.xxd"
 #include "simpleMatrix.vert.xxd"
@@ -75,6 +78,25 @@
 
 #define GET_U(name) u_##name = gl.GetUniformLocation(program, #name)
 
+static std::string shaderLastLog;
+static const std::string *userSpliceSource;
+
+Shader::UserSplice::UserSplice(const std::string &source)
+{
+	userSpliceSource = &source;
+	shaderLastLog.clear();
+}
+
+Shader::UserSplice::~UserSplice()
+{
+	userSpliceSource = 0;
+}
+
+const std::string &Shader::lastLog()
+{
+	return shaderLastLog;
+}
+
 #ifdef MKXPZ_BUILD_XCODE
 std::string Shader::shaderCommon = "";
 #endif
@@ -86,6 +108,7 @@ static void printShaderLog(GLuint shader)
 
 	std::string log(logLength, '\0');
 	gl.GetShaderInfoLog(shader, log.size(), 0, &log[0]);
+	shaderLastLog += log.c_str();
 
 	std::clog << "Shader log:\n" << log;
 }
@@ -97,6 +120,7 @@ static void printProgramLog(GLuint program)
 
 	std::string log(logLength, '\0');
 	gl.GetProgramInfoLog(program, log.size(), 0, &log[0]);
+	shaderLastLog += log.c_str();
 
 	std::clog << "Program log:\n" << log;
 }
@@ -143,8 +167,8 @@ static void setupShaderSource(GLuint shader, GLenum type, const unsigned char *b
 	static const char glesDefine[] = "#define GLSLES\n";
 	static const char fragDefine[] = "#define FRAGMENT_SHADER\n";
 
-	const GLchar *shaderSrc[4];
-	GLint shaderSrcSize[4];
+	const GLchar *shaderSrc[9];
+	GLint shaderSrcSize[9];
 	size_t i = 0;
 
 	if (gl.glsles)
@@ -170,9 +194,42 @@ static void setupShaderSource(GLuint shader, GLenum type, const unsigned char *b
 #endif
 	++i;
 
-	shaderSrc[i] = (const GLchar *) body;
-	shaderSrcSize[i] = bodySize;
-	++i;
+	static const char marker[] = "/*ARC_USER*/";
+	const char *b = (const char *) body;
+	const char *e = b + bodySize;
+	const char *m = (type == GL_FRAGMENT_SHADER && userSpliceSource) ?
+	    std::search(b, e, marker, marker + sizeof(marker) - 1) : e;
+
+	if (type == GL_FRAGMENT_SHADER && userSpliceSource && m == e)
+		throw Exception(Exception::MKXPError, "GLSL: shader template has no user slot");
+
+	if (m != e)
+	{
+		static const char userDefine[] = "#define ARC_USER 1\n";
+		/* GLSL ES numbers the next line as given, desktop GLSL 1.10 as given + 1 */
+		static const char userLineES[] = "\n#line 1\n";
+		static const char userLineGL[] = "\n#line 0\n";
+		static const char userEnd[] = "\n";
+
+		shaderSrc[i] = userDefine;
+		shaderSrcSize[i++] = sizeof(userDefine) - 1;
+		shaderSrc[i] = b;
+		shaderSrcSize[i++] = (GLint) (m - b);
+		shaderSrc[i] = gl.glsles ? userLineES : userLineGL;
+		shaderSrcSize[i++] = sizeof(userLineES) - 1;
+		shaderSrc[i] = userSpliceSource->c_str();
+		shaderSrcSize[i++] = (GLint) userSpliceSource->size();
+		shaderSrc[i] = userEnd;
+		shaderSrcSize[i++] = sizeof(userEnd) - 1;
+		shaderSrc[i] = m;
+		shaderSrcSize[i++] = (GLint) (e - m);
+	}
+	else
+	{
+		shaderSrc[i] = b;
+		shaderSrcSize[i] = bodySize;
+		++i;
+	}
 
 	gl.ShaderSource(shader, i, shaderSrc, shaderSrcSize);
 }
@@ -712,6 +769,14 @@ void SpriteMaterialShader::setParams(const float value[20])
 {
 	for (int i = 0; i < 5; ++i)
 		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
+}
+
+
+ARCPostShader::ARCPostShader()
+{
+	INIT_SHADER(arcPost, arcPost, ARCPostShader);
+
+	ShaderBase::init();
 }
 
 

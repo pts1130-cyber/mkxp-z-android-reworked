@@ -27,6 +27,8 @@
 #include "quad.h"
 #include "glstate.h"
 #include "graphics.h"
+#include "arcshader.h"
+#include "exception.h"
 
 #include <SDL_rect.h>
 
@@ -46,6 +48,9 @@ struct ViewportPrivate
 	IntRect screenRect;
 	int isOnScreen;
 
+	ARCShader *shaders[ARCShader::MaxPasses];
+	int shaderCount;
+
 	EtcTemps tmp;
 
 	ViewportPrivate(int x, int y, int width, int height, Viewport *self)
@@ -53,8 +58,12 @@ struct ViewportPrivate
 	      rect(&tmp.rect),
 	      color(&tmp.color),
 	      tone(&tmp.tone),
-	      isOnScreen(false)
+	      isOnScreen(false),
+	      shaderCount(0)
 	{
+		for (int i = 0; i < ARCShader::MaxPasses; ++i)
+			shaders[i] = 0;
+
 		rect->set(x, y, width, height);
 		updateRectCon();
 	}
@@ -96,6 +105,11 @@ struct ViewportPrivate
 		bool colorToneEffective = color->hasEffect() || tone->hasEffect() || flashing;
 
 		return (rectEffective && colorToneEffective && isOnScreen);
+	}
+
+	bool needsPostRender()
+	{
+		return shaderCount > 0 && !rect->isEmpty() && isOnScreen;
 	}
 };
 
@@ -173,6 +187,23 @@ void Viewport::setOY(int value)
 	notifyGeometryChange();
 }
 
+void Viewport::setShaders(ARCShader *const *list, int count)
+{
+	guardDisposed();
+
+	if (count < 0 || count > ARCShader::MaxPasses)
+		throw Exception(Exception::ArgumentError, "Viewport#shader takes at most %d passes", (int) ARCShader::MaxPasses);
+
+	for (int i = 0; i < count; ++i)
+		if (!list[i] || list[i]->kind() != ARCShader::KindPost)
+			throw Exception(Exception::ArgumentError, "Viewport#shader needs ARCShader::POST shaders");
+
+	for (int i = 0; i < ARCShader::MaxPasses; ++i)
+		p->shaders[i] = (i < count) ? list[i] : 0;
+
+	p->shaderCount = count;
+}
+
 void Viewport::initDynAttribs()
 {
 	p->rect = new Rect(*p->rect);
@@ -189,8 +220,9 @@ void Viewport::composite()
 		return;
 
 	bool renderEffect = p->needsEffectRender(flashing);
+	bool renderPost = p->needsPostRender();
 
-	if (elements.getSize() == 0 && !renderEffect)
+	if (elements.getSize() == 0 && !renderEffect && !renderPost)
 		return;
 
 	/* Setup scissor */
@@ -198,6 +230,9 @@ void Viewport::composite()
 	glState.scissorBox.pushSet(p->rect->toIntRect());
 
 	Scene::composite();
+
+	if (renderPost)
+		scene->requestViewportPost(p->shaders, p->shaderCount);
 
 	/* If any effects are visible, request parent Scene to
 	 * render them. */

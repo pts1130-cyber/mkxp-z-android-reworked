@@ -92,6 +92,9 @@ typedef void (APIENTRYP _PFNGLUNIFORM2FPROC) (GLint location, GLfloat v0, GLfloa
 typedef void (APIENTRYP _PFNGLUNIFORM4FPROC) (GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
 typedef void (APIENTRYP _PFNGLUNIFORM1IPROC) (GLint location, GLint v0);
 typedef void (APIENTRYP _PFNGLUNIFORM1IVPROC) (GLint location, GLsizei count, const GLint *value);
+typedef void (APIENTRYP _PFNGLUNIFORM3FPROC) (GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
+typedef void (APIENTRYP _PFNGLUNIFORM1FVPROC) (GLint location, GLsizei count, const GLfloat *value);
+typedef void (APIENTRYP _PFNGLGETACTIVEUNIFORMPROC) (GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name);
 typedef void (APIENTRYP _PFNGLUNIFORMMATRIX4FVPROC) (GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
 
 /* Vertex attribute */
@@ -178,6 +181,9 @@ typedef void (APIENTRYP _PFNGLRELEASESHADERCOMPILERPROC) (void);
 	GL_FUN(Uniform4f, _PFNGLUNIFORM4FPROC) \
 	GL_FUN(Uniform1i, _PFNGLUNIFORM1IPROC) \
 	GL_FUN(Uniform1iv, _PFNGLUNIFORM1IVPROC) \
+	GL_FUN(Uniform3f, _PFNGLUNIFORM3FPROC) \
+	GL_FUN(Uniform1fv, _PFNGLUNIFORM1FVPROC) \
+	GL_FUN(GetActiveUniform, _PFNGLGETACTIVEUNIFORMPROC) \
 	GL_FUN(UniformMatrix4fv, _PFNGLUNIFORMMATRIX4FVPROC) \
 	/* Vertex attribute */ \
 	GL_FUN(BindAttribLocation, _PFNGLBINDATTRIBLOCATIONPROC) \

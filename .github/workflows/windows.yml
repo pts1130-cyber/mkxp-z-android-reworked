@@ -98,6 +98,14 @@ jobs:
           git apply ../patchrepo/windows-engine/arc-preload.patch
           git diff --stat
 
+      - name: Apply user shader patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/user-shader.patch
+          git apply ../patchrepo/windows-engine/user-shader.patch
+          git diff --stat
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

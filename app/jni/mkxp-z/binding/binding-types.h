@@ -32,6 +32,7 @@ DECL_TYPE(Tone);
 DECL_TYPE(Font);
 
 DECL_TYPE(Bitmap);
+DECL_TYPE(ARCShader);
 DECL_TYPE(Sprite);
 DECL_TYPE(Plane);
 DECL_TYPE(Viewport);
@@ -48,6 +49,7 @@ DECL_TYPE(MiniFFI);
 #define FontType "Font"
 
 #define BitmapType "Bitmap"
+#define ARCShaderType "ARCShader"
 #define SpriteType "Sprite"
 #define PlaneType "Plane"
 #define ViewportType "Viewport"

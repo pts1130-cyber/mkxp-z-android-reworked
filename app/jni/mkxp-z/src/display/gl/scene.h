@@ -29,6 +29,7 @@
 
 class SceneElement;
 class Viewport;
+class ARCShader;
 class WindowVX;
 class Window;
 struct ScanRow;
@@ -58,6 +59,8 @@ public:
 	virtual void requestViewportRender(const Vec4& /* color */,
 	                                   const Vec4& /* flash */,
 	                                   const Vec4& /* tone */) {}
+	virtual void requestViewportPost(ARCShader *const * /* passes */,
+	                                 int /* count */) {}
 
 	const Geometry &getGeometry() const { return geometry; }
 

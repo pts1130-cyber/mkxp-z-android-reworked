@@ -41,6 +41,17 @@ public:
     
     static std::string &commonHeader();
 
+	GLuint glProgram() const { return program; }
+
+	/* While alive, fragment templates with a user slot get this source spliced in */
+	struct UserSplice
+	{
+		UserSplice(const std::string &source);
+		~UserSplice();
+	};
+
+	static const std::string &lastLog();
+
 protected:
 	Shader();
 	~Shader();
@@ -240,6 +251,12 @@ private:
 	GLint u_materialMode, u_materialMap, u_materialEnv, u_materialRamp, u_materialBack, u_materialMapTexel,
 	u_materialSrcTexel, u_materialBackInv, u_materialHasEnv, u_materialHasRamp, u_materialHasBack,
 	u_materialMirror, u_materialXform, u_materialP[5];
+};
+
+class ARCPostShader : public ShaderBase
+{
+public:
+	ARCPostShader();
 };
 
 class PlaneShader : public ShaderBase

@@ -85,6 +85,7 @@ void etcBindingInit();
 void fontBindingInit();
 void bitmapBindingInit();
 void spriteBindingInit();
+void arcShaderBindingInit();
 void viewportBindingInit();
 void planeBindingInit();
 void windowBindingInit();
@@ -169,6 +170,7 @@ static void mriBindingInit()
 	fontBindingInit();
 	bitmapBindingInit();
 	spriteBindingInit();
+	arcShaderBindingInit();
 	viewportBindingInit();
 	planeBindingInit();
 

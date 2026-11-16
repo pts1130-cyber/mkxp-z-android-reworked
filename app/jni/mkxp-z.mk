@@ -55,6 +55,7 @@ LOCAL_SRC_FILES := \
 	$(LOCAL_PATH)/src/display/viewport.cpp \
 	$(LOCAL_PATH)/src/display/bitmap.cpp \
 	$(LOCAL_PATH)/src/display/sprite.cpp \
+	$(LOCAL_PATH)/src/display/arcshader.cpp \
 	$(LOCAL_PATH)/src/display/plane.cpp \
 	$(LOCAL_PATH)/src/display/font.cpp \
 	$(LOCAL_PATH)/src/display/tilemap.cpp \
@@ -96,6 +97,7 @@ LOCAL_SRC_FILES := \
 	$(LOCAL_PATH)/binding/bitmap-binding.cpp \
 	$(LOCAL_PATH)/binding/plane-binding.cpp \
 	$(LOCAL_PATH)/binding/sprite-binding.cpp \
+	$(LOCAL_PATH)/binding/arcshader-binding.cpp \
 	$(LOCAL_PATH)/binding/font-binding.cpp \
 	$(LOCAL_PATH)/binding/tilemap-binding.cpp \
 	$(LOCAL_PATH)/binding/tilemapvx-binding.cpp \

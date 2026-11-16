@@ -26,6 +26,7 @@
 #include "sceneelement-binding.h"
 #include "sharedstate.h"
 #include "sprite.h"
+#include "arcshader.h"
 #include "viewportelement-binding.h"
 
 #if RAPI_FULL > 187
@@ -54,6 +55,7 @@ RB_METHOD(spriteInitialize) {
 
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Bitmap, "bitmap")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Pattern, "pattern")
+DEF_GFX_PROP_OBJ_REF(Sprite, ARCShader, Shader, "shader")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialMap, "material_map")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialEnv, "material_env")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialRamp, "material_ramp")
@@ -78,6 +80,7 @@ DEF_GFX_PROP_I(Sprite, WaveAmp)
 DEF_GFX_PROP_I(Sprite, WaveLength)
 DEF_GFX_PROP_I(Sprite, WaveSpeed)
 DEF_GFX_PROP_I(Sprite, MaterialMode)
+DEF_GFX_PROP_I(Sprite, ShaderPad)
 
 DEF_GFX_PROP_F(Sprite, ZoomX)
 DEF_GFX_PROP_F(Sprite, ZoomY)
@@ -198,6 +201,8 @@ void spriteBindingInit() {
     INIT_PROP_BIND(Sprite, PatternZoomX, "pattern_zoom_x");
     INIT_PROP_BIND(Sprite, PatternZoomY, "pattern_zoom_y");
     INIT_PROP_BIND(Sprite, Invert, "invert");
+    INIT_PROP_BIND(Sprite, Shader, "shader");
+    INIT_PROP_BIND(Sprite, ShaderPad, "shader_pad");
     
     INIT_PROP_BIND(Sprite, MaterialMap, "material_map");
     INIT_PROP_BIND(Sprite, MaterialEnv, "material_env");

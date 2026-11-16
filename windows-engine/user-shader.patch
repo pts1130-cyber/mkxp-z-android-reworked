@@ -1,0 +1,1901 @@
+diff --git a/binding/arcshader-binding.cpp b/binding/arcshader-binding.cpp
+new file mode 100644
+index 0000000..1a1906c
+--- /dev/null
++++ b/binding/arcshader-binding.cpp
+@@ -0,0 +1,191 @@
++/*
++** arcshader-binding.cpp
++**
++** This file is part of mkxp.
++**
++** mkxp is free software: you can redistribute it and/or modify
++** it under the terms of the GNU General Public License as published by
++** the Free Software Foundation, either version 2 of the License, or
++** (at your option) any later version.
++**
++** mkxp is distributed in the hope that it will be useful,
++** but WITHOUT ANY WARRANTY; without even the implied warranty of
++** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++** GNU General Public License for more details.
++**
++** You should have received a copy of the GNU General Public License
++** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "arcshader.h"
++#include "binding-types.h"
++#include "binding-util.h"
++#include "bitmap.h"
++#include "graphics.h"
++#include "sharedstate.h"
++
++#if RAPI_FULL > 187
++DEF_TYPE(ARCShader);
++#else
++DEF_ALLOCFUNC(ARCShader);
++#endif
++
++static ARCShader *arcShaderData(VALUE self)
++{
++    return getPrivateData<ARCShader>(self);
++}
++
++RB_METHOD(arcShaderInitialize) {
++    VALUE src, kindObj = Qnil;
++    rb_scan_args(argc, argv, "11", &src, &kindObj);
++
++    StringValue(src);
++    int kind = NIL_P(kindObj) ? ARCShader::KindSprite : NUM2INT(kindObj);
++    if (kind != ARCShader::KindSprite && kind != ARCShader::KindPost)
++        rb_raise(rb_eArgError, "ARCShader kind must be ARCShader::SPRITE or ARCShader::POST");
++
++    ARCShader *s = 0;
++    GFX_GUARD_EXC(s = new ARCShader(RSTRING_PTR(src), (int) RSTRING_LEN(src), kind);)
++
++    setPrivateData(self, s);
++    rb_iv_set(self, "textures", rb_hash_new());
++
++    return self;
++}
++
++RB_METHOD(arcShaderOk) {
++    RB_UNUSED_PARAM;
++    return rb_bool_new(arcShaderData(self)->ok());
++}
++
++RB_METHOD(arcShaderLog) {
++    RB_UNUSED_PARAM;
++    const std::string &log = arcShaderData(self)->log();
++    return rb_utf8_str_new(log.c_str(), (long) log.size());
++}
++
++RB_METHOD(arcShaderKind) {
++    RB_UNUSED_PARAM;
++    return INT2FIX(arcShaderData(self)->kind());
++}
++
++static VALUE arcShaderSetN(int argc, VALUE *argv, VALUE self, int comps) {
++    rb_check_argc(argc, comps + 1);
++
++    ARCShader *s = arcShaderData(self);
++    const char *name = StringValueCStr(argv[0]);
++
++    float v[4];
++    for (int i = 0; i < comps; ++i)
++        v[i] = (float) NUM2DBL(argv[i + 1]);
++
++    GFX_GUARD_EXC(s->setFloats(name, v, comps, 1);)
++
++    return self;
++}
++
++RB_METHOD(arcShaderSetFloat) { return arcShaderSetN(argc, argv, self, 1); }
++RB_METHOD(arcShaderSetVec2)  { return arcShaderSetN(argc, argv, self, 2); }
++RB_METHOD(arcShaderSetVec3)  { return arcShaderSetN(argc, argv, self, 3); }
++RB_METHOD(arcShaderSetVec4)  { return arcShaderSetN(argc, argv, self, 4); }
++
++RB_METHOD(arcShaderSetFloatArray) {
++    rb_check_argc(argc, 2);
++
++    ARCShader *s = arcShaderData(self);
++    const char *name = StringValueCStr(argv[0]);
++    VALUE ary = rb_Array(argv[1]);
++
++    long n = RARRAY_LEN(ary);
++    if (n > ARCShader::MaxArray)
++        rb_raise(rb_eArgError, "ARCShader#set_float_array takes at most %d values", (int) ARCShader::MaxArray);
++
++    float v[ARCShader::MaxArray] = { 0 };
++    for (long i = 0; i < n; ++i)
++        v[i] = (float) NUM2DBL(rb_ary_entry(ary, i));
++
++    GFX_GUARD_EXC(s->setFloats(name, v, 1, n > 0 ? (int) n : 1);)
++
++    return self;
++}
++
++RB_METHOD(arcShaderSetTexture) {
++    VALUE nameObj, bmpObj, unitObj = Qnil;
++    rb_scan_args(argc, argv, "21", &nameObj, &bmpObj, &unitObj);
++
++    ARCShader *s = arcShaderData(self);
++    const char *name = StringValueCStr(nameObj);
++
++    int unit = NIL_P(unitObj) ? ARCShader::FirstUnit : NUM2INT(unitObj);
++    if (unit < ARCShader::FirstUnit || unit > ARCShader::LastUnit)
++        rb_raise(rb_eArgError, "ARCShader texture unit must be %d..%d",
++                 (int) ARCShader::FirstUnit, (int) ARCShader::LastUnit);
++
++    Bitmap *bmp = 0;
++    if (!NIL_P(bmpObj))
++        bmp = getPrivateDataCheck<Bitmap>(bmpObj, BitmapType);
++
++    GFX_GUARD_EXC(s->setTexture(name, bmp, unit);)
++
++    /* keep the bitmap alive while it is bound */
++    VALUE textures = rb_iv_get(self, "textures");
++    if (NIL_P(textures)) {
++        textures = rb_hash_new();
++        rb_iv_set(self, "textures", textures);
++    }
++    if (NIL_P(bmpObj))
++        rb_hash_delete(textures, nameObj);
++    else
++        rb_hash_aset(textures, rb_str_new_frozen(nameObj), bmpObj);
++
++    return self;
++}
++
++RB_METHOD(arcShaderGetScale) {
++    RB_UNUSED_PARAM;
++    return rb_float_new(arcShaderData(self)->getScale());
++}
++
++RB_METHOD(arcShaderSetScale) {
++    rb_check_argc(argc, 1);
++    ARCShader *s = arcShaderData(self);
++    float v = (float) NUM2DBL(argv[0]);
++    GFX_GUARD_EXC(s->setScale(v);)
++    return argv[0];
++}
++
++RB_METHOD(arcShaderAvailable) {
++    RB_UNUSED_PARAM;
++
++    bool value = false;
++    GFX_GUARD_EXC(value = ARCShader::available();)
++
++    return rb_bool_new(value);
++}
++
++void arcShaderBindingInit() {
++    VALUE klass = rb_define_class("ARCShader", rb_cObject);
++#if RAPI_FULL > 187
++    rb_define_alloc_func(klass, classAllocate<&ARCShaderType>);
++#else
++    rb_define_alloc_func(klass, ARCShaderAllocate);
++#endif
++
++    rb_define_const(klass, "SPRITE", INT2FIX(ARCShader::KindSprite));
++    rb_define_const(klass, "POST", INT2FIX(ARCShader::KindPost));
++    rb_define_const(klass, "MAX_PASSES", INT2FIX(ARCShader::MaxPasses));
++
++    _rb_define_method(klass, "initialize", arcShaderInitialize);
++    _rb_define_method(klass, "ok?", arcShaderOk);
++    _rb_define_method(klass, "log", arcShaderLog);
++    _rb_define_method(klass, "kind", arcShaderKind);
++    _rb_define_method(klass, "set_float", arcShaderSetFloat);
++    _rb_define_method(klass, "set_vec2", arcShaderSetVec2);
++    _rb_define_method(klass, "set_vec3", arcShaderSetVec3);
++    _rb_define_method(klass, "set_vec4", arcShaderSetVec4);
++    _rb_define_method(klass, "set_float_array", arcShaderSetFloatArray);
++    _rb_define_method(klass, "set_texture", arcShaderSetTexture);
++    _rb_define_method(klass, "scale", arcShaderGetScale);
++    _rb_define_method(klass, "scale=", arcShaderSetScale);
++    rb_define_singleton_method(klass, "available?", RUBY_METHOD_FUNC(arcShaderAvailable), -1);
++}
+diff --git a/binding/binding-mri.cpp b/binding/binding-mri.cpp
+index b6202bd..fcbcdb4 100644
+--- a/binding/binding-mri.cpp
++++ b/binding/binding-mri.cpp
+@@ -85,6 +85,7 @@ void etcBindingInit();
+ void fontBindingInit();
+ void bitmapBindingInit();
+ void spriteBindingInit();
++void arcShaderBindingInit();
+ void viewportBindingInit();
+ void planeBindingInit();
+ void windowBindingInit();
+@@ -165,6 +166,7 @@ static void mriBindingInit() {
+     fontBindingInit();
+     bitmapBindingInit();
+     spriteBindingInit();
++    arcShaderBindingInit();
+     viewportBindingInit();
+     planeBindingInit();
+     
+diff --git a/binding/binding-types.h b/binding/binding-types.h
+index 6a022d1..56763ae 100644
+--- a/binding/binding-types.h
++++ b/binding/binding-types.h
+@@ -32,6 +32,7 @@ DECL_TYPE(Tone);
+ DECL_TYPE(Font);
+ 
+ DECL_TYPE(Bitmap);
++DECL_TYPE(ARCShader);
+ DECL_TYPE(Sprite);
+ DECL_TYPE(Plane);
+ DECL_TYPE(Viewport);
+@@ -48,6 +49,7 @@ DECL_TYPE(MiniFFI);
+ #define FontType "Font"
+ 
+ #define BitmapType "Bitmap"
++#define ARCShaderType "ARCShader"
+ #define SpriteType "Sprite"
+ #define PlaneType "Plane"
+ #define ViewportType "Viewport"
+diff --git a/binding/meson.build b/binding/meson.build
+index 933a72d..50974f2 100644
+--- a/binding/meson.build
++++ b/binding/meson.build
+@@ -24,6 +24,7 @@ binding_source = [files(
+     'graphics-binding.cpp',
+     'input-binding.cpp',
+     'sprite-binding.cpp',
++    'arcshader-binding.cpp',
+     'viewport-binding.cpp',
+     'plane-binding.cpp',
+     'window-binding.cpp',
+diff --git a/binding/sprite-binding.cpp b/binding/sprite-binding.cpp
+index 750bed5..4befb70 100644
+--- a/binding/sprite-binding.cpp
++++ b/binding/sprite-binding.cpp
+@@ -26,6 +26,7 @@
+ #include "sceneelement-binding.h"
+ #include "sharedstate.h"
+ #include "sprite.h"
++#include "arcshader.h"
+ #include "viewportelement-binding.h"
+ 
+ #if RAPI_FULL > 187
+@@ -54,6 +55,7 @@ RB_METHOD(spriteInitialize) {
+ 
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Bitmap, "bitmap")
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Pattern, "pattern")
++DEF_GFX_PROP_OBJ_REF(Sprite, ARCShader, Shader, "shader")
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialMap, "material_map")
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialEnv, "material_env")
+ DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, MaterialRamp, "material_ramp")
+@@ -78,6 +80,7 @@ DEF_GFX_PROP_I(Sprite, WaveAmp)
+ DEF_GFX_PROP_I(Sprite, WaveLength)
+ DEF_GFX_PROP_I(Sprite, WaveSpeed)
+ DEF_GFX_PROP_I(Sprite, MaterialMode)
++DEF_GFX_PROP_I(Sprite, ShaderPad)
+ 
+ DEF_GFX_PROP_F(Sprite, ZoomX)
+ DEF_GFX_PROP_F(Sprite, ZoomY)
+@@ -201,6 +204,8 @@ void spriteBindingInit() {
+     INIT_PROP_BIND(Sprite, PatternZoomX, "pattern_zoom_x");
+     INIT_PROP_BIND(Sprite, PatternZoomY, "pattern_zoom_y");
+     INIT_PROP_BIND(Sprite, Invert, "invert");
++    INIT_PROP_BIND(Sprite, Shader, "shader");
++    INIT_PROP_BIND(Sprite, ShaderPad, "shader_pad");
+     
+     INIT_PROP_BIND(Sprite, MaterialMap, "material_map");
+     INIT_PROP_BIND(Sprite, MaterialEnv, "material_env");
+diff --git a/binding/viewport-binding.cpp b/binding/viewport-binding.cpp
+index f1c754b..ef242b4 100644
+--- a/binding/viewport-binding.cpp
++++ b/binding/viewport-binding.cpp
+@@ -26,6 +26,7 @@
+ #include "sceneelement-binding.h"
+ #include "sharedstate.h"
+ #include "viewport.h"
++#include "arcshader.h"
+ 
+ #if RAPI_FULL > 187
+ DEF_TYPE(Viewport);
+@@ -79,6 +80,42 @@ DEF_GFX_PROP_OBJ_VAL(Viewport, Tone, Tone, "tone")
+ DEF_GFX_PROP_I(Viewport, OX)
+ DEF_GFX_PROP_I(Viewport, OY)
+ 
++RB_METHOD(viewportGetShader) {
++    RB_UNUSED_PARAM;
++    return rb_iv_get(self, "shader");
++}
++
++RB_METHOD(viewportSetShader) {
++    rb_check_argc(argc, 1);
++
++    Viewport *v = getPrivateData<Viewport>(self);
++    VALUE obj = argv[0];
++    VALUE stored = obj;
++
++    ARCShader *list[ARCShader::MaxPasses];
++    int n = 0;
++
++    if (RB_TYPE_P(obj, T_ARRAY)) {
++        long len = RARRAY_LEN(obj);
++        if (len > ARCShader::MaxPasses)
++            rb_raise(rb_eArgError, "Viewport#shader takes at most %d passes", (int) ARCShader::MaxPasses);
++
++        for (long i = 0; i < len; ++i)
++            list[n++] = getPrivateDataCheck<ARCShader>(rb_ary_entry(obj, i), ARCShaderType);
++
++        stored = rb_ary_dup(obj);
++        rb_obj_freeze(stored);
++    }
++    else if (!NIL_P(obj)) {
++        list[n++] = getPrivateDataCheck<ARCShader>(obj, ARCShaderType);
++    }
++
++    GFX_GUARD_EXC(v->setShaders(list, n);)
++
++    rb_iv_set(self, "shader", stored);
++    return obj;
++}
++
+ void viewportBindingInit() {
+     VALUE klass = rb_define_class("Viewport", rb_cObject);
+ #if RAPI_FULL > 187
+@@ -98,4 +135,6 @@ void viewportBindingInit() {
+     INIT_PROP_BIND(Viewport, OY, "oy");
+     INIT_PROP_BIND(Viewport, Color, "color");
+     INIT_PROP_BIND(Viewport, Tone, "tone");
++    _rb_define_method(klass, "shader", viewportGetShader);
++    _rb_define_method(klass, "shader=", viewportSetShader);
+ }
+diff --git a/shader/arcPost.frag b/shader/arcPost.frag
+new file mode 100644
+index 0000000..23b997b
+--- /dev/null
++++ b/shader/arcPost.frag
+@@ -0,0 +1,29 @@
++
++uniform sampler2D texture;
++uniform sampler2D arcScene;
++
++uniform vec2 arcTexel;
++uniform vec2 arcSceneTexel;
++uniform vec2 arcSize;
++uniform vec4 arcRect;
++uniform vec4 arcSceneRect;
++
++varying vec2 v_texCoord;
++varying vec2 v_sceneCoord;
++
++vec4 arcTex(vec2 uv)
++{
++	return texture2D(texture, clamp(uv, arcRect.xy, arcRect.zw));
++}
++
++vec4 arcSceneTex(vec2 uv)
++{
++	return texture2D(arcScene, clamp(uv, arcSceneRect.xy, arcSceneRect.zw));
++}
++
++/*ARC_USER*/
++
++void main()
++{
++	gl_FragColor = arcUser(texture2D(texture, v_texCoord), v_texCoord);
++}
+diff --git a/shader/arcPost.vert b/shader/arcPost.vert
+new file mode 100644
+index 0000000..74b45fd
+--- /dev/null
++++ b/shader/arcPost.vert
+@@ -0,0 +1,20 @@
++uniform mat4 projMat;
++
++uniform vec2 texSizeInv;
++
++/* xy: scale, zw: offset (target pixel -> scene uv) */
++uniform vec4 arcSceneXform;
++
++attribute vec2 position;
++attribute vec2 texCoord;
++
++varying vec2 v_texCoord;
++varying vec2 v_sceneCoord;
++
++void main()
++{
++	gl_Position = projMat * vec4(position, 0.0, 1.0);
++
++	v_texCoord = texCoord * texSizeInv;
++	v_sceneCoord = position * arcSceneXform.xy + arcSceneXform.zw;
++}
+diff --git a/shader/meson.build b/shader/meson.build
+index 69ac290..a65efe4 100644
+--- a/shader/meson.build
++++ b/shader/meson.build
+@@ -6,6 +6,7 @@ embedded_shaders = [
+     'hue.frag',
+     'sprite.frag',
+     'spriteMaterial.frag',
++    'arcPost.frag',
+     'plane.frag',
+     'gray.frag',
+     'bitmapBlit.frag',
+@@ -23,6 +24,7 @@ embedded_shaders = [
+     'simpleColor.vert',
+     'sprite.vert',
+     'spriteMaterial.vert',
++    'arcPost.vert',
+     'tilemap.vert',
+     'tilemapvx.vert',
+     'blur.frag',
+diff --git a/shader/sprite.frag b/shader/sprite.frag
+index 012a8a6..dda6f6f 100644
+--- a/shader/sprite.frag
++++ b/shader/sprite.frag
+@@ -67,6 +67,31 @@ vec3 blendSubtract(vec3 base, vec3 blend, float opacity) {
+ 
+ // = = = = = = = = = = =
+ 
++#ifdef ARC_USER
++uniform vec2 arcTexel;
++uniform vec2 arcSize;
++uniform vec4 arcRect;
++
++bool arcInside(vec2 uv)
++{
++	return uv.x >= arcRect.x && uv.y >= arcRect.y && uv.x < arcRect.z && uv.y < arcRect.w;
++}
++
++vec4 arcTex(vec2 uv)
++{
++	return arcInside(uv) ? texture2D(texture, uv) : vec4(0.0);
++}
++
++/* shader_pad area takes the bush of the nearest src_rect pixel */
++vec2 arcBushCoord(vec2 uv)
++{
++	return clamp(uv, arcRect.xy, arcRect.zw - arcTexel * 0.5);
++}
++#else
++#define arcBushCoord(uv) (uv)
++#endif
++/*ARC_USER*/
++
+ void main()
+ {
+ 	/* Sample source color */
+@@ -85,6 +110,10 @@ void main()
+             frag.rgb = blendNormal(frag.rgb, pattfrag.rgb, pattfrag.a * patternOpacity);
+         }
+     }
++
++#ifdef ARC_USER
++	frag = arcUser(arcInside(v_texCoord) ? frag : vec4(0.0), v_texCoord);
++#endif
+ 	
+ 	/* Apply gray */
+ 	float luma = dot(frag.rgb, lumaF);
+@@ -105,8 +134,8 @@ void main()
+     }
+ 
+ 	/* Apply bush alpha by mathematical if */
+-	bool underBush = (float(bushY) * v_texCoord.y + float(!bushY) * v_texCoord.x) <
+-	                 (bushSlope * (float(bushY) * v_texCoord.x + float(!bushY) * v_texCoord.y) + bushIntercept);
++	bool underBush = (float(bushY) * arcBushCoord(v_texCoord).y + float(!bushY) * arcBushCoord(v_texCoord).x) <
++	                 (bushSlope * (float(bushY) * arcBushCoord(v_texCoord).x + float(!bushY) * arcBushCoord(v_texCoord).y) + bushIntercept);
+ 	frag.a *= clamp(bushOpacity + float(underBush == bushUnder), 0.0, 1.0);
+ 	
+ 	gl_FragColor = frag;
+diff --git a/shader/spriteMaterial.frag b/shader/spriteMaterial.frag
+index 8b71d52..cf02fc8 100644
+--- a/shader/spriteMaterial.frag
++++ b/shader/spriteMaterial.frag
+@@ -200,6 +200,31 @@ vec4 haloStage(vec4 frag)
+ 	return vec4(materialP3.rgb, clamp(g * materialP0.x, 0.0, 1.0));
+ }
+ 
++#ifdef ARC_USER
++uniform vec2 arcTexel;
++uniform vec2 arcSize;
++uniform vec4 arcRect;
++
++bool arcInside(vec2 uv)
++{
++	return uv.x >= arcRect.x && uv.y >= arcRect.y && uv.x < arcRect.z && uv.y < arcRect.w;
++}
++
++vec4 arcTex(vec2 uv)
++{
++	return arcInside(uv) ? texture2D(texture, uv) : vec4(0.0);
++}
++
++/* shader_pad area takes the bush of the nearest src_rect pixel */
++vec2 arcBushCoord(vec2 uv)
++{
++	return clamp(uv, arcRect.xy, arcRect.zw - arcTexel * 0.5);
++}
++#else
++#define arcBushCoord(uv) (uv)
++#endif
++/*ARC_USER*/
++
+ void main()
+ {
+ 	vec4 frag = texture2D(texture, v_texCoord);
+@@ -227,6 +252,10 @@ void main()
+ 		}
+ 	}
+ 
++#ifdef ARC_USER
++	frag = arcUser(arcInside(v_texCoord) ? frag : vec4(0.0), v_texCoord);
++#endif
++
+ 	float luma = dot(frag.rgb, lumaF);
+ 	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);
+ 	frag.rgb += tone.rgb;
+@@ -236,8 +265,8 @@ void main()
+ 	if (invert)
+ 		frag.rgb = vec3(1.0) - frag.rgb;
+ 
+-	bool underBush = (float(bushY) * v_texCoord.y + float(!bushY) * v_texCoord.x) <
+-	                 (bushSlope * (float(bushY) * v_texCoord.x + float(!bushY) * v_texCoord.y) + bushIntercept);
++	bool underBush = (float(bushY) * arcBushCoord(v_texCoord).y + float(!bushY) * arcBushCoord(v_texCoord).x) <
++	                 (bushSlope * (float(bushY) * arcBushCoord(v_texCoord).x + float(!bushY) * arcBushCoord(v_texCoord).y) + bushIntercept);
+ 	frag.a *= clamp(bushOpacity + float(underBush == bushUnder), 0.0, 1.0);
+ 
+ 	gl_FragColor = frag;
+diff --git a/src/display/arcshader.cpp b/src/display/arcshader.cpp
+new file mode 100644
+index 0000000..1e947a2
+--- /dev/null
++++ b/src/display/arcshader.cpp
+@@ -0,0 +1,662 @@
++/*
++** arcshader.cpp
++**
++** This file is part of mkxp.
++**
++** mkxp is free software: you can redistribute it and/or modify
++** it under the terms of the GNU General Public License as published by
++** the Free Software Foundation, either version 2 of the License, or
++** (at your option) any later version.
++**
++** mkxp is distributed in the hope that it will be useful,
++** but WITHOUT ANY WARRANTY; without even the implied warranty of
++** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++** GNU General Public License for more details.
++**
++** You should have received a copy of the GNU General Public License
++** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "arcshader.h"
++
++#include "bitmap.h"
++#include "debugwriter.h"
++#include "disposable.h"
++#include "exception.h"
++#include "gl-util.h"
++#include "glstate.h"
++#include "quad.h"
++#include "shader.h"
++#include "util.h"
++
++#include <SDL_rect.h>
++
++#include <algorithm>
++#include <map>
++#include <math.h>
++#include <string.h>
++#include <vector>
++
++namespace
++{
++
++enum Variant
++{
++	VarSprite,
++	VarMaterial,
++	VarPost
++};
++
++enum EngineUniform
++{
++	U_Texel,
++	U_Size,
++	U_Rect,
++	U_SceneTexel,
++	U_SceneRect,
++	U_SceneXform,
++	U_Scene,
++	U_Count
++};
++
++const char *const engineNames[U_Count] =
++{
++	"arcTexel", "arcSize", "arcRect", "arcSceneTexel", "arcSceneRect", "arcSceneXform", "arcScene"
++};
++
++/* Float uniforms owned by the templates (the "arc" and "material" prefixes are reserved too) */
++const char *const templateFloats[] =
++{
++	"texSizeInv", "patternSizeInv", "patternScroll", "patternZoom", "tone", "opacity", "color",
++	"bushDepth", "bushOpacity", "bushSlope", "bushIntercept", "patternOpacity", "translation", 0
++};
++
++bool isTemplateUniform(const std::string &name)
++{
++	if (name.compare(0, 3, "arc") == 0 || name.compare(0, 8, "material") == 0)
++		return true;
++
++	for (int i = 0; templateFloats[i]; ++i)
++		if (name == templateFloats[i])
++			return true;
++
++	return false;
++}
++
++int typeComps(GLenum type)
++{
++	switch (type)
++	{
++	case GL_FLOAT_VEC2: return 2;
++	case GL_FLOAT_VEC3: return 3;
++	case GL_FLOAT_VEC4: return 4;
++	default:            return 1;
++	}
++}
++
++struct UserUniform
++{
++	std::string name;
++	GLenum type;
++	GLint size;
++	GLint loc;
++};
++
++struct Program
++{
++	ShaderBase *shader;
++	bool failed;
++	std::string log;
++	GLint engine[U_Count];
++	std::vector<UserUniform> floats;
++	std::map<std::string, GLint> samplers;
++
++	/* Whose values the program currently holds */
++	unsigned long long owner;
++	unsigned long long stamp;
++
++	/* The material template already uses units 2..5 */
++	int unitShift;
++
++	Program()
++	    : shader(0), failed(false), owner(0), stamp(0), unitShift(0)
++	{
++		for (int i = 0; i < U_Count; ++i)
++			engine[i] = -1;
++	}
++
++	GLint samplerLoc(const std::string &name)
++	{
++		std::map<std::string, GLint>::iterator it = samplers.find(name);
++		if (it != samplers.end())
++			return it->second;
++
++		GLint loc = gl.GetUniformLocation(shader->glProgram(), name.c_str());
++		samplers[name] = loc;
++		return loc;
++	}
++};
++
++typedef std::map<std::string, Program*> ProgramCache;
++
++ProgramCache &programCache()
++{
++	static ProgramCache cache;
++	return cache;
++}
++
++unsigned long long counter;
++
++GLint maxTextureUnits()
++{
++	static GLint units = 0;
++
++	if (units == 0)
++	{
++		gl.GetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
++		if (units <= 0)
++			units = 8;
++	}
++
++	return units;
++}
++
++void collectUniforms(Program &pr)
++{
++	GLuint prog = pr.shader->glProgram();
++
++	for (int i = 0; i < U_Count; ++i)
++		pr.engine[i] = gl.GetUniformLocation(prog, engineNames[i]);
++
++	GLint count = 0, maxLen = 0;
++	gl.GetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
++	gl.GetProgramiv(prog, GL_ACTIVE_UNIFORM_MAX_LENGTH, &maxLen);
++
++	std::vector<GLchar> buf(std::max(maxLen, 1) + 1, 0);
++
++	for (GLint i = 0; i < count; ++i)
++	{
++		GLsizei len = 0;
++		GLint size = 0;
++		GLenum type = 0;
++		gl.GetActiveUniform(prog, i, (GLsizei) buf.size(), &len, &size, &type, &buf[0]);
++
++		std::string name(&buf[0], len);
++		size_t bracket = name.find('[');
++		if (bracket != std::string::npos)
++			name.resize(bracket);
++
++		if (type != GL_FLOAT && type != GL_FLOAT_VEC2 &&
++		    type != GL_FLOAT_VEC3 && type != GL_FLOAT_VEC4)
++			continue;
++
++		if (isTemplateUniform(name))
++			continue;
++
++		UserUniform u;
++		u.name = name;
++		u.type = type;
++		u.size = size;
++		u.loc = gl.GetUniformLocation(prog, name.c_str());
++
++		if (u.loc >= 0)
++			pr.floats.push_back(u);
++	}
++}
++
++Program *getProgram(int variant, const std::string &source)
++{
++	std::string key(1, (char) ('0' + variant));
++	key += source;
++
++	ProgramCache &cache = programCache();
++	ProgramCache::iterator it = cache.find(key);
++	if (it != cache.end())
++		return it->second;
++
++	Program *pr = new Program;
++	pr->unitShift = (variant == VarMaterial) ? 4 : 0;
++
++	try
++	{
++		Shader::UserSplice splice(source);
++
++		switch (variant)
++		{
++		case VarSprite:
++			pr->shader = new SpriteShader();
++			break;
++		case VarMaterial:
++			pr->shader = new SpriteMaterialShader();
++			break;
++		default:
++			pr->shader = new ARCPostShader();
++			break;
++		}
++	}
++	catch (const Exception &e)
++	{
++		pr->failed = true;
++		pr->log = std::string(e.msg.c_str()) + "\n" + Shader::lastLog();
++		Debug() << "ARCShader:" << pr->log;
++	}
++
++	if (pr->shader)
++		collectUniforms(*pr);
++
++	cache[key] = pr;
++	return pr;
++}
++
++struct PostState
++{
++	TEX::ID scene;
++	Vec2i sceneSize;
++	TEXFBO aux[2];
++	bool auxInit;
++	Quad *quad;
++
++	PostState()
++	    : auxInit(false), quad(0)
++	{}
++};
++
++PostState post;
++
++void setLinear()
++{
++	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++}
++
++/* Storage only grows, so several shaded viewports per frame do not reallocate */
++void growTex(TEX::ID tex, Vec2i &size, int w, int h)
++{
++	TEX::bind(tex);
++
++	if (size.x >= w && size.y >= h)
++		return;
++
++	size = Vec2i(std::max(size.x, w), std::max(size.y, h));
++	TEX::allocEmpty(size.x, size.y);
++}
++
++Vec4 regionRect(const IntRect &r, const Vec2i &alloc)
++{
++	/* Half a texel inside so linear reads never leave the region */
++	const float ix = 1.f / alloc.x, iy = 1.f / alloc.y;
++	return Vec4((r.x + 0.5f) * ix, (r.y + 0.5f) * iy,
++	            (r.x + r.w - 0.5f) * ix, (r.y + r.h - 0.5f) * iy);
++}
++
++} // namespace
++
++struct ARCShaderPrivate
++{
++	struct Value
++	{
++		int comps;
++		int count;
++		float data[ARCShader::MaxArray];
++	};
++
++	struct TexSlot
++	{
++		std::string name;
++		Bitmap *bitmap;
++
++		TexSlot() : bitmap(0) {}
++	};
++
++	int kind;
++	std::string source;
++	std::string log;
++	Program *main;
++	Program *material;
++	bool materialTried;
++	std::map<std::string, Value> values;
++	TexSlot tex[ARCShader::LastUnit - ARCShader::FirstUnit + 1];
++	float scale;
++	unsigned long long id;
++	unsigned long long stamp;
++	bool unitWarned;
++
++	void touch()
++	{
++		stamp = ++counter;
++	}
++
++	void upload(Program &pr)
++	{
++		if (pr.owner != id || pr.stamp != stamp)
++		{
++			for (size_t i = 0; i < pr.floats.size(); ++i)
++			{
++				const UserUniform &u = pr.floats[i];
++				const int comps = typeComps(u.type);
++				const int n = (comps == 1) ? std::min<int>(u.size, ARCShader::MaxArray) : 1;
++
++				float tmp[ARCShader::MaxArray];
++				memset(tmp, 0, sizeof(tmp));
++
++				std::map<std::string, Value>::const_iterator it = values.find(u.name);
++				if (it != values.end())
++				{
++					const int have = it->second.comps * it->second.count;
++					memcpy(tmp, it->second.data, sizeof(float) * std::min(have, n * comps));
++				}
++
++				switch (comps)
++				{
++				case 1: gl.Uniform1fv(u.loc, n, tmp); break;
++				case 2: gl.Uniform2f(u.loc, tmp[0], tmp[1]); break;
++				case 3: gl.Uniform3f(u.loc, tmp[0], tmp[1], tmp[2]); break;
++				default: gl.Uniform4f(u.loc, tmp[0], tmp[1], tmp[2], tmp[3]); break;
++				}
++			}
++
++			pr.owner = id;
++			pr.stamp = stamp;
++		}
++
++		bool bound = false;
++
++		for (int i = 0; i <= ARCShader::LastUnit - ARCShader::FirstUnit; ++i)
++		{
++			const TexSlot &t = tex[i];
++			if (t.name.empty())
++				continue;
++
++			GLint loc = pr.samplerLoc(t.name);
++			if (loc < 0)
++				continue;
++
++			const int unit = ARCShader::FirstUnit + i + pr.unitShift;
++			if (unit >= maxTextureUnits())
++			{
++				if (!unitWarned)
++					Debug() << "ARCShader: texture" << t.name << "needs unit" << unit << "beyond the device limit";
++				unitWarned = true;
++				continue;
++			}
++
++			TEX::ID id = nullOrDisposed(t.bitmap) ? TEX::ID(0) : t.bitmap->getGLTypes().tex;
++
++			gl.ActiveTexture(GL_TEXTURE0 + unit);
++			TEX::bind(id);
++			gl.Uniform1i(loc, unit);
++			bound = true;
++		}
++
++		if (bound)
++			gl.ActiveTexture(GL_TEXTURE0);
++	}
++};
++
++ARCShader::ARCShader(const char *source, int length, int kind)
++{
++	p = new ARCShaderPrivate;
++	p->kind = (kind == KindPost) ? KindPost : KindSprite;
++	p->source.assign(source, length);
++	p->material = 0;
++	p->materialTried = false;
++	p->scale = 1.f;
++	p->unitWarned = false;
++	p->id = ++counter;
++	p->stamp = ++counter;
++
++	p->main = getProgram(p->kind == KindPost ? VarPost : VarSprite, p->source);
++	p->log = p->main->log;
++}
++
++ARCShader::~ARCShader()
++{
++	delete p;
++}
++
++bool ARCShader::ok() const
++{
++	return !p->main->failed;
++}
++
++const std::string &ARCShader::log() const
++{
++	return p->log;
++}
++
++int ARCShader::kind() const
++{
++	return p->kind;
++}
++
++void ARCShader::setFloats(const char *name, const float *values, int comps, int count)
++{
++	ARCShaderPrivate::Value &v = p->values[name];
++	v.comps = clamp(comps, 1, 4);
++	v.count = (v.comps == 1) ? clamp(count, 1, (int) MaxArray) : 1;
++
++	memset(v.data, 0, sizeof(v.data));
++	memcpy(v.data, values, sizeof(float) * v.comps * v.count);
++
++	p->touch();
++}
++
++void ARCShader::setTexture(const char *name, Bitmap *bitmap, int unit)
++{
++	unit = clamp(unit, (int) FirstUnit, (int) LastUnit);
++
++	/* one name lives in one unit */
++	for (int i = 0; i <= LastUnit - FirstUnit; ++i)
++		if (p->tex[i].name == name)
++			p->tex[i] = ARCShaderPrivate::TexSlot();
++
++	if (!bitmap)
++		return;
++
++	bitmap->ensureNonMega();
++
++	ARCShaderPrivate::TexSlot &t = p->tex[unit - FirstUnit];
++	t.name = name;
++	t.bitmap = bitmap;
++}
++
++float ARCShader::getScale() const
++{
++	return p->scale;
++}
++
++void ARCShader::setScale(float value)
++{
++	p->scale = clamp(value, 1.f / 16.f, 1.f);
++}
++
++SpriteShader *ARCShader::spriteShader()
++{
++	if (p->kind != KindSprite || p->main->failed)
++		return 0;
++
++	return static_cast<SpriteShader*>(p->main->shader);
++}
++
++SpriteMaterialShader *ARCShader::materialShader()
++{
++	if (p->kind != KindSprite || p->main->failed)
++		return 0;
++
++	if (!p->materialTried)
++	{
++		p->materialTried = true;
++		p->material = getProgram(VarMaterial, p->source);
++
++		if (p->material->failed)
++			p->log += p->material->log;
++	}
++
++	return p->material->failed ? 0 : static_cast<SpriteMaterialShader*>(p->material->shader);
++}
++
++void ARCShader::applySprite(ShaderBase &bound, const Vec2 &texel,
++                            const Vec2 &size, const Vec4 &rect)
++{
++	Program *pr = 0;
++
++	if (&bound == p->main->shader)
++		pr = p->main;
++	else if (p->material && &bound == p->material->shader)
++		pr = p->material;
++
++	if (!pr)
++		return;
++
++	gl.Uniform2f(pr->engine[U_Texel], texel.x, texel.y);
++	gl.Uniform2f(pr->engine[U_Size], size.x, size.y);
++	gl.Uniform4f(pr->engine[U_Rect], rect.x, rect.y, rect.z, rect.w);
++
++	p->upload(*pr);
++}
++
++void ARCShader::postProcess(ARCShader *const *passes, int count,
++                            const IntRect &rect, const IntRect &screen,
++                            const TEXFBO &target)
++{
++	ARCShader *list[MaxPasses];
++	int n = 0;
++
++	for (int i = 0; i < count && n < MaxPasses; ++i)
++		if (passes[i] && passes[i]->p->kind == KindPost && !passes[i]->p->main->failed)
++			list[n++] = passes[i];
++
++	if (n == 0)
++		return;
++
++	SDL_Rect a = { rect.x, rect.y, rect.w, rect.h };
++	SDL_Rect b = { screen.x, screen.y, screen.w, screen.h };
++	SDL_Rect c;
++	if (!SDL_IntersectRect(&a, &b, &c))
++		return;
++
++	const IntRect r(c.x, c.y, c.w, c.h);
++
++	if (!post.quad)
++	{
++		post.quad = new Quad;
++		post.scene = TEX::gen();
++		TEX::bind(post.scene);
++		TEX::setRepeat(false);
++		setLinear();
++	}
++
++	/* Copy what is drawn under the viewport (a native blit may have left another read framebuffer bound) */
++	growTex(post.scene, post.sceneSize, r.w, r.h);
++	if (gl.BlitFramebuffer)
++		gl.BindFramebuffer(GL_READ_FRAMEBUFFER, target.fbo.gl);
++	gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, r.x, r.y, r.w, r.h);
++
++	glState.scissorTest.pushSet(false);
++	glState.blend.pushSet(false);
++
++	const IntRect sceneRegion(0, 0, r.w, r.h);
++	const Vec4 sceneRect = regionRect(sceneRegion, post.sceneSize);
++	const Vec2 sceneTexel(1.f / post.sceneSize.x, 1.f / post.sceneSize.y);
++
++	TEX::ID inTex = post.scene;
++	Vec2i inAlloc = post.sceneSize;
++	IntRect inRegion = sceneRegion;
++
++	for (int i = 0; i < n; ++i)
++	{
++		const bool last = (i == n - 1);
++		IntRect outPos;
++
++		if (last)
++		{
++			FBO::bind(target.fbo);
++			outPos = r;
++		}
++		else
++		{
++			TEXFBO &aux = post.aux[i & 1];
++
++			if (!post.auxInit)
++			{
++				for (int k = 0; k < 2; ++k)
++				{
++					TEXFBO::init(post.aux[k]);
++					setLinear();
++				}
++				post.auxInit = true;
++			}
++
++			const float s = list[i]->p->scale;
++			const int w = std::max(1, (int) lround(r.w * s));
++			const int h = std::max(1, (int) lround(r.h * s));
++
++			if (aux.width < w || aux.height < h)
++			{
++				TEXFBO::allocEmpty(aux, std::max(aux.width, w), std::max(aux.height, h));
++				TEXFBO::linkFBO(aux);
++			}
++
++			FBO::bind(aux.fbo);
++			glState.viewport.pushSet(IntRect(0, 0, aux.width, aux.height));
++			outPos = IntRect(0, 0, w, h);
++		}
++
++		Program &pr = *list[i]->p->main;
++		ShaderBase &shader = *pr.shader;
++
++		shader.bind();
++		shader.applyViewportProj();
++		shader.setTexSize(inAlloc);
++
++		const float sx = (float) r.w / (outPos.w * post.sceneSize.x);
++		const float sy = (float) r.h / (outPos.h * post.sceneSize.y);
++		const Vec4 inRect = regionRect(inRegion, inAlloc);
++
++		gl.Uniform2f(pr.engine[U_Texel], 1.f / inAlloc.x, 1.f / inAlloc.y);
++		gl.Uniform2f(pr.engine[U_Size], (float) outPos.w, (float) outPos.h);
++		gl.Uniform4f(pr.engine[U_Rect], inRect.x, inRect.y, inRect.z, inRect.w);
++		gl.Uniform2f(pr.engine[U_SceneTexel], sceneTexel.x, sceneTexel.y);
++		gl.Uniform4f(pr.engine[U_SceneRect], sceneRect.x, sceneRect.y, sceneRect.z, sceneRect.w);
++		gl.Uniform4f(pr.engine[U_SceneXform], sx, sy, -outPos.x * sx, -outPos.y * sy);
++
++		gl.ActiveTexture(GL_TEXTURE1);
++		TEX::bind(post.scene);
++		gl.Uniform1i(pr.engine[U_Scene], 1);
++		gl.ActiveTexture(GL_TEXTURE0);
++
++		list[i]->p->upload(pr);
++
++		TEX::bind(inTex);
++
++		post.quad->setTexPosRect(FloatRect(inRegion), FloatRect(outPos));
++		post.quad->draw();
++
++		if (!last)
++		{
++			glState.viewport.pop();
++
++			inTex = post.aux[i & 1].tex;
++			inAlloc = Vec2i(post.aux[i & 1].width, post.aux[i & 1].height);
++			inRegion = outPos;
++		}
++	}
++
++	glState.blend.pop();
++	glState.scissorTest.pop();
++}
++
++bool ARCShader::available()
++{
++	static int state = -1;
++
++	if (state < 0)
++	{
++		static const char identity[] = "vec4 arcUser(vec4 c, vec2 uv) { return c; }";
++		ARCShader probe(identity, sizeof(identity) - 1, KindSprite);
++		ARCShader probePost(identity, sizeof(identity) - 1, KindPost);
++		state = (probe.ok() && probePost.ok()) ? 1 : 0;
++	}
++
++	return state == 1;
++}
+diff --git a/src/display/arcshader.h b/src/display/arcshader.h
+new file mode 100644
+index 0000000..3c77761
+--- /dev/null
++++ b/src/display/arcshader.h
+@@ -0,0 +1,91 @@
++/*
++** arcshader.h
++**
++** This file is part of mkxp.
++**
++** mkxp is free software: you can redistribute it and/or modify
++** it under the terms of the GNU General Public License as published by
++** the Free Software Foundation, either version 2 of the License, or
++** (at your option) any later version.
++**
++** mkxp is distributed in the hope that it will be useful,
++** but WITHOUT ANY WARRANTY; without even the implied warranty of
++** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++** GNU General Public License for more details.
++**
++** You should have received a copy of the GNU General Public License
++** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef ARCSHADER_H
++#define ARCSHADER_H
++
++#include "etc-internal.h"
++
++#include <string>
++
++class Bitmap;
++class ShaderBase;
++class SpriteShader;
++class SpriteMaterialShader;
++struct TEXFBO;
++struct ARCShaderPrivate;
++
++/* User fragment shader. The source defines
++ *   vec4 arcUser(vec4 c, vec2 uv)
++ * and is compiled into an engine template: Sprite (after pattern/material,
++ * before tone/opacity/color/flash/invert/bush) or Post (Viewport pass). */
++class ARCShader
++{
++public:
++	enum Kind
++	{
++		KindSprite = 0,
++		KindPost   = 1
++	};
++
++	enum
++	{
++		MaxArray   = 64,
++		FirstUnit  = 2,
++		LastUnit   = 5,
++		MaxPasses  = 4,
++		MaxPad     = 256
++	};
++
++	ARCShader(const char *source, int length, int kind);
++	~ARCShader();
++
++	bool ok() const;
++	const std::string &log() const;
++	int kind() const;
++
++	/* comps 1..4; count > 1 only for comps == 1 (float array) */
++	void setFloats(const char *name, const float *values, int comps, int count);
++	/* bitmap 0 removes the binding of that name */
++	void setTexture(const char *name, Bitmap *bitmap, int unit);
++
++	/* Size of a non-final Viewport pass relative to the viewport */
++	float getScale() const;
++	void setScale(float value);
++
++	/* Engine side */
++	SpriteShader *spriteShader();
++	SpriteMaterialShader *materialShader();
++
++	/* After the template uniforms are set on the bound program */
++	void applySprite(ShaderBase &bound, const Vec2 &texel,
++	                 const Vec2 &size, const Vec4 &rect);
++
++	/* Runs the passes over 'rect' of the bound screen target */
++	static void postProcess(ARCShader *const *passes, int count,
++	                        const IntRect &rect, const IntRect &screen,
++	                        const TEXFBO &target);
++
++	static bool available();
++
++private:
++	ARCShaderPrivate *p;
++};
++
++#endif // ARCSHADER_H
+diff --git a/src/display/gl/gl-fun.h b/src/display/gl/gl-fun.h
+index 4d12b1f..1d1b538 100644
+--- a/src/display/gl/gl-fun.h
++++ b/src/display/gl/gl-fun.h
+@@ -94,6 +94,9 @@ typedef void (APIENTRYP _PFNGLUNIFORM2FPROC) (GLint location, GLfloat v0, GLfloa
+ typedef void (APIENTRYP _PFNGLUNIFORM4FPROC) (GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
+ typedef void (APIENTRYP _PFNGLUNIFORM1IPROC) (GLint location, GLint v0);
+ typedef void (APIENTRYP _PFNGLUNIFORM1IVPROC) (GLint location, GLsizei count, const GLint *value);
++typedef void (APIENTRYP _PFNGLUNIFORM3FPROC) (GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
++typedef void (APIENTRYP _PFNGLUNIFORM1FVPROC) (GLint location, GLsizei count, const GLfloat *value);
++typedef void (APIENTRYP _PFNGLGETACTIVEUNIFORMPROC) (GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name);
+ typedef void (APIENTRYP _PFNGLUNIFORMMATRIX4FVPROC) (GLint location, GLsizei count, GLboolean transpose, const GLfloat* value);
+ 
+ /* Vertex attribute */
+@@ -182,6 +185,9 @@ typedef void (APIENTRYP _PFNGLRELEASESHADERCOMPILERPROC) (void);
+ 	GL_FUN(Uniform4f, _PFNGLUNIFORM4FPROC) \
+ 	GL_FUN(Uniform1i, _PFNGLUNIFORM1IPROC) \
+ 	GL_FUN(Uniform1iv, _PFNGLUNIFORM1IVPROC) \
++	GL_FUN(Uniform3f, _PFNGLUNIFORM3FPROC) \
++	GL_FUN(Uniform1fv, _PFNGLUNIFORM1FVPROC) \
++	GL_FUN(GetActiveUniform, _PFNGLGETACTIVEUNIFORMPROC) \
+ 	GL_FUN(UniformMatrix4fv, _PFNGLUNIFORMMATRIX4FVPROC) \
+ 	/* Vertex attribute */ \
+ 	GL_FUN(BindAttribLocation, _PFNGLBINDATTRIBLOCATIONPROC) \
+diff --git a/src/display/gl/scene.h b/src/display/gl/scene.h
+index 0353e6a..33ae902 100644
+--- a/src/display/gl/scene.h
++++ b/src/display/gl/scene.h
+@@ -29,6 +29,7 @@
+ 
+ class SceneElement;
+ class Viewport;
++class ARCShader;
+ class WindowVX;
+ class Window;
+ struct ScanRow;
+@@ -58,6 +59,8 @@ public:
+ 	virtual void requestViewportRender(const Vec4& /* color */,
+ 	                                   const Vec4& /* flash */,
+ 	                                   const Vec4& /* tone */) {}
++	virtual void requestViewportPost(ARCShader *const * /* passes */,
++	                                 int /* count */) {}
+ 
+ 	const Geometry &getGeometry() const { return geometry; }
+ 
+diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
+index 4e96f66..ce679e4 100644
+--- a/src/display/gl/shader.cpp
++++ b/src/display/gl/shader.cpp
+@@ -26,6 +26,7 @@
+ #include "glstate.h"
+ #include "exception.h"
+ 
++#include <algorithm>
+ #include <assert.h>
+ #include <string.h>
+ #include <iostream>
+@@ -57,6 +58,8 @@
+ #include "sprite.vert.xxd"
+ #include "spriteMaterial.vert.xxd"
+ #include "spriteMaterial.frag.xxd"
++#include "arcPost.vert.xxd"
++#include "arcPost.frag.xxd"
+ #include "tilemap.vert.xxd"
+ #include "blur.frag.xxd"
+ #include "simpleMatrix.vert.xxd"
+@@ -88,6 +91,25 @@
+ 
+ #define GET_U(name) u_##name = gl.GetUniformLocation(program, #name)
+ 
++static std::string shaderLastLog;
++static const std::string *userSpliceSource;
++
++Shader::UserSplice::UserSplice(const std::string &source)
++{
++	userSpliceSource = &source;
++	shaderLastLog.clear();
++}
++
++Shader::UserSplice::~UserSplice()
++{
++	userSpliceSource = 0;
++}
++
++const std::string &Shader::lastLog()
++{
++	return shaderLastLog;
++}
++
+ #ifdef MKXPZ_BUILD_XCODE
+     std::string Shader::shaderCommon = "";
+ #endif
+@@ -99,6 +121,7 @@ static void printShaderLog(GLuint shader)
+ 
+ 	std::string log(logLength, '\0');
+ 	gl.GetShaderInfoLog(shader, log.size(), 0, &log[0]);
++	shaderLastLog += log.c_str();
+ 
+ 	std::clog << "Shader log:\n" << log;
+ }
+@@ -110,6 +133,7 @@ static void printProgramLog(GLuint program)
+ 
+ 	std::string log(logLength, '\0');
+ 	gl.GetProgramInfoLog(program, log.size(), 0, &log[0]);
++	shaderLastLog += log.c_str();
+ 
+ 	std::clog << "Program log:\n" << log;
+ }
+@@ -156,8 +180,8 @@ static void setupShaderSource(GLuint shader, GLenum type,
+ 	static const char glesDefine[] = "#define GLSLES\n";
+ 	static const char fragDefine[] = "#define FRAGMENT_SHADER\n";
+ 
+-	const GLchar *shaderSrc[4];
+-	GLint shaderSrcSize[4];
++	const GLchar *shaderSrc[9];
++	GLint shaderSrcSize[9];
+ 	size_t i = 0;
+ 
+ 	if (gl.glsles)
+@@ -183,9 +207,42 @@ static void setupShaderSource(GLuint shader, GLenum type,
+ #endif
+ 	++i;
+ 
+-	shaderSrc[i] = (const GLchar*) body;
+-	shaderSrcSize[i] = bodySize;
+-	++i;
++	static const char marker[] = "/*ARC_USER*/";
++	const char *b = (const char *) body;
++	const char *e = b + bodySize;
++	const char *m = (type == GL_FRAGMENT_SHADER && userSpliceSource) ?
++	    std::search(b, e, marker, marker + sizeof(marker) - 1) : e;
++
++	if (type == GL_FRAGMENT_SHADER && userSpliceSource && m == e)
++		throw Exception(Exception::MKXPError, "GLSL: shader template has no user slot");
++
++	if (m != e)
++	{
++		static const char userDefine[] = "#define ARC_USER 1\n";
++		/* GLSL ES numbers the next line as given, desktop GLSL 1.10 as given + 1 */
++		static const char userLineES[] = "\n#line 1\n";
++		static const char userLineGL[] = "\n#line 0\n";
++		static const char userEnd[] = "\n";
++
++		shaderSrc[i] = userDefine;
++		shaderSrcSize[i++] = sizeof(userDefine) - 1;
++		shaderSrc[i] = b;
++		shaderSrcSize[i++] = (GLint) (m - b);
++		shaderSrc[i] = gl.glsles ? userLineES : userLineGL;
++		shaderSrcSize[i++] = sizeof(userLineES) - 1;
++		shaderSrc[i] = userSpliceSource->c_str();
++		shaderSrcSize[i++] = (GLint) userSpliceSource->size();
++		shaderSrc[i] = userEnd;
++		shaderSrcSize[i++] = sizeof(userEnd) - 1;
++		shaderSrc[i] = m;
++		shaderSrcSize[i++] = (GLint) (e - m);
++	}
++	else
++	{
++		shaderSrc[i] = b;
++		shaderSrcSize[i] = bodySize;
++		++i;
++	}
+ 
+ 	gl.ShaderSource(shader, i, shaderSrc, shaderSrcSize);
+ }
+@@ -822,6 +879,14 @@ void SpriteMaterialShader::setParams(const float value[16])
+ }
+ 
+ 
++ARCPostShader::ARCPostShader()
++{
++	INIT_SHADER(arcPost, arcPost, ARCPostShader);
++
++	ShaderBase::init();
++}
++
++
+ PlaneShader::PlaneShader()
+ {
+ 	INIT_SHADER(simple, plane, PlaneShader);
+diff --git a/src/display/gl/shader.h b/src/display/gl/shader.h
+index 13d88fc..8f1b90c 100644
+--- a/src/display/gl/shader.h
++++ b/src/display/gl/shader.h
+@@ -43,6 +43,17 @@ public:
+     
+     static std::string &commonHeader();
+ 
++	GLuint glProgram() const { return program; }
++
++	/* While alive, fragment templates with a user slot get this source spliced in */
++	struct UserSplice
++	{
++		UserSplice(const std::string &source);
++		~UserSplice();
++	};
++
++	static const std::string &lastLog();
++
+ protected:
+ 	Shader();
+ 	~Shader();
+@@ -250,6 +261,12 @@ private:
+ 	u_materialMirror, u_materialXform, u_materialP[4];
+ };
+ 
++class ARCPostShader : public ShaderBase
++{
++public:
++	ARCPostShader();
++};
++
+ class PlaneShader : public ShaderBase
+ {
+ public:
+diff --git a/src/display/graphics.cpp b/src/display/graphics.cpp
+index 7ca41c4..658038f 100644
+--- a/src/display/graphics.cpp
++++ b/src/display/graphics.cpp
+@@ -45,6 +45,7 @@
+ #include "util.h"
+ #include "input.h"
+ #include "sprite.h"
++#include "arcshader.h"
+ 
+ #include <SDL.h>
+ #include <SDL_image.h>
+@@ -528,6 +529,11 @@ public:
+         }
+     }
+     
++    void requestViewportPost(ARCShader *const *passes, int count) {
++        ARCShader::postProcess(passes, count, glState.scissorBox.get(),
++                               geometry.rect, pp.frontBuffer());
++    }
++
+     void requestViewportRender(const Vec4 &c, const Vec4 &f, const Vec4 &t) {
+         const IntRect &viewpRect = glState.scissorBox.get();
+         const IntRect &screenRect = geometry.rect;
+diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
+index bd26a33..1a9f494 100644
+--- a/src/display/sprite.cpp
++++ b/src/display/sprite.cpp
+@@ -33,6 +33,7 @@
+ #include "quad.h"
+ #include "transform.h"
+ #include "shader.h"
++#include "arcshader.h"
+ #include "exception.h"
+ #include "glstate.h"
+ #include "quadarray.h"
+@@ -85,6 +86,11 @@ struct SpritePrivate
+     Vec2 patternZoom;
+     
+     bool invert;
++    
++    ARCShader *shader;
++    int shaderPad;
++    bool padDirty;
++    Quad padQuad;
+ 
+     Bitmap *materialMap;
+     Bitmap *materialEnv;
+@@ -138,6 +144,9 @@ struct SpritePrivate
+     patternTile(true),
+     patternOpacity(255),
+     invert(false),
++    shader(0),
++    shaderPad(0),
++    padDirty(true),
+     materialMap(0),
+     materialEnv(0),
+     materialRamp(0),
+@@ -330,6 +339,7 @@ struct SpritePrivate
+         
+         quad.setPosRect(FloatRect(0, 0, rect.w, rect.h));
+         bushDirty = true;
++        padDirty = true;
+         
+         if (wave.active)
+             wave.dirty = true;
+@@ -376,6 +386,14 @@ struct SpritePrivate
+         IntRect self = adjustedSrcRect;
+         self.setPos(trans.getPositionI() + trans.getGlobalOffset() - trans.getAdjustedOriginI());
+         
++        if (shader && shaderPad > 0)
++        {
++            self.x -= shaderPad;
++            self.y -= shaderPad;
++            self.w += shaderPad * 2;
++            self.h += shaderPad * 2;
++        }
++        
+         isVisible = SDL_HasIntersection(&self, &sceneGeo.rect);
+     }
+     
+@@ -527,6 +545,48 @@ struct SpritePrivate
+         wave.qArray.commit();
+     }
+     
++    /* Source rect (clamped to the bitmap) in the units of the quad */
++    FloatRect userSrcRect() const
++    {
++        FloatRect rect = adjustedSrcRect;
++        return rect;
++    }
++
++    void applyUser(ARCShader *user, ShaderBase &s)
++    {
++        const FloatRect rect = userSrcRect();
++        const float bw = (float) bitmap->width();
++        const float bh = (float) bitmap->height();
++        Bitmap *tb = bitmap->hasHires() ? bitmap->getHires() : bitmap;
++        const Vec2 texel(1.f / tb->width(), 1.f / tb->height());
++
++        user->applySprite(s, texel, Vec2(bw, bh),
++                          Vec4(rect.x / bw, rect.y / bh, (rect.x + rect.w) / bw, (rect.y + rect.h) / bh));
++    }
++
++    void drawPadded()
++    {
++        if (padDirty)
++        {
++            const FloatRect rect = userSrcRect();
++            const float pd = (float) shaderPad;
++            FloatRect tex(rect.x - pd, rect.y - pd, rect.w + pd * 2, rect.h + pd * 2);
++
++            if (bitmap->hasHires() && bitmap->width() && bitmap->height())
++            {
++                const float sx = (float) bitmap->getHires()->width() / bitmap->width();
++                const float sy = (float) bitmap->getHires()->height() / bitmap->height();
++                tex = FloatRect(tex.x * sx, tex.y * sy, tex.w * sx, tex.h * sy);
++            }
++
++            padQuad.setTexPosRect(mirrored ? tex.hFlipped() : tex,
++                                  FloatRect(-pd, -pd, rect.w + pd * 2, rect.h + pd * 2));
++            padDirty = false;
++        }
++
++        padQuad.draw();
++    }
++
+     void prepare()
+     {
+         if (wave.dirty)
+@@ -585,6 +645,30 @@ DEF_ATTR_SIMPLE(Sprite, PatternScrollY, int, p->patternScroll.y)
+ DEF_ATTR_SIMPLE(Sprite, PatternZoomX, float, p->patternZoom.x)
+ DEF_ATTR_SIMPLE(Sprite, PatternZoomY, float, p->patternZoom.y)
+ DEF_ATTR_SIMPLE(Sprite, Invert,      bool,    p->invert)
++DEF_ATTR_RD_SIMPLE(Sprite, Shader,    ARCShader*, p->shader)
++DEF_ATTR_RD_SIMPLE(Sprite, ShaderPad, int,        p->shaderPad)
++
++void Sprite::setShader(ARCShader *value)
++{
++    guardDisposed();
++
++    if (value && value->kind() != ARCShader::KindSprite)
++        throw Exception(Exception::ArgumentError, "Sprite#shader needs an ARCShader::SPRITE shader");
++
++    p->shader = value;
++}
++
++void Sprite::setShaderPad(int value)
++{
++    guardDisposed();
++
++    value = clamp(value, 0, (int) ARCShader::MaxPad);
++    if (p->shaderPad == value)
++        return;
++
++    p->shaderPad = value;
++    p->padDirty = true;
++}
+ DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
+ DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
+ DEF_ATTR_RD_SIMPLE(Sprite, MaterialRamp, Bitmap*, p->materialRamp)
+@@ -971,12 +1055,22 @@ void Sprite::draw()
+         scalingMethod = shState->config().bitmapSmoothScaling;
+     }
+ 
++    ARCShader *user = (p->shader && p->shader->ok()) ? p->shader : 0;
++
+     bool useMaterial = (p->materialMode == 3 ||
+     (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
+ 
++    /* A user shader that cannot combine with the material is left out */
++    SpriteMaterialShader *userMaterial = (useMaterial && user) ? user->materialShader() : 0;
++    if (useMaterial && !userMaterial)
++        user = 0;
++
++    if (user)
++        scalingMethod = NearestNeighbor;
++
+     if (useMaterial)
+     {
+-        SpriteMaterialShader &shader = *materialShader;
++        SpriteMaterialShader &shader = userMaterial ? *userMaterial : *materialShader;
+         scalingMethod = NearestNeighbor;
+         const float *mp = p->materialParams;
+ 
+@@ -1040,9 +1134,12 @@ void Sprite::draw()
+         shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
+         shader.setBack(materialBackTex, backInv, back);
+ 
++        if (user)
++            p->applyUser(user, shader);
++
+         base = &shader;
+     }
+-    else if (renderEffect)
++    else if (renderEffect || user)
+     {
+         if (scalingMethod != NearestNeighbor)
+         {
+@@ -1050,7 +1147,7 @@ void Sprite::draw()
+             scalingMethod = NearestNeighbor;
+         }
+ 
+-        SpriteShader &shader = shState->shaders().sprite;
++        SpriteShader &shader = user ? *user->spriteShader() : shState->shaders().sprite;
+         
+         shader.bind();
+         shader.applyViewportProj();
+@@ -1087,6 +1184,9 @@ void Sprite::draw()
+         
+         shader.setColor(*blend);
+         
++        if (user)
++            p->applyUser(user, shader);
++        
+         base = &shader;
+     }
+     else if (p->opacity != 255)
+@@ -1174,6 +1274,8 @@ void Sprite::draw()
+ 
+     if (p->wave.active)
+         p->wave.qArray.draw();
++    else if (user && p->shaderPad > 0)
++        p->drawPadded();
+     else
+         p->quad.draw();
+     
+diff --git a/src/display/sprite.h b/src/display/sprite.h
+index 315912b..5d48dc9 100644
+--- a/src/display/sprite.h
++++ b/src/display/sprite.h
+@@ -29,6 +29,7 @@
+ #include "util.h"
+ 
+ class Bitmap;
++class ARCShader;
+ struct Color;
+ struct Tone;
+ struct Rect;
+@@ -71,6 +72,8 @@ public:
+     DECL_ATTR( PatternZoomX, float  )
+     DECL_ATTR( PatternZoomY, float  )
+     DECL_ATTR( Invert,      bool    )
++	DECL_ATTR( Shader,      ARCShader* )
++	DECL_ATTR( ShaderPad,   int     )
+ 	DECL_ATTR( MaterialMap,  Bitmap* )
+ 	DECL_ATTR( MaterialEnv,  Bitmap* )
+ 	DECL_ATTR( MaterialRamp, Bitmap* )
+diff --git a/src/display/viewport.cpp b/src/display/viewport.cpp
+index 29b3219..449432d 100644
+--- a/src/display/viewport.cpp
++++ b/src/display/viewport.cpp
+@@ -27,6 +27,8 @@
+ #include "quad.h"
+ #include "glstate.h"
+ #include "graphics.h"
++#include "arcshader.h"
++#include "exception.h"
+ 
+ #include <SDL_rect.h>
+ 
+@@ -46,6 +48,9 @@ struct ViewportPrivate
+ 	IntRect screenRect;
+ 	int isOnScreen;
+ 
++	ARCShader *shaders[ARCShader::MaxPasses];
++	int shaderCount;
++
+ 	EtcTemps tmp;
+ 
+ 	ViewportPrivate(int x, int y, int width, int height, Viewport *self)
+@@ -53,8 +58,12 @@ struct ViewportPrivate
+ 	      rect(&tmp.rect),
+ 	      color(&tmp.color),
+ 	      tone(&tmp.tone),
+-	      isOnScreen(false)
++	      isOnScreen(false),
++	      shaderCount(0)
+ 	{
++		for (int i = 0; i < ARCShader::MaxPasses; ++i)
++			shaders[i] = 0;
++
+ 		rect->set(x, y, width, height);
+ 		updateRectCon();
+ 	}
+@@ -97,6 +106,11 @@ struct ViewportPrivate
+ 
+ 		return (rectEffective && colorToneEffective && isOnScreen);
+ 	}
++
++	bool needsPostRender()
++	{
++		return shaderCount > 0 && !rect->isEmpty() && isOnScreen;
++	}
+ };
+ 
+ Viewport::Viewport(int x, int y, int width, int height)
+@@ -173,6 +187,23 @@ void Viewport::setOY(int value)
+ 	notifyGeometryChange();
+ }
+ 
++void Viewport::setShaders(ARCShader *const *list, int count)
++{
++	guardDisposed();
++
++	if (count < 0 || count > ARCShader::MaxPasses)
++		throw Exception(Exception::ArgumentError, "Viewport#shader takes at most %d passes", (int) ARCShader::MaxPasses);
++
++	for (int i = 0; i < count; ++i)
++		if (!list[i] || list[i]->kind() != ARCShader::KindPost)
++			throw Exception(Exception::ArgumentError, "Viewport#shader needs ARCShader::POST shaders");
++
++	for (int i = 0; i < ARCShader::MaxPasses; ++i)
++		p->shaders[i] = (i < count) ? list[i] : 0;
++
++	p->shaderCount = count;
++}
++
+ void Viewport::initDynAttribs()
+ {
+ 	p->rect = new Rect(*p->rect);
+@@ -189,8 +220,9 @@ void Viewport::composite()
+ 		return;
+ 
+ 	bool renderEffect = p->needsEffectRender(flashing);
++	bool renderPost = p->needsPostRender();
+ 
+-	if (elements.getSize() == 0 && !renderEffect)
++	if (elements.getSize() == 0 && !renderEffect && !renderPost)
+ 		return;
+ 
+ 	/* Setup scissor */
+@@ -199,6 +231,9 @@ void Viewport::composite()
+ 
+ 	Scene::composite();
+ 
++	if (renderPost)
++		scene->requestViewportPost(p->shaders, p->shaderCount);
++
+ 	/* If any effects are visible, request parent Scene to
+ 	 * render them. */
+ 	if (renderEffect)
+diff --git a/src/display/viewport.h b/src/display/viewport.h
+index 20fdddd..2e234bf 100644
+--- a/src/display/viewport.h
++++ b/src/display/viewport.h
+@@ -28,6 +28,7 @@
+ #include "util.h"
+ 
+ struct ViewportPrivate;
++class ARCShader;
+ 
+ class Viewport : public Scene, public SceneElement, public Flashable, public Disposable
+ {
+@@ -45,6 +46,9 @@ public:
+ 	DECL_ATTR( Color, Color& )
+ 	DECL_ATTR( Tone,  Tone&  )
+ 
++	/* Post passes run over what is drawn inside the rect after the children */
++	void setShaders(ARCShader *const *list, int count);
++
+ 	void initDynAttribs();
+ 
+ private:
+diff --git a/src/meson.build b/src/meson.build
+index 4ce97ae..3a1e1b8 100755
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -140,6 +140,7 @@ main_source = files(
+     'display/graphics.cpp',
+     'display/plane.cpp',
+     'display/sprite.cpp',
++    'display/arcshader.cpp',
+     'display/tilemap.cpp',
+     'display/tilemapvx.cpp',
+     'display/viewport.cpp',

@@ -26,6 +26,7 @@
 #include "sceneelement-binding.h"
 #include "sharedstate.h"
 #include "viewport.h"
+#include "arcshader.h"
 
 #if RAPI_FULL > 187
 DEF_TYPE(Viewport);
@@ -83,6 +84,42 @@ DEF_GFX_PROP_OBJ_VAL(Viewport, Tone, Tone, "tone")
 DEF_GFX_PROP_I(Viewport, OX)
 DEF_GFX_PROP_I(Viewport, OY)
 
+RB_METHOD(viewportGetShader) {
+    RB_UNUSED_PARAM;
+    return rb_iv_get(self, "shader");
+}
+
+RB_METHOD(viewportSetShader) {
+    rb_check_argc(argc, 1);
+
+    Viewport *v = getPrivateData<Viewport>(self);
+    VALUE obj = argv[0];
+    VALUE stored = obj;
+
+    ARCShader *list[ARCShader::MaxPasses];
+    int n = 0;
+
+    if (RB_TYPE_P(obj, T_ARRAY)) {
+        long len = RARRAY_LEN(obj);
+        if (len > ARCShader::MaxPasses)
+            rb_raise(rb_eArgError, "Viewport#shader takes at most %d passes", (int) ARCShader::MaxPasses);
+
+        for (long i = 0; i < len; ++i)
+            list[n++] = getPrivateDataCheck<ARCShader>(rb_ary_entry(obj, i), ARCShaderType);
+
+        stored = rb_ary_dup(obj);
+        rb_obj_freeze(stored);
+    }
+    else if (!NIL_P(obj)) {
+        list[n++] = getPrivateDataCheck<ARCShader>(obj, ARCShaderType);
+    }
+
+    GFX_GUARD_EXC(v->setShaders(list, n);)
+
+    rb_iv_set(self, "shader", stored);
+    return obj;
+}
+
 void viewportBindingInit() {
     VALUE klass = rb_define_class("Viewport", rb_cObject);
 #if RAPI_FULL > 187
@@ -102,4 +139,6 @@ void viewportBindingInit() {
     INIT_PROP_BIND(Viewport, OY, "oy");
     INIT_PROP_BIND(Viewport, Color, "color");
     INIT_PROP_BIND(Viewport, Tone, "tone");
+    _rb_define_method(klass, "shader", viewportGetShader);
+    _rb_define_method(klass, "shader=", viewportSetShader);
 }

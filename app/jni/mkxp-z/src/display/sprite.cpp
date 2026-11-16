@@ -31,6 +31,7 @@
 #include "quad.h"
 #include "transform.h"
 #include "shader.h"
+#include "arcshader.h"
 #include "debugwriter.h"
 #include "exception.h"
 #include "glstate.h"
@@ -70,6 +71,11 @@ struct SpritePrivate
     Vec2 patternZoom;
     
     bool invert;
+    
+    ARCShader *shader;
+    int shaderPad;
+    bool padDirty;
+    Quad padQuad;
 
     Bitmap *materialMap;
     Bitmap *materialEnv;
@@ -120,6 +126,9 @@ struct SpritePrivate
     patternTile(true),
     patternOpacity(255),
     invert(false),
+    shader(0),
+    shaderPad(0),
+    padDirty(true),
     materialMap(0),
     materialEnv(0),
     materialRamp(0),
@@ -188,6 +197,7 @@ struct SpritePrivate
         recomputeBushDepth();
         
         wave.dirty = true;
+        padDirty = true;
     }
     
     void updateSrcRectCon()
@@ -232,6 +242,14 @@ struct SpritePrivate
         self.setPos(trans.getPositionI() - (trans.getOriginI() + sceneOrig));
         self.w = bitmap->width();
         self.h = bitmap->height();
+        
+        if (shader && shaderPad > 0)
+        {
+            self.x -= shaderPad;
+            self.y -= shaderPad;
+            self.w += shaderPad * 2;
+            self.h += shaderPad * 2;
+        }
         
         isVisible = SDL_HasIntersection(&self, &sceneRect);
     }
@@ -319,6 +337,43 @@ struct SpritePrivate
         wave.qArray.commit();
     }
     
+    /* Source rect (clamped to the bitmap) in the units of the quad */
+    FloatRect userSrcRect() const
+    {
+        FloatRect rect = srcRect->toFloatRect();
+        rect.w = clamp<int>(rect.w, 0, bitmap->width() - rect.x);
+        rect.h = clamp<int>(rect.h, 0, bitmap->height() - rect.y);
+        return rect;
+    }
+
+    void applyUser(ARCShader *user, ShaderBase &s)
+    {
+        const FloatRect rect = userSrcRect();
+        const float bw = (float) bitmap->width();
+        const float bh = (float) bitmap->height();
+        const TEXFBO &tb = bitmap->getGLTypes();
+        const Vec2 texel(1.f / tb.width, 1.f / tb.height);
+
+        user->applySprite(s, texel, Vec2(bw, bh),
+                          Vec4(rect.x / bw, rect.y / bh, (rect.x + rect.w) / bw, (rect.y + rect.h) / bh));
+    }
+
+    void drawPadded()
+    {
+        if (padDirty)
+        {
+            const FloatRect rect = userSrcRect();
+            const float pd = (float) shaderPad;
+            FloatRect tex(rect.x - pd, rect.y - pd, rect.w + pd * 2, rect.h + pd * 2);
+
+            padQuad.setTexPosRect(mirrored ? tex.hFlipped() : tex,
+                                  FloatRect(-pd, -pd, rect.w + pd * 2, rect.h + pd * 2));
+            padDirty = false;
+        }
+
+        padQuad.draw();
+    }
+
     void prepare()
     {
         if (wave.dirty)
@@ -375,6 +430,30 @@ DEF_ATTR_SIMPLE(Sprite, PatternScrollY, int, p->patternScroll.y)
 DEF_ATTR_SIMPLE(Sprite, PatternZoomX, float, p->patternZoom.x)
 DEF_ATTR_SIMPLE(Sprite, PatternZoomY, float, p->patternZoom.y)
 DEF_ATTR_SIMPLE(Sprite, Invert,      bool,    p->invert)
+DEF_ATTR_RD_SIMPLE(Sprite, Shader,    ARCShader*, p->shader)
+DEF_ATTR_RD_SIMPLE(Sprite, ShaderPad, int,        p->shaderPad)
+
+void Sprite::setShader(ARCShader *value)
+{
+    guardDisposed();
+
+    if (value && value->kind() != ARCShader::KindSprite)
+        throw Exception(Exception::ArgumentError, "Sprite#shader needs an ARCShader::SPRITE shader");
+
+    p->shader = value;
+}
+
+void Sprite::setShaderPad(int value)
+{
+    guardDisposed();
+
+    value = clamp(value, 0, (int) ARCShader::MaxPad);
+    if (p->shaderPad == value)
+        return;
+
+    p->shaderPad = value;
+    p->padDirty = true;
+}
 DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
 DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
 DEF_ATTR_RD_SIMPLE(Sprite, MaterialRamp, Bitmap*, p->materialRamp)
@@ -706,12 +785,19 @@ void Sprite::draw()
     p->invert             ||
     (p->pattern && !p->pattern->isDisposed());
     
+    ARCShader *user = (p->shader && p->shader->ok()) ? p->shader : 0;
+
     bool useMaterial = (p->materialMode == 3 ||
     (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
 
+    /* A user shader that cannot combine with the material is left out */
+    SpriteMaterialShader *userMaterial = (useMaterial && user) ? user->materialShader() : 0;
+    if (useMaterial && !userMaterial)
+        user = 0;
+
     if (useMaterial)
     {
-        SpriteMaterialShader &shader = *materialShader;
+        SpriteMaterialShader &shader = userMaterial ? *userMaterial : *materialShader;
         const float *mp = p->materialParams;
 
         Vec2 backInv;
@@ -774,11 +860,14 @@ void Sprite::draw()
         shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
         shader.setBack(materialBackTex, backInv, back);
 
+        if (user)
+            p->applyUser(user, shader);
+
         base = &shader;
     }
-    else if (renderEffect)
+    else if (renderEffect || user)
     {
-        SpriteShader &shader = shState->shaders().sprite;
+        SpriteShader &shader = user ? *user->spriteShader() : shState->shaders().sprite;
         
         shader.bind();
         shader.applyViewportProj();
@@ -811,6 +900,9 @@ void Sprite::draw()
         
         shader.setColor(*blend);
         
+        if (user)
+            p->applyUser(user, shader);
+        
         base = &shader;
     }
     else if (p->opacity != 255)
@@ -839,6 +931,8 @@ void Sprite::draw()
     
     if (p->wave.active)
         p->wave.qArray.draw();
+    else if (user && p->shaderPad > 0)
+        p->drawPadded();
     else
         p->quad.draw();
     

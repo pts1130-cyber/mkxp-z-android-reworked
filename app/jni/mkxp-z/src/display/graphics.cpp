@@ -44,6 +44,7 @@
 #include "util.h"
 #include "input.h"
 #include "sprite.h"
+#include "arcshader.h"
 #include "arc-prof.h"
 
 #include <SDL.h>
@@ -522,6 +523,11 @@ public:
         }
     }
     
+    void requestViewportPost(ARCShader *const *passes, int count) {
+        ARCShader::postProcess(passes, count, glState.scissorBox.get(),
+                               geometry.rect, pp.frontBuffer());
+    }
+
     void requestViewportRender(const Vec4 &c, const Vec4 &f, const Vec4 &t) {
         const IntRect &viewpRect = glState.scissorBox.get();
         const IntRect &screenRect = geometry.rect;

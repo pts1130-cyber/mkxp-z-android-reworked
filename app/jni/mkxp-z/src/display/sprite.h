@@ -29,6 +29,7 @@
 #include "util.h"
 
 class Bitmap;
+class ARCShader;
 struct Color;
 struct Tone;
 struct Rect;
@@ -71,6 +72,8 @@ public:
     DECL_ATTR( PatternZoomX, float  )
     DECL_ATTR( PatternZoomY, float  )
     DECL_ATTR( Invert,      bool    )
+	DECL_ATTR( Shader,      ARCShader* )
+	DECL_ATTR( ShaderPad,   int     )
 	DECL_ATTR( MaterialMap,  Bitmap* )
 	DECL_ATTR( MaterialEnv,  Bitmap* )
 	DECL_ATTR( MaterialRamp, Bitmap* )

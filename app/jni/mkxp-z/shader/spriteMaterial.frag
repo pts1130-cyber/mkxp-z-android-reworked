@@ -199,6 +199,31 @@ vec4 haloStage(vec4 frag)
 	return vec4(materialP3.rgb, clamp(g * materialP0.x, 0.0, 1.0));
 }
 
+#ifdef ARC_USER
+uniform vec2 arcTexel;
+uniform vec2 arcSize;
+uniform vec4 arcRect;
+
+bool arcInside(vec2 uv)
+{
+	return uv.x >= arcRect.x && uv.y >= arcRect.y && uv.x < arcRect.z && uv.y < arcRect.w;
+}
+
+vec4 arcTex(vec2 uv)
+{
+	return arcInside(uv) ? texture2D(texture, uv) : vec4(0.0);
+}
+
+/* shader_pad area takes the bush of the nearest src_rect pixel */
+vec2 arcBushCoord(vec2 uv)
+{
+	return clamp(uv, arcRect.xy, arcRect.zw - arcTexel * 0.5);
+}
+#else
+#define arcBushCoord(uv) (uv)
+#endif
+/*ARC_USER*/
+
 void main()
 {
 	vec4 frag = texture2D(texture, v_texCoord);
@@ -226,6 +251,10 @@ void main()
 		}
 	}
 
+#ifdef ARC_USER
+	frag = arcUser(arcInside(v_texCoord) ? frag : vec4(0.0), v_texCoord);
+#endif
+
 	float luma = dot(frag.rgb, lumaF);
 	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);
 	frag.rgb += tone.rgb;
@@ -235,7 +264,7 @@ void main()
 	if (invert)
 		frag.rgb = vec3(1.0) - frag.rgb;
 
-	lowp float underBush = float(v_texCoord.y < bushDepth);
+	lowp float underBush = float(arcBushCoord(v_texCoord).y < bushDepth);
 	frag.a *= clamp(bushOpacity + underBush, 0.0, 1.0);
 
 	gl_FragColor = frag;
