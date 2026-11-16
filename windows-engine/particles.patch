@@ -1,0 +1,1215 @@
+diff --git a/binding/binding-mri.cpp b/binding/binding-mri.cpp
+index b6202bd..54ea4f1 100644
+--- a/binding/binding-mri.cpp
++++ b/binding/binding-mri.cpp
+@@ -97,6 +97,7 @@ void audioBindingInit();
+ void graphicsBindingInit();
+ 
+ void fileIntBindingInit();
++void particleLayerBindingInit();
+ 
+ #ifdef MKXPZ_MINIFFI
+ void MiniFFIBindingInit();
+@@ -181,6 +182,7 @@ static void mriBindingInit() {
+     graphicsBindingInit();
+     
+     fileIntBindingInit();
++    particleLayerBindingInit();
+     
+ #ifdef MKXPZ_MINIFFI
+     MiniFFIBindingInit();
+diff --git a/binding/meson.build b/binding/meson.build
+index 933a72d..b56668a 100644
+--- a/binding/meson.build
++++ b/binding/meson.build
+@@ -32,6 +32,7 @@ binding_source = [files(
+     'module_rpg.cpp',
+     'filesystem-binding.cpp',
+     'windowvx-binding.cpp',
++    'particlelayer-binding.cpp',
+     'tilemapvx-binding.cpp',
+     'http-binding.cpp'
+ )]
+diff --git a/binding/particlelayer-binding.cpp b/binding/particlelayer-binding.cpp
+new file mode 100644
+index 0000000..e4c90d6
+--- /dev/null
++++ b/binding/particlelayer-binding.cpp
+@@ -0,0 +1,315 @@
++/*
++** particlelayer-binding.cpp
++**
++** Ruby class ParticleLayer.
++*/
++
++#include "binding-types.h"
++#include "binding-util.h"
++#include "disposable-binding.h"
++#include "particlelayer.h"
++#include "viewportelement-binding.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <string.h>
++
++#ifdef RB_METHOD_GUARD
++#define PL_METHOD(name) RB_METHOD_GUARD(name)
++#define PL_METHOD_END RB_METHOD_GUARD_END
++#define PL_GUARD(exp) { exp }
++#else
++#define PL_METHOD(name) RB_METHOD(name)
++#define PL_METHOD_END
++#define PL_GUARD(exp) GUARD_EXC(exp)
++#endif
++
++#if RAPI_FULL > 187
++DEF_TYPE(ParticleLayer);
++#else
++DEF_ALLOCFUNC(ParticleLayer);
++#endif
++
++PL_METHOD(particleLayerInitialize) {
++  ParticleLayer *l = viewportElementInitialize<ParticleLayer>(argc, argv, self);
++
++  setPrivateData(self, l);
++
++  GFX_LOCK;
++  l->initDynAttribs();
++
++  wrapProperty(self, &l->getColor(), "color", ColorType);
++  wrapProperty(self, &l->getTone(), "tone", ToneType);
++  GFX_UNLOCK;
++
++  return self;
++}
++PL_METHOD_END
++
++DEF_GFX_PROP_OBJ_REF(ParticleLayer, Bitmap, Bitmap, "bitmap")
++DEF_GFX_PROP_OBJ_VAL(ParticleLayer, Color, Color, "color")
++DEF_GFX_PROP_OBJ_VAL(ParticleLayer, Tone, Tone, "tone")
++
++DEF_GFX_PROP_I(ParticleLayer, Opacity)
++DEF_GFX_PROP_I(ParticleLayer, BlendType)
++
++DEF_GFX_PROP_F(ParticleLayer, X)
++DEF_GFX_PROP_F(ParticleLayer, Y)
++
++DEF_GFX_PROP_B(ParticleLayer, PixelSnap)
++DEF_GFX_PROP_B(ParticleLayer, Smooth)
++
++/* Float data given as a packed String ("e*"/"f*") or an Array of numbers
++ * (flat, or one Array per particle). The result is a Ruby String so a
++ * raise while converting leaks nothing. */
++static VALUE particleFloats(VALUE data, int stride, int maxCount, const float **out, int *count)
++{
++  *out = 0;
++  *count = 0;
++
++  if (NIL_P(data))
++    return Qnil;
++
++  if (RB_TYPE_P(data, RUBY_T_STRING)) {
++    long n = RSTRING_LEN(data) / (long) (sizeof(float) * stride);
++    if (n > maxCount)
++      n = maxCount;
++
++    const char *src = RSTRING_PTR(data);
++    if (((uintptr_t) src % sizeof(float)) == 0) {
++      *out = (const float *) src;
++      *count = (int) n;
++      return data;
++    }
++
++    VALUE buf = rb_str_new(src, n * sizeof(float) * stride);
++    *out = (const float *) RSTRING_PTR(buf);
++    *count = (int) n;
++    return buf;
++  }
++
++  if (!RB_TYPE_P(data, RUBY_T_ARRAY))
++    rb_raise(rb_eTypeError, "particle data must be a packed String or an Array");
++
++  long len = RARRAY_LEN(data);
++  bool nested = len > 0 && RB_TYPE_P(rb_ary_entry(data, 0), RUBY_T_ARRAY);
++  long n = nested ? len : len / stride;
++  if (n > maxCount)
++    n = maxCount;
++
++  VALUE buf = rb_str_new(0, n * sizeof(float) * stride);
++  float *dst = (float *) RSTRING_PTR(buf);
++
++  for (long i = 0; i < n; ++i) {
++    if (nested) {
++      VALUE row = rb_Array(rb_ary_entry(data, i));
++      long rl = RARRAY_LEN(row);
++      for (int k = 0; k < stride; ++k)
++        dst[i * stride + k] = (k < rl) ? (float) NUM2DBL(rb_ary_entry(row, k)) : NAN;
++    } else {
++      for (int k = 0; k < stride; ++k)
++        dst[i * stride + k] = (float) NUM2DBL(rb_ary_entry(data, i * stride + k));
++    }
++  }
++
++  *out = dst;
++  *count = (int) n;
++  return buf;
++}
++
++static int particleStride(VALUE v, int def, int max) {
++  if (NIL_P(v))
++    return def;
++
++  int s = NUM2INT(v);
++  if (s < 1 || s > max)
++    rb_raise(rb_eArgError, "stride must be 1..%d", max);
++
++  return s;
++}
++
++/* (data, stride = 6, motion = nil, motion_stride = 12) */
++static VALUE particleLoad(int argc, VALUE *argv, VALUE self, bool append) {
++  VALUE data = Qnil, strideV = Qnil, motion = Qnil, motionStrideV = Qnil;
++  rb_scan_args(argc, argv, "13", &data, &strideV, &motion, &motionStrideV);
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  int stride = particleStride(strideV, 6, ParticleLayer::StateFields);
++  int mstride = particleStride(motionStrideV, ParticleLayer::MotionFields, ParticleLayer::MotionFields);
++
++  const float *state = 0, *mot = 0;
++  int n = 0, mn = 0;
++  VALUE keepS = particleFloats(data, stride, ParticleLayer::MaxParticles, &state, &n);
++  VALUE keepM = particleFloats(motion, mstride, ParticleLayer::MaxParticles, &mot, &mn);
++
++  if (mot && mn < n)
++    n = mn;
++
++  int stored = 0;
++  GFX_GUARD_EXC(
++    stored = append ? l->addParticles(state, stride, mot, mstride, n)
++                    : l->setParticles(state, stride, mot, mstride, n);
++  )
++
++  RB_GC_GUARD(keepS);
++  RB_GC_GUARD(keepM);
++
++  return rb_fix_new(stored);
++}
++
++PL_METHOD(particleLayerSetParticles) {
++  return particleLoad(argc, argv, self, false);
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerAddParticles) {
++  return particleLoad(argc, argv, self, true);
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerClear) {
++  RB_UNUSED_PARAM;
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++  GFX_GUARD_EXC(l->clearParticles();)
++
++  return self;
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerUpdate) {
++  VALUE framesV = Qnil;
++  rb_scan_args(argc, argv, "01", &framesV);
++
++  double frames = NIL_P(framesV) ? 1.0 : NUM2DBL(framesV);
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  int live = 0;
++  GFX_GUARD_EXC(live = l->update((float) frames);)
++
++  return rb_fix_new(live);
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerCount) {
++  RB_UNUSED_PARAM;
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  int v = 0;
++  PL_GUARD(v = l->getCount();)
++
++  return rb_fix_new(v);
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerDrawnCount) {
++  RB_UNUSED_PARAM;
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  int v = 0;
++  PL_GUARD(v = l->getDrawnCount();)
++
++  return rb_fix_new(v);
++}
++PL_METHOD_END
++
++/* (w = nil, h = nil, ox = nil, oy = nil): with arguments sets the cell
++ * size and its origin (default: centre), returns [w, h, ox, oy] */
++PL_METHOD(particleLayerCell) {
++  VALUE wV = Qnil, hV = Qnil, oxV = Qnil, oyV = Qnil;
++  rb_scan_args(argc, argv, "04", &wV, &hV, &oxV, &oyV);
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  if (!NIL_P(wV)) {
++    int w = NUM2INT(wV);
++    int h = NIL_P(hV) ? w : NUM2INT(hV);
++    int ox = NIL_P(oxV) ? -1 : NUM2INT(oxV);
++    int oy = NIL_P(oyV) ? -1 : NUM2INT(oyV);
++    GFX_GUARD_EXC(l->setCell(w, h, ox, oy);)
++  }
++
++  int w = 0, h = 0, ox = 0, oy = 0;
++  PL_GUARD(
++    w = l->getCellWidth(); h = l->getCellHeight();
++    ox = l->getCellOX(); oy = l->getCellOY();
++  )
++
++  VALUE ary = rb_ary_new2(4);
++  rb_ary_push(ary, rb_fix_new(w));
++  rb_ary_push(ary, rb_fix_new(h));
++  rb_ary_push(ary, rb_fix_new(ox));
++  rb_ary_push(ary, rb_fix_new(oy));
++  return ary;
++}
++PL_METHOD_END
++
++/* Packed String of STATE_FIELDS floats per particle, as drawn now */
++PL_METHOD(particleLayerExport) {
++  RB_UNUSED_PARAM;
++
++  ParticleLayer *l = getPrivateData<ParticleLayer>(self);
++
++  int n = 0;
++  PL_GUARD(n = l->getCount();)
++
++  VALUE buf = rb_str_new(0, (long) n * ParticleLayer::StateFields * sizeof(float));
++  float *dst = (float *) RSTRING_PTR(buf);
++  GFX_GUARD_EXC(l->exportParticles(dst);)
++
++  return buf;
++}
++PL_METHOD_END
++
++PL_METHOD(particleLayerAvailable) {
++  RB_UNUSED_PARAM;
++
++  bool v = false;
++  GFX_GUARD_EXC(v = ParticleLayer::available();)
++
++  return rb_bool_new(v);
++}
++PL_METHOD_END
++
++void particleLayerBindingInit() {
++  VALUE klass = rb_define_class("ParticleLayer", rb_cObject);
++#if RAPI_FULL > 187
++  rb_define_alloc_func(klass, classAllocate<&ParticleLayerType>);
++#else
++  rb_define_alloc_func(klass, ParticleLayerAllocate);
++#endif
++
++  disposableBindingInit<ParticleLayer>(klass);
++  viewportElementBindingInit<ParticleLayer>(klass);
++
++  _rb_define_method(klass, "initialize", particleLayerInitialize);
++
++  INIT_PROP_BIND(ParticleLayer, Bitmap, "bitmap");
++  INIT_PROP_BIND(ParticleLayer, Opacity, "opacity");
++  INIT_PROP_BIND(ParticleLayer, BlendType, "blend_type");
++  INIT_PROP_BIND(ParticleLayer, X, "x");
++  INIT_PROP_BIND(ParticleLayer, Y, "y");
++  INIT_PROP_BIND(ParticleLayer, PixelSnap, "pixel_snap");
++  INIT_PROP_BIND(ParticleLayer, Smooth, "smooth");
++  INIT_PROP_BIND(ParticleLayer, Color, "color");
++  INIT_PROP_BIND(ParticleLayer, Tone, "tone");
++
++  _rb_define_method(klass, "cell", particleLayerCell);
++  _rb_define_method(klass, "set_particles", particleLayerSetParticles);
++  _rb_define_method(klass, "add_particles", particleLayerAddParticles);
++  _rb_define_method(klass, "clear", particleLayerClear);
++  _rb_define_method(klass, "update", particleLayerUpdate);
++  _rb_define_method(klass, "count", particleLayerCount);
++  _rb_define_method(klass, "drawn_count", particleLayerDrawnCount);
++  _rb_define_method(klass, "export_particles", particleLayerExport);
++
++  rb_define_class_method(klass, "available?", particleLayerAvailable);
++
++  rb_define_const(klass, "MAX", INT2FIX(ParticleLayer::MaxParticles));
++  rb_define_const(klass, "STATE_FIELDS", INT2FIX(ParticleLayer::StateFields));
++  rb_define_const(klass, "MOTION_FIELDS", INT2FIX(ParticleLayer::MotionFields));
++}
+diff --git a/src/display/particlecore.h b/src/display/particlecore.h
+new file mode 100644
+index 0000000..23a5f56
+--- /dev/null
++++ b/src/display/particlecore.h
+@@ -0,0 +1,312 @@
++/*
++** particlecore.h
++**
++** Particle storage, motion and quad building for ParticleLayer.
++** No GL or Ruby dependencies so the same code can be tested standalone.
++*/
++
++#ifndef PARTICLECORE_H
++#define PARTICLECORE_H
++
++#include <math.h>
++#include <string.h>
++#include <vector>
++
++namespace ParticleCore
++{
++
++enum
++{
++	MaxParticles = 4096,
++	StateFields  = 9,   /* x, y, cell, scale, angle, opacity, r, g, b */
++	MotionFields = 12,  /* vx, vy, ax, ay, life, fade_in, fade_out, spin, grow, drag, anim_speed, anim_frames */
++	VertexFloats = 8,   /* pos.xy, tex.xy, color.rgba (matches struct Vertex) */
++	QuadFloats   = VertexFloats * 4
++};
++
++struct Particle
++{
++	float x, y, cell, scale, angle, opacity, r, g, b;
++	float vx, vy, ax, ay, life, fadeIn, fadeOut, spin, grow, drag, animSpeed, animFrames;
++	float age;
++	bool moving;
++};
++
++struct BuildParams
++{
++	float cellW, cellH;
++	float originX, originY;
++	int cols, cellCount;
++	float offsetX, offsetY;
++	float alpha;          /* layer opacity, 0..1 */
++	bool snap;
++	bool cull;
++	float cullX0, cullY0, cullX1, cullY1;
++};
++
++static inline float clampf(float v, float lo, float hi)
++{
++	return v < lo ? lo : (v > hi ? hi : v);
++}
++
++static inline bool finitef(float v)
++{
++	return v == v && v - v == 0.f;
++}
++
++class Store
++{
++public:
++	Store() { parts.reserve(256); }
++
++	int count() const { return (int) parts.size(); }
++
++	void clear() { parts.clear(); }
++
++	/* state: count*stateStride floats (stateStride 1..9),
++	 * motion: count*motionStride floats or null (motionStride 1..12).
++	 * Returns how many particles were stored. */
++	int load(const float *state, int stateStride, const float *motion, int motionStride,
++	         int n, bool append)
++	{
++		if (!append)
++			parts.clear();
++
++		if (n < 0)
++			n = 0;
++
++		int room = MaxParticles - (int) parts.size();
++		if (n > room)
++			n = room;
++
++		static const float stateDef[StateFields] = { 0, 0, 0, 1, 0, 1, 1, 1, 1 };
++		static const float motionDef[MotionFields] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1 };
++
++		size_t base = parts.size();
++		parts.resize(base + n);
++
++		for (int i = 0; i < n; ++i)
++		{
++			float s[StateFields], m[MotionFields];
++
++			for (int k = 0; k < StateFields; ++k)
++				s[k] = (k < stateStride) ? state[(size_t) i * stateStride + k] : stateDef[k];
++
++			for (int k = 0; k < MotionFields; ++k)
++				m[k] = (motion && k < motionStride) ? motion[(size_t) i * motionStride + k] : motionDef[k];
++
++			for (int k = 0; k < StateFields; ++k)
++				if (!finitef(s[k])) s[k] = stateDef[k];
++
++			for (int k = 0; k < MotionFields; ++k)
++				if (!finitef(m[k])) m[k] = motionDef[k];
++
++			Particle &p = parts[base + i];
++			p.x = s[0]; p.y = s[1]; p.cell = s[2]; p.scale = s[3]; p.angle = s[4];
++			p.opacity = clampf(s[5], 0.f, 1.f);
++			p.r = clampf(s[6], 0.f, 2.f); p.g = clampf(s[7], 0.f, 2.f); p.b = clampf(s[8], 0.f, 2.f);
++
++			p.vx = m[0]; p.vy = m[1]; p.ax = m[2]; p.ay = m[3];
++			p.life = m[4]; p.fadeIn = m[5]; p.fadeOut = m[6];
++			p.spin = m[7]; p.grow = m[8]; p.drag = m[9];
++			p.animSpeed = m[10]; p.animFrames = m[11] < 1.f ? 1.f : m[11];
++			p.age = 0.f;
++			p.moving = motion != 0;
++		}
++
++		return n;
++	}
++
++	/* Advances moving particles by dt frames and removes expired ones
++	 * (draw order of the survivors is kept). Returns the live count. */
++	int update(float dt)
++	{
++		if (!(dt > 0.f) || !finitef(dt))
++			return count();
++
++		size_t w = 0;
++		const size_t n = parts.size();
++
++		for (size_t i = 0; i < n; ++i)
++		{
++			Particle p = parts[i];
++
++			if (p.moving)
++			{
++				p.age += dt;
++
++				if (p.life > 0.f && p.age >= p.life)
++					continue;
++
++				float d = (p.drag == 1.f) ? 1.f : (dt == 1.f ? p.drag : powf(p.drag < 0.f ? 0.f : p.drag, dt));
++				p.vx = p.vx * d + p.ax * dt;
++				p.vy = p.vy * d + p.ay * dt;
++				p.x += p.vx * dt;
++				p.y += p.vy * dt;
++				p.angle += p.spin * dt;
++				p.scale += p.grow * dt;
++
++				if (p.angle >= 360.f || p.angle < -360.f)
++					p.angle = fmodf(p.angle, 360.f);
++			}
++
++			parts[w++] = p;
++		}
++
++		parts.resize(w);
++
++		return (int) w;
++	}
++
++	float effectiveAlpha(const Particle &p) const
++	{
++		float a = p.opacity;
++
++		if (!p.moving)
++			return a;
++
++		if (p.fadeIn > 0.f && p.age < p.fadeIn)
++			a *= p.age / p.fadeIn;
++
++		if (p.fadeOut > 0.f && p.life > 0.f)
++		{
++			float left = p.life - p.age;
++			if (left < p.fadeOut)
++				a *= left / p.fadeOut;
++		}
++
++		return a;
++	}
++
++	int effectiveCell(const Particle &p) const
++	{
++		int c = (int) floorf(p.cell);
++
++		if (p.moving && p.animFrames > 1.f && p.animSpeed != 0.f)
++		{
++			int frames = (int) p.animFrames;
++			int step = (int) floorf(p.age * p.animSpeed) % frames;
++			if (step < 0)
++				step += frames;
++			c += step;
++		}
++
++		return c;
++	}
++
++	/* Writes up to count() quads (QuadFloats each) and returns how many. */
++	int build(float *out, const BuildParams &bp) const
++	{
++		if (bp.cellW <= 0.f || bp.cellH <= 0.f || bp.cols <= 0 || bp.cellCount <= 0 || !(bp.alpha > 0.f))
++			return 0;
++
++		const float cw = bp.cellW, ch = bp.cellH;
++		const float ox = bp.originX, oy = bp.originY;
++		const float ext = fabsf(ox) + fabsf(oy) + cw + ch;
++
++		int q = 0;
++		const size_t n = parts.size();
++
++		for (size_t i = 0; i < n; ++i)
++		{
++			const Particle &p = parts[i];
++
++			const float alpha = effectiveAlpha(p) * bp.alpha;
++			if (!(alpha > 0.f))
++				continue;
++
++			const int ci = effectiveCell(p);
++			if (ci < 0 || ci >= bp.cellCount)
++				continue;
++
++			if (p.scale == 0.f)
++				continue;
++
++			float px = p.x + bp.offsetX;
++			float py = p.y + bp.offsetY;
++
++			if (bp.snap)
++			{
++				px = floorf(px + 0.5f);
++				py = floorf(py + 0.5f);
++			}
++
++			if (bp.cull)
++			{
++				const float r = ext * fabsf(p.scale);
++				if (px + r < bp.cullX0 || px - r > bp.cullX1 ||
++				    py + r < bp.cullY0 || py - r > bp.cullY1)
++					continue;
++			}
++
++			/* Same arithmetic as Transform::updateMatrix */
++			float rot = p.angle;
++			if (rot >= 360.f || rot < -360.f)
++				rot = fmodf(rot, 360.f);
++
++			float sxc, syc, sxs, sys;
++			if (rot == 0.f)
++			{
++				sxc = syc = p.scale;
++				sxs = sys = 0.f;
++			}
++			else
++			{
++				const float ang = rot * 3.141592654f / 180.0f;
++				const float c = (float) cos(ang);
++				const float s = (float) sin(ang);
++				sxc = p.scale * c; syc = p.scale * c;
++				sxs = p.scale * s; sys = p.scale * s;
++			}
++
++			const float tx = -ox * sxc - oy * sys + px;
++			const float ty =  ox * sxs - oy * syc + py;
++
++			const float u0 = (float) (ci % bp.cols) * cw;
++			const float v0 = (float) (ci / bp.cols) * ch;
++
++			static const float lx[4] = { 0, 1, 1, 0 };
++			static const float ly[4] = { 0, 0, 1, 1 };
++
++			float *v = out + (size_t) q * QuadFloats;
++
++			for (int k = 0; k < 4; ++k)
++			{
++				const float x = lx[k] * cw;
++				const float y = ly[k] * ch;
++				v[0] = sxc * x + sys * y + tx;
++				v[1] = -sxs * x + syc * y + ty;
++				v[2] = u0 + x;
++				v[3] = v0 + y;
++				v[4] = p.r;
++				v[5] = p.g;
++				v[6] = p.b;
++				v[7] = alpha;
++				v += VertexFloats;
++			}
++
++			++q;
++		}
++
++		return q;
++	}
++
++	/* StateFields floats per particle, with motion applied (alpha/cell as drawn) */
++	void exportState(float *out) const
++	{
++		for (size_t i = 0; i < parts.size(); ++i)
++		{
++			const Particle &p = parts[i];
++			float *o = out + i * StateFields;
++			o[0] = p.x; o[1] = p.y; o[2] = (float) effectiveCell(p); o[3] = p.scale; o[4] = p.angle;
++			o[5] = effectiveAlpha(p); o[6] = p.r; o[7] = p.g; o[8] = p.b;
++		}
++	}
++
++private:
++	std::vector<Particle> parts;
++};
++
++} // namespace ParticleCore
++
++#endif // PARTICLECORE_H
+diff --git a/src/display/particlelayer.cpp b/src/display/particlelayer.cpp
+new file mode 100644
+index 0000000..84f7a31
+--- /dev/null
++++ b/src/display/particlelayer.cpp
+@@ -0,0 +1,449 @@
++/*
++** particlelayer.cpp
++**
++** Many small cells of one bitmap sheet drawn with a single draw call.
++** GLES2 has no instancing, so every particle becomes one quad of a
++** streamed vertex buffer that shares the global quad index buffer.
++*/
++
++#include "particlelayer.h"
++#include "particlecore.h"
++
++#include "sharedstate.h"
++#include "bitmap.h"
++#include "etc.h"
++#include "etc-internal.h"
++#include "util.h"
++#include "exception.h"
++#include "debugwriter.h"
++
++#include "gl-util.h"
++#include "gl-meta.h"
++#include "quadarray.h"
++#include "shader.h"
++#include "glstate.h"
++
++#include <string.h>
++
++static const char particleVert[] =
++"uniform mat4 projMat;\n"
++"uniform vec2 texSizeInv;\n"
++"uniform vec2 translation;\n"
++"attribute vec2 position;\n"
++"attribute vec2 texCoord;\n"
++"attribute lowp vec4 color;\n"
++"varying vec2 v_texCoord;\n"
++"varying lowp vec4 v_color;\n"
++"void main()\n"
++"{\n"
++"	gl_Position = projMat * vec4(position + translation, 0, 1);\n"
++"	v_texCoord = texCoord * texSizeInv;\n"
++"	v_color = color;\n"
++"}\n";
++
++static const char particleFrag[] =
++"uniform sampler2D texture;\n"
++"uniform lowp vec4 tone;\n"
++"uniform lowp vec4 color;\n"
++"varying vec2 v_texCoord;\n"
++"varying lowp vec4 v_color;\n"
++"const vec3 lumaF = vec3(.299, .587, .114);\n"
++"void main()\n"
++"{\n"
++"	vec4 frag = texture2D(texture, v_texCoord);\n"
++"	frag.rgb *= v_color.rgb;\n"
++"	float luma = dot(frag.rgb, lumaF);\n"
++"	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);\n"
++"	frag.rgb += tone.rgb;\n"
++"	frag.a *= v_color.a;\n"
++"	frag.rgb = mix(frag.rgb, color.rgb, color.a);\n"
++"	gl_FragColor = frag;\n"
++"}\n";
++
++class ParticleShader : public ShaderBase
++{
++public:
++	ParticleShader()
++	{
++		Shader::init((const unsigned char *) particleVert, sizeof(particleVert) - 1,
++		             (const unsigned char *) particleFrag, sizeof(particleFrag) - 1,
++		             "particle", "particle", "ParticleShader");
++
++		ShaderBase::init();
++
++		u_tone = gl.GetUniformLocation(program, "tone");
++		u_color = gl.GetUniformLocation(program, "color");
++	}
++
++	void setTone(const Vec4 &value) { setVec4Uniform(u_tone, value); }
++	void setColor(const Vec4 &value) { setVec4Uniform(u_color, value); }
++
++private:
++	GLint u_tone, u_color;
++};
++
++/* Built on first use so a driver that rejects it only turns particles off */
++static ParticleShader *particleShader;
++static bool particleShaderFailed;
++
++static ParticleShader *getParticleShader()
++{
++	if (particleShader || particleShaderFailed)
++		return particleShader;
++
++	try {
++		particleShader = new ParticleShader();
++	} catch (const Exception &e) {
++		particleShaderFailed = true;
++		Debug() << "ParticleLayer shader unavailable:" << e.msg;
++	}
++
++	return particleShader;
++}
++
++struct ParticleLayerPrivate
++{
++	EtcTemps tmp;
++
++	Bitmap *bitmap;
++
++	NormValue opacity;
++	BlendType blendType;
++	Color *color;
++	Tone *tone;
++
++	float x, y;
++	bool snap;
++	bool smooth;
++
++	int cellW, cellH, cellOX, cellOY;
++
++	ParticleCore::Store store;
++
++	ColorQuadArray qArray;
++	size_t iboQuads;
++	int drawn;
++	bool dirty;
++
++	Scene::Geometry sceneGeo;
++
++	ParticleLayerPrivate()
++	    : bitmap(0),
++	      opacity(255),
++	      blendType(BlendNormal),
++	      color(&tmp.color),
++	      tone(&tmp.tone),
++	      x(0), y(0),
++	      snap(true),
++	      smooth(false),
++	      cellW(0), cellH(0), cellOX(-1), cellOY(-1),
++	      iboQuads(0),
++	      drawn(0),
++	      dirty(true)
++	{
++		sceneGeo.rect = IntRect(0, 0, 0, 0);
++		sceneGeo.orig = Vec2i(0, 0);
++	}
++
++	void rebuild()
++	{
++		dirty = false;
++		drawn = 0;
++
++		if (nullOrDisposed(bitmap) || store.count() == 0)
++			return;
++
++		const int bw = bitmap->width();
++		const int bh = bitmap->height();
++		const int cw = cellW > 0 ? cellW : bw;
++		const int ch = cellH > 0 ? cellH : bh;
++
++		ParticleCore::BuildParams bp;
++		bp.cellW = (float) cw;
++		bp.cellH = (float) ch;
++		bp.originX = (float) (cellOX >= 0 ? cellOX : cw / 2);
++		bp.originY = (float) (cellOY >= 0 ? cellOY : ch / 2);
++		bp.cols = bw / cw;
++		bp.cellCount = bp.cols * (bh / ch);
++		bp.offsetX = x;
++		bp.offsetY = y;
++		bp.alpha = opacity.norm;
++		bp.snap = snap;
++		bp.cull = sceneGeo.rect.w > 0 && sceneGeo.rect.h > 0;
++		bp.cullX0 = (float) sceneGeo.orig.x;
++		bp.cullY0 = (float) sceneGeo.orig.y;
++		bp.cullX1 = (float) (sceneGeo.orig.x + sceneGeo.rect.w);
++		bp.cullY1 = (float) (sceneGeo.orig.y + sceneGeo.rect.h);
++
++		qArray.vertices.resize((size_t) store.count() * 4);
++		drawn = store.build(reinterpret_cast<float *>(dataPtr(qArray.vertices)), bp);
++
++		if (drawn == 0)
++			return;
++
++		/* Re-specifying the whole store each frame lets tiled GPUs
++		 * hand out a fresh buffer instead of waiting on the last frame */
++		VBO::bind(qArray.vbo);
++		VBO::uploadData((GLsizeiptr) drawn * 4 * sizeof(Vertex), dataPtr(qArray.vertices), GL_STREAM_DRAW);
++		VBO::unbind();
++
++		if ((size_t) drawn > iboQuads)
++		{
++			shState->ensureQuadIBO(drawn);
++			iboQuads = drawn;
++		}
++
++		qArray.quadCount = drawn;
++	}
++};
++
++static_assert(sizeof(Vertex) == ParticleCore::VertexFloats * sizeof(float),
++              "ParticleCore writes Vertex as 8 packed floats");
++
++ParticleLayer::ParticleLayer(Viewport *viewport)
++    : ViewportElement(viewport)
++{
++	p = new ParticleLayerPrivate();
++
++	onGeometryChange(scene->getGeometry());
++}
++
++ParticleLayer::~ParticleLayer()
++{
++	dispose();
++}
++
++DEF_ATTR_RD_SIMPLE(ParticleLayer, Bitmap,    Bitmap*, p->bitmap)
++DEF_ATTR_RD_SIMPLE(ParticleLayer, Opacity,   int,     p->opacity.unNorm)
++DEF_ATTR_RD_SIMPLE(ParticleLayer, BlendType, int,     p->blendType)
++DEF_ATTR_RD_SIMPLE(ParticleLayer, X,         float,   p->x)
++DEF_ATTR_RD_SIMPLE(ParticleLayer, Y,         float,   p->y)
++DEF_ATTR_RD_SIMPLE(ParticleLayer, PixelSnap, bool,    p->snap)
++
++DEF_ATTR_SIMPLE(ParticleLayer, Smooth, bool,    p->smooth)
++DEF_ATTR_SIMPLE(ParticleLayer, Color,  Color&, *p->color)
++DEF_ATTR_SIMPLE(ParticleLayer, Tone,   Tone&,  *p->tone)
++
++void ParticleLayer::setBitmap(Bitmap *value)
++{
++	guardDisposed();
++
++	if (value)
++		value->ensureNonMega();
++
++	p->bitmap = value;
++	p->dirty = true;
++}
++
++void ParticleLayer::setOpacity(int value)
++{
++	guardDisposed();
++
++	if (p->opacity.unNorm == clamp(value, 0, 255))
++		return;
++
++	p->opacity = value;
++	p->dirty = true;
++}
++
++void ParticleLayer::setBlendType(int value)
++{
++	guardDisposed();
++
++	switch (value)
++	{
++	default :
++	case BlendNormal :
++		p->blendType = BlendNormal;
++		return;
++	case BlendAddition :
++		p->blendType = BlendAddition;
++		return;
++	case BlendSubstraction :
++		p->blendType = BlendSubstraction;
++		return;
++	}
++}
++
++void ParticleLayer::setX(float value)
++{
++	guardDisposed();
++
++	if (p->x == value || !ParticleCore::finitef(value))
++		return;
++
++	p->x = value;
++	p->dirty = true;
++}
++
++void ParticleLayer::setY(float value)
++{
++	guardDisposed();
++
++	if (p->y == value || !ParticleCore::finitef(value))
++		return;
++
++	p->y = value;
++	p->dirty = true;
++}
++
++void ParticleLayer::setPixelSnap(bool value)
++{
++	guardDisposed();
++
++	p->snap = value;
++	p->dirty = true;
++}
++
++void ParticleLayer::setCell(int w, int h, int ox, int oy)
++{
++	guardDisposed();
++
++	p->cellW = w > 0 ? w : 0;
++	p->cellH = h > 0 ? h : 0;
++	p->cellOX = ox;
++	p->cellOY = oy;
++	p->dirty = true;
++}
++
++int ParticleLayer::getCellWidth() const
++{
++	guardDisposed();
++	return p->cellW;
++}
++
++int ParticleLayer::getCellHeight() const
++{
++	guardDisposed();
++	return p->cellH;
++}
++
++int ParticleLayer::getCellOX() const
++{
++	guardDisposed();
++	return p->cellOX >= 0 ? p->cellOX : p->cellW / 2;
++}
++
++int ParticleLayer::getCellOY() const
++{
++	guardDisposed();
++	return p->cellOY >= 0 ? p->cellOY : p->cellH / 2;
++}
++
++int ParticleLayer::setParticles(const float *state, int stateStride,
++                                const float *motion, int motionStride, int n)
++{
++	guardDisposed();
++
++	p->dirty = true;
++	return p->store.load(state, stateStride, motion, motionStride, n, false);
++}
++
++int ParticleLayer::addParticles(const float *state, int stateStride,
++                                const float *motion, int motionStride, int n)
++{
++	guardDisposed();
++
++	p->dirty = true;
++	return p->store.load(state, stateStride, motion, motionStride, n, true);
++}
++
++void ParticleLayer::clearParticles()
++{
++	guardDisposed();
++
++	p->store.clear();
++	p->dirty = true;
++}
++
++int ParticleLayer::update(float frames)
++{
++	guardDisposed();
++
++	p->dirty = true;
++	return p->store.update(frames);
++}
++
++int ParticleLayer::getCount() const
++{
++	guardDisposed();
++	return p->store.count();
++}
++
++int ParticleLayer::getDrawnCount() const
++{
++	guardDisposed();
++	return p->drawn;
++}
++
++void ParticleLayer::exportParticles(float *out) const
++{
++	guardDisposed();
++	p->store.exportState(out);
++}
++
++void ParticleLayer::initDynAttribs()
++{
++	p->color = new Color;
++	p->tone = new Tone;
++}
++
++bool ParticleLayer::available()
++{
++	return getParticleShader() != 0;
++}
++
++void ParticleLayer::draw()
++{
++	if (nullOrDisposed(p->bitmap) || !p->opacity || p->store.count() == 0)
++		return;
++
++	ParticleShader *shader = getParticleShader();
++	if (!shader)
++		return;
++
++	if (p->dirty)
++		p->rebuild();
++
++	if (p->drawn == 0)
++		return;
++
++	shader->bind();
++	shader->applyViewportProj();
++	shader->setTranslation(p->sceneGeo.offset());
++	shader->setTone(p->tone->norm);
++	shader->setColor(p->color->norm);
++
++	glState.blendMode.pushSet(p->blendType);
++
++	p->bitmap->bindTex(*shader);
++
++	if (p->smooth)
++	{
++		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++	}
++
++	p->qArray.draw(0, p->drawn);
++
++	if (p->smooth)
++	{
++		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++	}
++
++	glState.blendMode.pop();
++}
++
++void ParticleLayer::onGeometryChange(const Scene::Geometry &geo)
++{
++	p->sceneGeo = geo;
++	p->dirty = true;
++}
++
++void ParticleLayer::releaseResources()
++{
++	unlink();
++
++	delete p;
++}
+diff --git a/src/display/particlelayer.h b/src/display/particlelayer.h
+new file mode 100644
+index 0000000..4e12384
+--- /dev/null
++++ b/src/display/particlelayer.h
+@@ -0,0 +1,71 @@
++/*
++** particlelayer.h
++**
++** Many small cells of one bitmap sheet drawn with a single draw call.
++*/
++
++#ifndef PARTICLELAYER_H
++#define PARTICLELAYER_H
++
++#include "disposable.h"
++#include "viewport.h"
++
++class Bitmap;
++struct Color;
++struct Tone;
++
++struct ParticleLayerPrivate;
++
++class ParticleLayer : public ViewportElement, public Disposable
++{
++public:
++	enum { MaxParticles = 4096, StateFields = 9, MotionFields = 12 };
++
++	ParticleLayer(Viewport *viewport = 0);
++	~ParticleLayer();
++
++	DECL_ATTR( Bitmap,    Bitmap* )
++	DECL_ATTR( Opacity,   int     )
++	DECL_ATTR( BlendType, int     )
++	DECL_ATTR( X,         float   )
++	DECL_ATTR( Y,         float   )
++	DECL_ATTR( PixelSnap, bool    )
++	DECL_ATTR( Smooth,    bool    )
++	DECL_ATTR( Color,     Color&  )
++	DECL_ATTR( Tone,      Tone&   )
++
++	void setCell(int w, int h, int ox, int oy);
++	int getCellWidth() const;
++	int getCellHeight() const;
++	int getCellOX() const;
++	int getCellOY() const;
++
++	/* state: n * stateStride floats, motion: n * motionStride floats or null */
++	int setParticles(const float *state, int stateStride,
++	                 const float *motion, int motionStride, int n);
++	int addParticles(const float *state, int stateStride,
++	                 const float *motion, int motionStride, int n);
++	void clearParticles();
++	int update(float frames);
++	int getCount() const;
++	int getDrawnCount() const;
++	/* StateFields floats per particle */
++	void exportParticles(float *out) const;
++
++	void initDynAttribs();
++
++	static bool available();
++
++private:
++	ParticleLayerPrivate *p;
++
++	void draw();
++	void onGeometryChange(const Scene::Geometry &);
++
++	void releaseResources();
++	const char *klassName() const { return "particle layer"; }
++
++	ABOUT_TO_ACCESS_DISP
++};
++
++#endif // PARTICLELAYER_H
+diff --git a/src/meson.build b/src/meson.build
+index 4ce97ae..4eec066 100755
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -145,6 +145,7 @@ main_source = files(
+     'display/viewport.cpp',
+     'display/window.cpp',
+     'display/windowvx.cpp',
++    'display/particlelayer.cpp',
+ 
+     'display/libnsgif/libnsgif.c',
+     'display/libnsgif/lzw.c',

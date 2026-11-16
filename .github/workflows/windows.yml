@@ -90,6 +90,14 @@ jobs:
           git apply ../patchrepo/windows-engine/sprite-material.patch
           git diff --stat
 
+      - name: Apply particle layer patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/particles.patch
+          git apply ../patchrepo/windows-engine/particles.patch
+          git diff --stat
+
       - name: Apply ARC preload patch
         shell: bash
         run: |

@@ -64,6 +64,7 @@ LOCAL_SRC_FILES := \
 	$(LOCAL_PATH)/src/display/autotilesvx.cpp \
 	$(LOCAL_PATH)/src/display/window.cpp \
 	$(LOCAL_PATH)/src/display/windowvx.cpp \
+	$(LOCAL_PATH)/src/display/particlelayer.cpp \
 	$(LOCAL_PATH)/src/display/gl/gl-fun.cpp \
 	$(LOCAL_PATH)/src/display/gl/gl-meta.cpp \
 	$(LOCAL_PATH)/src/display/gl/gl-debug.cpp \
@@ -104,6 +105,7 @@ LOCAL_SRC_FILES := \
 	$(LOCAL_PATH)/binding/viewport-binding.cpp \
 	$(LOCAL_PATH)/binding/window-binding.cpp \
 	$(LOCAL_PATH)/binding/windowvx-binding.cpp \
+	$(LOCAL_PATH)/binding/particlelayer-binding.cpp \
 	$(LOCAL_PATH)/binding/android-binding.cpp \
 	$(LOCAL_PATH)/binding/cusl-binding.cpp \
 	$(LOCAL_PATH)/binding/http-binding.cpp \

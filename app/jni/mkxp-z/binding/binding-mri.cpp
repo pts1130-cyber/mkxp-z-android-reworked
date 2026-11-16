@@ -98,6 +98,7 @@ void audioBindingInit();
 void graphicsBindingInit();
 
 void fileIntBindingInit();
+void particleLayerBindingInit();
 
 #ifdef MKXPZ_BUILD_ANDROID
 void androidBindingInit();
@@ -187,6 +188,7 @@ static void mriBindingInit()
 	graphicsBindingInit();
 
 	fileIntBindingInit();
+	particleLayerBindingInit();
 
 #ifdef MKXPZ_BUILD_ANDROID
 	androidBindingInit();
