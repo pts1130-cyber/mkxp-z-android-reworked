@@ -647,6 +647,8 @@ SpriteMaterialShader::SpriteMaterialShader()
 	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
 	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
 	u_materialP[4] = gl.GetUniformLocation(program, "materialP4");
+	GET_U(scrMat);
+	GET_U(scrMatOn);
 }
 
 void SpriteMaterialShader::setSpriteMat(const float value[16])
@@ -769,6 +771,13 @@ void SpriteMaterialShader::setParams(const float value[20])
 {
 	for (int i = 0; i < 5; ++i)
 		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
+}
+
+void SpriteMaterialShader::setScreenMat(const float *value)
+{
+	if (value)
+		gl.UniformMatrix4fv(u_scrMat, 1, GL_FALSE, value);
+	gl.Uniform1i(u_scrMatOn, value != 0);
 }
 
 

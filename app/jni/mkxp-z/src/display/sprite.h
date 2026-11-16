@@ -98,6 +98,9 @@ public:
 	void setMeshUVOffsets(const float *values, int count);
 	bool hasMeshUVOffsets() const;
 	float getMeshOffset(int index, bool uv) const;
+	enum { MeshMaxDot = 4 };
+	void setMeshDot(int value);
+	int getMeshDot() const;
 
 	void initDynAttribs();
 

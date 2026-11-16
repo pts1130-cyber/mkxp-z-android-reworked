@@ -1,5 +1,5 @@
 diff --git a/binding/sprite-binding.cpp b/binding/sprite-binding.cpp
-index 4befb70..7923ae9 100644
+index 4befb70..85a3f3a 100644
 --- a/binding/sprite-binding.cpp
 +++ b/binding/sprite-binding.cpp
 @@ -29,6 +29,9 @@
@@ -12,7 +12,7 @@ index 4befb70..7923ae9 100644
  #if RAPI_FULL > 187
  DEF_TYPE(Sprite);
  #else
-@@ -136,6 +139,119 @@ RB_METHOD_GUARD(spriteSetMaterialParams) {
+@@ -136,6 +139,143 @@ RB_METHOD_GUARD(spriteSetMaterialParams) {
  }
  RB_METHOD_GUARD_END
  
@@ -129,10 +129,34 @@ index 4befb70..7923ae9 100644
 +}
 +RB_METHOD_GUARD_END
 +
++RB_METHOD_GUARD(spriteGetMeshDot) {
++    RB_UNUSED_PARAM;
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    int value = 0;
++    GFX_GUARD_EXC(value = s->getMeshDot();)
++    
++    return INT2FIX(value);
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(spriteSetMeshDot) {
++    rb_check_argc(argc, 1);
++    
++    Sprite *s = getPrivateData<Sprite>(self);
++    
++    int value = NIL_P(argv[0]) ? 0 : NUM2INT(argv[0]);
++    GFX_GUARD_EXC(s->setMeshDot(value);)
++    
++    return argv[0];
++}
++RB_METHOD_GUARD_END
++
  RB_METHOD_GUARD(spriteWidth) {
      RB_UNUSED_PARAM;
      
-@@ -216,6 +332,13 @@ void spriteBindingInit() {
+@@ -216,6 +356,16 @@ void spriteBindingInit() {
      _rb_define_method(klass, "material_params=", spriteSetMaterialParams);
      rb_define_singleton_method(klass, "material_available?", RUBY_METHOD_FUNC(spriteMaterialAvailable), -1);
      
@@ -141,17 +165,87 @@ index 4befb70..7923ae9 100644
 +    _rb_define_method(klass, "mesh_offsets=", spriteSetMeshOffsets);
 +    _rb_define_method(klass, "mesh_uv_offsets", spriteGetMeshUVOffsets);
 +    _rb_define_method(klass, "mesh_uv_offsets=", spriteSetMeshUVOffsets);
++    _rb_define_method(klass, "mesh_dot", spriteGetMeshDot);
++    _rb_define_method(klass, "mesh_dot=", spriteSetMeshDot);
 +    rb_define_const(klass, "MESH_MAX_CELLS", INT2FIX(Sprite::MeshMaxCells));
++    rb_define_const(klass, "MESH_MAX_DOT", INT2FIX(Sprite::MeshMaxDot));
 +    
      INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
      INIT_PROP_BIND(Sprite, WaveLength, "wave_length");
      INIT_PROP_BIND(Sprite, WaveSpeed, "wave_speed");
+diff --git a/shader/spriteMaterial.vert b/shader/spriteMaterial.vert
+index 8af4321..dffc668 100644
+--- a/shader/spriteMaterial.vert
++++ b/shader/spriteMaterial.vert
+@@ -13,6 +13,10 @@ uniform bool patternTile;
+ /* xy: scale, zw: offset (texture pixel -> map uv) */
+ uniform vec4 materialXform;
+ 
++/* Clip position on screen when the sprite is drawn off-screen first */
++uniform mat4 scrMat;
++uniform bool scrMatOn;
++
+ attribute vec2 position;
+ attribute vec2 texCoord;
+ 
+@@ -27,7 +31,8 @@ void main()
+ 
+ 	v_texCoord = texCoord * texSizeInv;
+ 	v_matCoord = texCoord * materialXform.xy + materialXform.zw;
+-	v_scrCoord = gl_Position.xy * 0.5 + 0.5;
++	vec4 scr = scrMatOn ? scrMat * vec4(position, 0, 1) : gl_Position;
++	v_scrCoord = scr.xy * 0.5 + 0.5;
+ 
+ 	v_patCoord = vec2(0.0);
+ 	if (renderPattern) {
+diff --git a/src/display/gl/shader.cpp b/src/display/gl/shader.cpp
+index 2518513..aeea1ae 100644
+--- a/src/display/gl/shader.cpp
++++ b/src/display/gl/shader.cpp
+@@ -752,6 +752,8 @@ SpriteMaterialShader::SpriteMaterialShader()
+ 	u_materialP[2] = gl.GetUniformLocation(program, "materialP2");
+ 	u_materialP[3] = gl.GetUniformLocation(program, "materialP3");
+ 	u_materialP[4] = gl.GetUniformLocation(program, "materialP4");
++	GET_U(scrMat);
++	GET_U(scrMatOn);
+ }
+ 
+ void SpriteMaterialShader::setSpriteMat(const float value[16])
+@@ -879,6 +881,13 @@ void SpriteMaterialShader::setParams(const float value[20])
+ 		gl.Uniform4f(u_materialP[i], value[i*4], value[i*4+1], value[i*4+2], value[i*4+3]);
+ }
+ 
++void SpriteMaterialShader::setScreenMat(const float *value)
++{
++	if (value)
++		gl.UniformMatrix4fv(u_scrMat, 1, GL_FALSE, value);
++	gl.Uniform1i(u_scrMatOn, value != 0);
++}
++
+ 
+ ARCPostShader::ARCPostShader()
+ {
+diff --git a/src/display/gl/shader.h b/src/display/gl/shader.h
+index b5f358d..d8ec5b2 100644
+--- a/src/display/gl/shader.h
++++ b/src/display/gl/shader.h
+@@ -251,8 +251,10 @@ public:
+ 	void setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled);
+ 	void setMirror(bool value);
+ 	void setParams(const float value[20]);
++	void setScreenMat(const float *value);
+ 
+ private:
++	GLint u_scrMat, u_scrMatOn;
+ 	GLint u_spriteMat, u_tone, u_opacity, u_color,
+     u_bushY, u_bushUnder, u_bushSlope, u_bushIntercept, u_bushOpacity, u_pattern, u_renderPattern,
+     u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
 diff --git a/src/display/meshwarp.h b/src/display/meshwarp.h
 new file mode 100644
-index 0000000..7e816c9
+index 0000000..ba67b49
 --- /dev/null
 +++ b/src/display/meshwarp.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,341 @@
 +/*
 + ** meshwarp.h
 + **
@@ -282,6 +376,46 @@ index 0000000..7e816c9
 +                }
 +    }
 +
++    static int padQuadCount(int c, int r) { return 2 * (c + r) + 4; }
++
++    /* After build(): a ring of quads `pad` picture pixels wide around the
++     * warped edge, so a user shader with shader_pad can draw outside the
++     * src_rect. Its texture side lies outside the src_rect (read as clear). */
++    template<class V>
++    void buildPad(V *vert, float pad, bool mirrored,
++                  float texScaleX, float texScaleY) const
++    {
++        const int vc = cols + 1;
++        auto put = [&](const float *g, int ux, int uy)
++        {
++            vert->pos.x = g[0] + (float) (mirrored ? -ux : ux) * pad;
++            vert->pos.y = g[1] + (float) uy * pad;
++            vert->texPos.x = g[2] + (float) ux * pad * texScaleX;
++            vert->texPos.y = g[3] + (float) uy * pad * texScaleY;
++            ++vert;
++        };
++        for (int i = 0; i < cols; ++i)
++        {
++            const float *a = &grid[i * 4], *b = &grid[(i + 1) * 4];
++            put(a, 0, -1); put(b, 0, -1); put(b, 0, 0); put(a, 0, 0);
++            a = &grid[(rows * vc + i) * 4]; b = &grid[(rows * vc + i + 1) * 4];
++            put(a, 0, 0); put(b, 0, 0); put(b, 0, 1); put(a, 0, 1);
++        }
++        for (int j = 0; j < rows; ++j)
++        {
++            const float *a = &grid[(j * vc) * 4], *b = &grid[((j + 1) * vc) * 4];
++            put(a, -1, 0); put(a, 0, 0); put(b, 0, 0); put(b, -1, 0);
++            a = &grid[(j * vc + cols) * 4]; b = &grid[((j + 1) * vc + cols) * 4];
++            put(a, 0, 0); put(a, 1, 0); put(b, 1, 0); put(b, 0, 0);
++        }
++        const float *tl = &grid[0], *tr = &grid[cols * 4];
++        const float *bl = &grid[(rows * vc) * 4], *br = &grid[(rows * vc + cols) * 4];
++        put(tl, -1, -1); put(tl, 0, -1); put(tl, 0, 0); put(tl, -1, 0);
++        put(tr, 0, -1); put(tr, 1, -1); put(tr, 1, 0); put(tr, 0, 0);
++        put(br, 0, 0); put(br, 1, 0); put(br, 1, 1); put(br, 0, 1);
++        put(bl, -1, 0); put(bl, 0, 0); put(bl, 0, 1); put(bl, -1, 1);
++    }
++
 +private:
 +    mutable std::vector<float> grid;
 +
@@ -323,46 +457,185 @@ index 0000000..7e816c9
 +    }
 +};
 +
++/* Dot mode (mesh_dot = k): the mesh is drawn into an off-screen target
++ * where one pixel is one dot (k bitmap pixels), and that target is then
++ * drawn k times larger with nearest sampling, so dots stay square. */
++struct MeshDot
++{
++    enum { MaxDot = 4 };
++
++    /* Target area in dots, on the dot grid of the src_rect */
++    int x0, y0, w, h;
++
++    MeshDot()
++    : x0(0), y0(0), w(0), h(0)
++    {}
++
++    /* Holds every vertex position, at most one src_rect size beyond each
++     * side and maxDots across */
++    template<class V>
++    void fit(const V *vert, size_t count, int k, float sw, float sh, int maxDots)
++    {
++        float minx = 0.f, miny = 0.f, maxx = sw, maxy = sh;
++        if (count > 0)
++        {
++            minx = maxx = vert[0].pos.x;
++            miny = maxy = vert[0].pos.y;
++        }
++        for (size_t i = 1; i < count; ++i)
++        {
++            const float x = vert[i].pos.x, y = vert[i].pos.y;
++            if (x < minx) minx = x;
++            if (x > maxx) maxx = x;
++            if (y < miny) miny = y;
++            if (y > maxy) maxy = y;
++        }
++        minx = minx < -sw ? -sw : minx;
++        miny = miny < -sh ? -sh : miny;
++        maxx = maxx > 2.f * sw ? 2.f * sw : maxx;
++        maxy = maxy > 2.f * sh ? 2.f * sh : maxy;
++
++        x0 = floorDiv(minx, k);
++        y0 = floorDiv(miny, k);
++        w = ceilDiv(maxx, k) - x0;
++        h = ceilDiv(maxy, k) - y0;
++        w = w < 1 ? 1 : (w > maxDots ? maxDots : w);
++        h = h < 1 ? 1 : (h > maxDots ? maxDots : h);
++    }
++
++    /* picture pixels -> target pixels */
++    void targetMatrix(float m[16], int k) const
++    {
++        identity(m);
++        m[0] = m[5] = 1.f / (float) k;
++        m[12] = (float) -x0;
++        m[13] = (float) -y0;
++    }
++
++    /* Second pass quad: position in sprite space (x, y, w, h) and
++     * texture rect in target pixels, mirrored like the plain quad */
++    void posRect(float r[4], int k, float sw, bool mirrored) const
++    {
++        const float px0 = (float) (x0 * k), px1 = (float) ((x0 + w) * k);
++        r[0] = mirrored ? sw - px1 : px0;
++        r[1] = (float) (y0 * k);
++        r[2] = px1 - px0;
++        r[3] = (float) (h * k);
++    }
++
++    void texRect(float r[4], bool mirrored) const
++    {
++        r[0] = mirrored ? (float) w : 0.f;
++        r[1] = 0.f;
++        r[2] = mirrored ? (float) -w : (float) w;
++        r[3] = (float) h;
++    }
++
++    /* Clip position of a picture point once drawn: proj * sprite * mirror */
++    static void screenMatrix(float out[16], int vpW, int vpH, const float sprite[16],
++                             float sw, bool mirrored)
++    {
++        float proj[16], mir[16], tmp[16];
++        identity(proj);
++        proj[0] = 2.f / vpW;
++        proj[5] = 2.f / vpH;
++        proj[10] = -2.f;
++        proj[12] = proj[13] = proj[14] = -1.f;
++        identity(mir);
++        if (mirrored)
++        {
++            mir[0] = -1.f;
++            mir[12] = sw;
++        }
++        mul(tmp, sprite, mir);
++        mul(out, proj, tmp);
++    }
++
++private:
++    static int floorDiv(float v, int k)
++    {
++        const float q = v / (float) k;
++        int i = (int) q;
++        return ((float) i > q) ? i - 1 : i;
++    }
++
++    static int ceilDiv(float v, int k)
++    {
++        const float q = v / (float) k;
++        int i = (int) q;
++        return ((float) i < q) ? i + 1 : i;
++    }
++
++    static void identity(float m[16])
++    {
++        for (int i = 0; i < 16; ++i)
++            m[i] = (i % 5 == 0) ? 1.f : 0.f;
++    }
++
++    /* column-major out = a * b */
++    static void mul(float out[16], const float a[16], const float b[16])
++    {
++        for (int c = 0; c < 4; ++c)
++            for (int r = 0; r < 4; ++r)
++            {
++                float v = 0.f;
++                for (int i = 0; i < 4; ++i)
++                    v += a[i * 4 + r] * b[c * 4 + i];
++                out[c * 4 + r] = v;
++            }
++    }
++};
++
 +#endif // MESHWARP_H
 diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
-index 1a9f494..b681c76 100644
+index 1a9f494..c466ca4 100644
 --- a/src/display/sprite.cpp
 +++ b/src/display/sprite.cpp
-@@ -37,6 +37,7 @@
+@@ -37,6 +37,9 @@
  #include "exception.h"
  #include "glstate.h"
  #include "quadarray.h"
 +#include "meshwarp.h"
++
++#include <algorithm>
  
  #include <math.h>
  #ifndef M_PI
-@@ -123,6 +124,9 @@ struct SpritePrivate
+@@ -123,6 +126,14 @@ struct SpritePrivate
          SimpleQuadArray qArray;
      } wave;
      
 +    MeshWarp mesh;
 +    SimpleQuadArray *meshArray;
++    int meshDot;
++    MeshDot dotArea;
++    TEXFBO dotTex;
++    Quad *dotQuad;
++    float dotMat[16];
 +    
      EtcTemps tmp;
      
      sigslot::connection prepareCon;
-@@ -152,6 +156,7 @@ struct SpritePrivate
+@@ -152,6 +163,9 @@ struct SpritePrivate
      materialRamp(0),
      materialMode(0),
      materialRect(&materialRectTmp),
 +    meshArray(0),
++    meshDot(0),
++    dotQuad(0),
      isVisible(false),
      color(&tmp.color),
      tone(&tmp.tone)
-@@ -179,6 +184,7 @@ struct SpritePrivate
+@@ -179,6 +193,8 @@ struct SpritePrivate
      {
          srcRectCon.disconnect();
          prepareCon.disconnect();
++        releaseDot();
 +        delete meshArray;
          
          bitmapDisposal();
      }
-@@ -340,6 +346,7 @@ struct SpritePrivate
+@@ -340,6 +356,7 @@ struct SpritePrivate
          quad.setPosRect(FloatRect(0, 0, rect.w, rect.h));
          bushDirty = true;
          padDirty = true;
@@ -370,11 +643,11 @@ index 1a9f494..b681c76 100644
          
          if (wave.active)
              wave.dirty = true;
-@@ -364,6 +371,12 @@ struct SpritePrivate
+@@ -364,6 +381,12 @@ struct SpritePrivate
          if (!opacity)
              return;
          
-+        if (mesh.deforms())
++        if (meshDrawn())
 +        {
 +            isVisible = true;
 +            return;
@@ -383,10 +656,103 @@ index 1a9f494..b681c76 100644
          if (wave.active)
          {
              /* Don't do expensive wave bounding box
-@@ -587,6 +600,26 @@ struct SpritePrivate
+@@ -587,6 +610,142 @@ struct SpritePrivate
          padQuad.draw();
      }
  
++    bool dotActive() const
++    {
++        return meshDot > 0 && mesh.active();
++    }
++    
++    bool meshDrawn() const
++    {
++        return mesh.deforms() || dotActive();
++    }
++    
++    void releaseDot()
++    {
++        if (dotTex.tex != TEX::ID(0))
++            TEXFBO::fini(dotTex);
++        dotTex = TEXFBO();
++        delete dotQuad;
++        dotQuad = 0;
++    }
++    
++    /* First pass target: grows only, cleared every draw */
++    GLint beginDot()
++    {
++        GLint prev = 0;
++        gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
++        
++        if (dotTex.tex == TEX::ID(0))
++        {
++            TEXFBO::init(dotTex);
++            TEXFBO::allocEmpty(dotTex, dotArea.w, dotArea.h);
++            TEXFBO::linkFBO(dotTex);
++        }
++        else if (dotArea.w > dotTex.width || dotArea.h > dotTex.height)
++        {
++            TEXFBO::allocEmpty(dotTex, std::max(dotArea.w, dotTex.width),
++                               std::max(dotArea.h, dotTex.height));
++        }
++        
++        FBO::bind(dotTex.fbo);
++        glState.viewport.pushSet(IntRect(0, 0, dotTex.width, dotTex.height));
++        glState.scissorTest.pushSet(false);
++        glState.blend.pushSet(false);
++        glState.clearColor.pushSet(Vec4());
++        FBO::clear();
++        glState.clearColor.pop();
++        
++        return prev;
++    }
++    
++    void endDot(GLint prev)
++    {
++        glState.blend.pop();
++        glState.scissorTest.pop();
++        glState.viewport.pop();
++        gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint) prev);
++    }
++    
++    /* Second pass: the dot target k times larger, nearest, with the
++     * sprite's transform, opacity and blend type */
++    void drawDot()
++    {
++        ShaderBase *base;
++        
++        if (opacity != 255)
++        {
++            AlphaSpriteShader &shader = shState->shaders().alphaSprite;
++            shader.bind();
++            shader.setSpriteMat(trans.getMatrix());
++            shader.setAlpha(opacity.norm);
++            shader.applyViewportProj();
++            base = &shader;
++        }
++        else
++        {
++            SimpleSpriteShader &shader = shState->shaders().simpleSprite;
++            shader.bind();
++            shader.setSpriteMat(trans.getMatrix());
++            shader.applyViewportProj();
++            base = &shader;
++        }
++        
++        glState.blendMode.pushSet(blendType);
++        TEX::bind(dotTex.tex);
++        base->setTexSize(Vec2i(dotTex.width, dotTex.height));
++        dotQuad->draw();
++        glState.blendMode.pop();
++    }
++    
++    /* shader_pad of a working user shader widens the mesh by a ring */
++    int meshPad() const
++    {
++        return (shader && shader->ok()) ? shaderPad : 0;
++    }
++    
 +    void updateMesh()
 +    {
 +        mesh.dirty = false;
@@ -402,25 +768,65 @@ index 1a9f494..b681c76 100644
 +        }
 +        
 +        const FloatRect &r = adjustedSrcRect;
-+        meshArray->resize(mesh.quadCount());
-+        mesh.build(dataPtr(meshArray->vertices), r.x, r.y, r.w, r.h, mirrored, tsx, tsy);
++        const int pad = meshPad();
++        const bool flip = mirrored && !dotActive();
++        meshArray->resize(mesh.quadCount() + (pad ? MeshWarp::padQuadCount(mesh.cols, mesh.rows) : 0));
++        mesh.build(dataPtr(meshArray->vertices), r.x, r.y, r.w, r.h, flip, tsx, tsy);
++        if (pad)
++            mesh.buildPad(dataPtr(meshArray->vertices) + mesh.quadCount() * 4, (float) pad, flip, tsx, tsy);
 +        meshArray->commit();
++        
++        if (dotActive())
++            updateDotQuad(r.w, r.h);
++    }
++    
++    void updateDotQuad(float sw, float sh)
++    {
++        dotArea.fit(dataPtr(meshArray->vertices), meshArray->vertices.size(),
++                    meshDot, sw, sh, glState.caps.maxTexSize);
++        dotArea.targetMatrix(dotMat, meshDot);
++        
++        float pr[4], tr[4];
++        dotArea.posRect(pr, meshDot, sw, mirrored);
++        dotArea.texRect(tr, mirrored);
++        
++        if (!dotQuad)
++            dotQuad = new Quad;
++        dotQuad->setTexPosRect(FloatRect(tr[0], tr[1], tr[2], tr[3]),
++                               FloatRect(pr[0], pr[1], pr[2], pr[3]));
 +    }
 +    
      void prepare()
      {
          if (wave.dirty)
-@@ -594,6 +627,9 @@ struct SpritePrivate
+@@ -594,6 +753,9 @@ struct SpritePrivate
              updateWave();
          }
          
-+        if (mesh.deforms() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
++        if (meshDrawn() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
 +            updateMesh();
 +        
          updateVisibility();
          
          if (isVisible && bushDirty)
-@@ -711,6 +747,57 @@ void Sprite::setMaterialParams(const float *values, int count)
+@@ -655,6 +817,8 @@ void Sprite::setShader(ARCShader *value)
+     if (value && value->kind() != ARCShader::KindSprite)
+         throw Exception(Exception::ArgumentError, "Sprite#shader needs an ARCShader::SPRITE shader");
+ 
++    if (p->shader != value)
++        p->mesh.dirty = true;
+     p->shader = value;
+ }
+ 
+@@ -668,6 +832,7 @@ void Sprite::setShaderPad(int value)
+ 
+     p->shaderPad = value;
+     p->padDirty = true;
++    p->mesh.dirty = true;
+ }
+ DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
+ DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
+@@ -711,6 +876,78 @@ void Sprite::setMaterialParams(const float *values, int count)
          p->materialParams[i] = (i < count) ? values[i] : 0.f;
  }
  
@@ -428,6 +834,27 @@ index 1a9f494..b681c76 100644
 +{
 +    guardDisposed();
 +    p->mesh.setGrid(cols, rows);
++    if (!p->mesh.active())
++        p->releaseDot();
++}
++
++void Sprite::setMeshDot(int value)
++{
++    guardDisposed();
++    value = clamp(value, 0, (int) MeshDot::MaxDot);
++    if (p->meshDot == value)
++        return;
++    
++    p->meshDot = value;
++    if (value == 0)
++        p->releaseDot();
++    p->mesh.dirty = true;
++}
++
++int Sprite::getMeshDot() const
++{
++    guardDisposed();
++    return p->meshDot;
 +}
 +
 +int Sprite::getMeshCols() const
@@ -478,7 +905,142 @@ index 1a9f494..b681c76 100644
  void Sprite::setBitmap(Bitmap *bitmap)
  {
      guardDisposed();
-@@ -1272,7 +1359,13 @@ void Sprite::draw()
+@@ -1059,6 +1296,26 @@ void Sprite::draw()
+ 
+     bool useMaterial = (p->materialMode == 3 ||
+     (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
++    
++    const bool dot = p->dotActive() && p->meshArray && p->dotQuad;
++    const float *spriteMat = p->trans.getMatrix();
++    float opacity = p->opacity.norm;
++    
++    Vec2 backInv;
++    bool back = useMaterial && p->materialMode == 2 && p->materialParams[15] > 0.f &&
++    grabMaterialBackdrop(backInv);
++    
++    float screenMat[16];
++    GLint screenFbo = 0;
++    if (dot)
++    {
++        const IntRect &vp = glState.viewport.get();
++        MeshDot::screenMatrix(screenMat, vp.w, vp.h, spriteMat, p->adjustedSrcRect.w, p->mirrored);
++        screenFbo = p->beginDot();
++        spriteMat = p->dotMat;
++        opacity = 1.f;
++        scalingMethod = NearestNeighbor;
++    }
+ 
+     /* A user shader that cannot combine with the material is left out */
+     SpriteMaterialShader *userMaterial = (useMaterial && user) ? user->materialShader() : 0;
+@@ -1074,15 +1331,12 @@ void Sprite::draw()
+         scalingMethod = NearestNeighbor;
+         const float *mp = p->materialParams;
+ 
+-        Vec2 backInv;
+-        bool back = p->materialMode == 2 && mp[15] > 0.f && grabMaterialBackdrop(backInv);
+-
+         shader.bind();
+         shader.applyViewportProj();
+-        shader.setSpriteMat(p->trans.getMatrix());
++        shader.setSpriteMat(spriteMat);
+ 
+         shader.setTone(p->tone->norm);
+-        shader.setOpacity(p->opacity.norm);
++        shader.setOpacity(opacity);
+         shader.setBushDepth(p->bushY, p->bushUnder, p->bushSlope, p->bushIntercept);
+         shader.setBushOpacity(p->bushOpacity.norm);
+ 
+@@ -1133,6 +1387,7 @@ void Sprite::draw()
+         bool ramp = !nullOrDisposed(p->materialRamp);
+         shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
+         shader.setBack(materialBackTex, backInv, back);
++        shader.setScreenMat((dot && back) ? screenMat : 0);
+ 
+         if (user)
+             p->applyUser(user, shader);
+@@ -1151,10 +1406,10 @@ void Sprite::draw()
+         
+         shader.bind();
+         shader.applyViewportProj();
+-        shader.setSpriteMat(p->trans.getMatrix());
++        shader.setSpriteMat(spriteMat);
+         
+         shader.setTone(p->tone->norm);
+-        shader.setOpacity(p->opacity.norm);
++        shader.setOpacity(opacity);
+         shader.setBushDepth(p->bushY, p->bushUnder, p->bushSlope, p->bushIntercept);
+         shader.setBushOpacity(p->bushOpacity.norm);
+         
+@@ -1189,7 +1444,7 @@ void Sprite::draw()
+         
+         base = &shader;
+     }
+-    else if (p->opacity != 255)
++    else if (!dot && p->opacity != 255)
+     {
+         if (scalingMethod != NearestNeighbor)
+         {
+@@ -1200,7 +1455,7 @@ void Sprite::draw()
+         AlphaSpriteShader &shader = shState->shaders().alphaSprite;
+         shader.bind();
+         
+-        shader.setSpriteMat(p->trans.getMatrix());
++        shader.setSpriteMat(spriteMat);
+         shader.setAlpha(p->opacity.norm);
+         shader.applyViewportProj();
+         base = &shader;
+@@ -1216,7 +1471,7 @@ void Sprite::draw()
+ 
+             shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
+             shader.setSharpness(shState->config().bicubicSharpness);
+-            shader.setSpriteMat(p->trans.getMatrix());
++            shader.setSpriteMat(spriteMat);
+             shader.applyViewportProj();
+             base = &shader;
+         }
+@@ -1227,7 +1482,7 @@ void Sprite::draw()
+             shader.bind();
+             
+             shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
+-            shader.setSpriteMat(p->trans.getMatrix());
++            shader.setSpriteMat(spriteMat);
+             shader.applyViewportProj();
+             base = &shader;
+         }
+@@ -1240,7 +1495,7 @@ void Sprite::draw()
+ 
+             shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
+             shader.setTargetScale(Vec2((float)(shState->config().xbrzScalingFactor), (float)(shState->config().xbrzScalingFactor)));
+-            shader.setSpriteMat(p->trans.getMatrix());
++            shader.setSpriteMat(spriteMat);
+             shader.applyViewportProj();
+             base = &shader;
+         }
+@@ -1251,13 +1506,22 @@ void Sprite::draw()
+             SimpleSpriteShader &shader = shState->shaders().simpleSprite;
+             shader.bind();
+ 
+-            shader.setSpriteMat(p->trans.getMatrix());
++            shader.setSpriteMat(spriteMat);
+             shader.applyViewportProj();
+             base = &shader;
+         }
+         }        
+     }
+     
++    if (dot)
++    {
++        p->bitmap->bindTex(*base, false);
++        p->meshArray->draw();
++        p->endDot(screenFbo);
++        p->drawDot();
++        return;
++    }
++    
+     glState.blendMode.pushSet(p->blendType);
+     
+     p->bitmap->bindTex(*base, false);
+@@ -1272,7 +1536,13 @@ void Sprite::draw()
      
      TEX::setSmooth(scalingMethod == Bilinear);
  
@@ -494,10 +1056,10 @@ index 1a9f494..b681c76 100644
      else if (user && p->shaderPad > 0)
          p->drawPadded();
 diff --git a/src/display/sprite.h b/src/display/sprite.h
-index 86aa9d9..85f0a2e 100644
+index 86aa9d9..61cfa87 100644
 --- a/src/display/sprite.h
 +++ b/src/display/sprite.h
-@@ -89,6 +89,16 @@ public:
+@@ -89,6 +89,19 @@ public:
  	void setMaterialParams(const float *values, int count);
  	static bool materialAvailable();
  
@@ -510,6 +1072,9 @@ index 86aa9d9..85f0a2e 100644
 +	void setMeshUVOffsets(const float *values, int count);
 +	bool hasMeshUVOffsets() const;
 +	float getMeshOffset(int index, bool uv) const;
++	enum { MeshMaxDot = 4 };
++	void setMeshDot(int value);
++	int getMeshDot() const;
 +
  	void initDynAttribs();
  

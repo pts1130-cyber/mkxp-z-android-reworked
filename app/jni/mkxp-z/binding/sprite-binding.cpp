@@ -246,6 +246,28 @@ RB_METHOD(spriteSetMeshUVOffsets) {
     return argv[0];
 }
 
+RB_METHOD(spriteGetMeshDot) {
+    RB_UNUSED_PARAM;
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    int value = 0;
+    GUARD_EXC(value = s->getMeshDot();)
+    
+    return INT2FIX(value);
+}
+
+RB_METHOD(spriteSetMeshDot) {
+    rb_check_argc(argc, 1);
+    
+    Sprite *s = getPrivateData<Sprite>(self);
+    
+    int value = NIL_P(argv[0]) ? 0 : NUM2INT(argv[0]);
+    GFX_GUARD_EXC(s->setMeshDot(value);)
+    
+    return argv[0];
+}
+
 RB_METHOD(spriteWidth) {
     RB_UNUSED_PARAM;
     
@@ -329,7 +351,10 @@ void spriteBindingInit() {
     _rb_define_method(klass, "mesh_offsets=", spriteSetMeshOffsets);
     _rb_define_method(klass, "mesh_uv_offsets", spriteGetMeshUVOffsets);
     _rb_define_method(klass, "mesh_uv_offsets=", spriteSetMeshUVOffsets);
+    _rb_define_method(klass, "mesh_dot", spriteGetMeshDot);
+    _rb_define_method(klass, "mesh_dot=", spriteSetMeshDot);
     rb_define_const(klass, "MESH_MAX_CELLS", INT2FIX(Sprite::MeshMaxCells));
+    rb_define_const(klass, "MESH_MAX_DOT", INT2FIX(Sprite::MeshMaxDot));
     
     INIT_PROP_BIND(Sprite, WaveAmp, "wave_amp");
     INIT_PROP_BIND(Sprite, WaveLength, "wave_length");

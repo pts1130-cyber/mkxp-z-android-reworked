@@ -244,8 +244,10 @@ public:
 	void setBack(const TEX::ID tex, const Vec2 &sizeInv, bool enabled);
 	void setMirror(bool value);
 	void setParams(const float value[20]);
+	void setScreenMat(const float *value);
 
 private:
+	GLint u_scrMat, u_scrMatOn;
 	GLint u_spriteMat, u_tone, u_opacity, u_color, u_bushDepth, u_bushOpacity, u_pattern, u_renderPattern,
 	u_patternBlendType, u_patternSizeInv, u_patternTile, u_patternOpacity, u_patternScroll, u_patternZoom, u_invert;
 	GLint u_materialMode, u_materialMap, u_materialEnv, u_materialRamp, u_materialBack, u_materialMapTexel,

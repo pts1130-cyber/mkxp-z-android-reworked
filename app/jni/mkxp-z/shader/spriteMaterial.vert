@@ -13,6 +13,10 @@ uniform bool patternTile;
 /* xy: scale, zw: offset (texture pixel -> map uv) */
 uniform vec4 materialXform;
 
+/* Clip position on screen when the sprite is drawn off-screen first */
+uniform mat4 scrMat;
+uniform bool scrMatOn;
+
 attribute vec2 position;
 attribute vec2 texCoord;
 
@@ -27,7 +31,8 @@ void main()
 
 	v_texCoord = texCoord * texSizeInv;
 	v_matCoord = texCoord * materialXform.xy + materialXform.zw;
-	v_scrCoord = gl_Position.xy * 0.5 + 0.5;
+	vec4 scr = scrMatOn ? scrMat * vec4(position, 0, 1) : gl_Position;
+	v_scrCoord = scr.xy * 0.5 + 0.5;
 
 	v_patCoord = vec2(0.0);
 	if (renderPattern) {

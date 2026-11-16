@@ -38,6 +38,8 @@
 #include "quadarray.h"
 #include "meshwarp.h"
 
+#include <algorithm>
+
 #include <math.h>
 #ifndef M_PI
 # define M_PI 3.14159265358979323846
@@ -113,6 +115,11 @@ struct SpritePrivate
     MeshWarp mesh;
     SimpleQuadArray *meshArray;
     FloatRect meshSrc;
+    int meshDot;
+    MeshDot dotArea;
+    TEXFBO dotTex;
+    Quad *dotQuad;
+    float dotMat[16];
     
     EtcTemps tmp;
     
@@ -140,6 +147,8 @@ struct SpritePrivate
     materialMode(0),
     materialRect(&materialRectTmp),
     meshArray(0),
+    meshDot(0),
+    dotQuad(0),
     isVisible(false),
     color(&tmp.color),
     tone(&tmp.tone)
@@ -169,6 +178,7 @@ struct SpritePrivate
     {
         srcRectCon.disconnect();
         prepareCon.disconnect();
+        releaseDot();
         delete meshArray;
     }
     
@@ -228,7 +238,7 @@ struct SpritePrivate
         if (!opacity)
             return;
         
-        if (wave.active || mesh.deforms())
+        if (wave.active || meshDrawn())
         {
             /* Don't do expensive wave bounding box
              * calculations */
@@ -383,6 +393,99 @@ struct SpritePrivate
         padQuad.draw();
     }
 
+    bool dotActive() const
+    {
+        return meshDot > 0 && mesh.active();
+    }
+    
+    bool meshDrawn() const
+    {
+        return mesh.deforms() || dotActive();
+    }
+    
+    void releaseDot()
+    {
+        if (dotTex.tex != TEX::ID(0))
+            TEXFBO::fini(dotTex);
+        dotTex = TEXFBO();
+        delete dotQuad;
+        dotQuad = 0;
+    }
+    
+    /* First pass target: grows only, cleared every draw */
+    GLint beginDot()
+    {
+        GLint prev = 0;
+        gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+        
+        if (dotTex.tex == TEX::ID(0))
+        {
+            TEXFBO::init(dotTex);
+            TEXFBO::allocEmpty(dotTex, dotArea.w, dotArea.h);
+            TEXFBO::linkFBO(dotTex);
+        }
+        else if (dotArea.w > dotTex.width || dotArea.h > dotTex.height)
+        {
+            TEXFBO::allocEmpty(dotTex, std::max(dotArea.w, dotTex.width),
+                               std::max(dotArea.h, dotTex.height));
+        }
+        
+        FBO::bind(dotTex.fbo);
+        glState.viewport.pushSet(IntRect(0, 0, dotTex.width, dotTex.height));
+        glState.scissorTest.pushSet(false);
+        glState.blend.pushSet(false);
+        glState.clearColor.pushSet(Vec4());
+        FBO::clear();
+        glState.clearColor.pop();
+        
+        return prev;
+    }
+    
+    void endDot(GLint prev)
+    {
+        glState.blend.pop();
+        glState.scissorTest.pop();
+        glState.viewport.pop();
+        gl.BindFramebuffer(GL_FRAMEBUFFER, (GLuint) prev);
+    }
+    
+    /* Second pass: the dot target k times larger, nearest, with the
+     * sprite's transform, opacity and blend type */
+    void drawDot()
+    {
+        ShaderBase *base;
+        
+        if (opacity != 255)
+        {
+            AlphaSpriteShader &shader = shState->shaders().alphaSprite;
+            shader.bind();
+            shader.setSpriteMat(trans.getMatrix());
+            shader.setAlpha(opacity.norm);
+            shader.applyViewportProj();
+            base = &shader;
+        }
+        else
+        {
+            SimpleSpriteShader &shader = shState->shaders().simpleSprite;
+            shader.bind();
+            shader.setSpriteMat(trans.getMatrix());
+            shader.applyViewportProj();
+            base = &shader;
+        }
+        
+        glState.blendMode.pushSet(blendType);
+        TEX::bind(dotTex.tex);
+        base->setTexSize(Vec2i(dotTex.width, dotTex.height));
+        dotQuad->draw();
+        glState.blendMode.pop();
+    }
+    
+    /* shader_pad of a working user shader widens the mesh by a ring */
+    int meshPad() const
+    {
+        return (shader && shader->ok()) ? shaderPad : 0;
+    }
+    
     void updateMesh()
     {
         mesh.dirty = false;
@@ -390,10 +493,33 @@ struct SpritePrivate
         if (!meshArray)
             meshArray = new SimpleQuadArray;
         
-        meshArray->resize(mesh.quadCount());
+        const int pad = meshPad();
+        const bool flip = mirrored && !dotActive();
+        meshArray->resize(mesh.quadCount() + (pad ? MeshWarp::padQuadCount(mesh.cols, mesh.rows) : 0));
         mesh.build(dataPtr(meshArray->vertices), meshSrc.x, meshSrc.y,
-                   meshSrc.w, meshSrc.h, mirrored, 1.f, 1.f);
+                   meshSrc.w, meshSrc.h, flip, 1.f, 1.f);
+        if (pad)
+            mesh.buildPad(dataPtr(meshArray->vertices) + mesh.quadCount() * 4, (float) pad, flip, 1.f, 1.f);
         meshArray->commit();
+        
+        if (dotActive())
+            updateDotQuad(meshSrc.w, meshSrc.h);
+    }
+    
+    void updateDotQuad(float sw, float sh)
+    {
+        dotArea.fit(dataPtr(meshArray->vertices), meshArray->vertices.size(),
+                    meshDot, sw, sh, glState.caps.maxTexSize);
+        dotArea.targetMatrix(dotMat, meshDot);
+        
+        float pr[4], tr[4];
+        dotArea.posRect(pr, meshDot, sw, mirrored);
+        dotArea.texRect(tr, mirrored);
+        
+        if (!dotQuad)
+            dotQuad = new Quad;
+        dotQuad->setTexPosRect(FloatRect(tr[0], tr[1], tr[2], tr[3]),
+                               FloatRect(pr[0], pr[1], pr[2], pr[3]));
     }
     
     void prepare()
@@ -404,7 +530,7 @@ struct SpritePrivate
             wave.dirty = false;
         }
         
-        if (mesh.deforms() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
+        if (meshDrawn() && (mesh.dirty || !meshArray) && !nullOrDisposed(bitmap))
             updateMesh();
         
         updateVisibility();
@@ -465,6 +591,8 @@ void Sprite::setShader(ARCShader *value)
     if (value && value->kind() != ARCShader::KindSprite)
         throw Exception(Exception::ArgumentError, "Sprite#shader needs an ARCShader::SPRITE shader");
 
+    if (p->shader != value)
+        p->mesh.dirty = true;
     p->shader = value;
 }
 
@@ -478,6 +606,7 @@ void Sprite::setShaderPad(int value)
 
     p->shaderPad = value;
     p->padDirty = true;
+    p->mesh.dirty = true;
 }
 DEF_ATTR_RD_SIMPLE(Sprite, MaterialMap,  Bitmap*, p->materialMap)
 DEF_ATTR_RD_SIMPLE(Sprite, MaterialEnv,  Bitmap*, p->materialEnv)
@@ -525,6 +654,27 @@ void Sprite::setMeshGrid(int cols, int rows)
 {
     guardDisposed();
     p->mesh.setGrid(cols, rows);
+    if (!p->mesh.active())
+        p->releaseDot();
+}
+
+void Sprite::setMeshDot(int value)
+{
+    guardDisposed();
+    value = clamp(value, 0, (int) MeshDot::MaxDot);
+    if (p->meshDot == value)
+        return;
+    
+    p->meshDot = value;
+    if (value == 0)
+        p->releaseDot();
+    p->mesh.dirty = true;
+}
+
+int Sprite::getMeshDot() const
+{
+    guardDisposed();
+    return p->meshDot;
 }
 
 int Sprite::getMeshCols() const
@@ -865,6 +1015,25 @@ void Sprite::draw()
 
     bool useMaterial = (p->materialMode == 3 ||
     (p->materialMode > 0 && !nullOrDisposed(p->materialMap))) && getMaterialShader();
+    
+    const bool dot = p->dotActive() && p->meshArray && p->dotQuad;
+    const float *spriteMat = p->trans.getMatrix();
+    float opacity = p->opacity.norm;
+    
+    Vec2 backInv;
+    bool back = useMaterial && p->materialMode == 2 && p->materialParams[15] > 0.f &&
+    grabMaterialBackdrop(backInv);
+    
+    float screenMat[16];
+    GLint screenFbo = 0;
+    if (dot)
+    {
+        const IntRect &vp = glState.viewport.get();
+        MeshDot::screenMatrix(screenMat, vp.w, vp.h, spriteMat, p->meshSrc.w, p->mirrored);
+        screenFbo = p->beginDot();
+        spriteMat = p->dotMat;
+        opacity = 1.f;
+    }
 
     /* A user shader that cannot combine with the material is left out */
     SpriteMaterialShader *userMaterial = (useMaterial && user) ? user->materialShader() : 0;
@@ -876,15 +1045,12 @@ void Sprite::draw()
         SpriteMaterialShader &shader = userMaterial ? *userMaterial : *materialShader;
         const float *mp = p->materialParams;
 
-        Vec2 backInv;
-        bool back = p->materialMode == 2 && mp[15] > 0.f && grabMaterialBackdrop(backInv);
-
         shader.bind();
         shader.applyViewportProj();
-        shader.setSpriteMat(p->trans.getMatrix());
+        shader.setSpriteMat(spriteMat);
 
         shader.setTone(p->tone->norm);
-        shader.setOpacity(p->opacity.norm);
+        shader.setOpacity(opacity);
         shader.setBushDepth(p->efBushDepth);
         shader.setBushOpacity(p->bushOpacity.norm);
 
@@ -935,6 +1101,7 @@ void Sprite::draw()
         bool ramp = !nullOrDisposed(p->materialRamp);
         shader.setRamp(ramp ? p->materialRamp->getGLTypes().tex : TEX::ID(0), ramp);
         shader.setBack(materialBackTex, backInv, back);
+        shader.setScreenMat((dot && back) ? screenMat : 0);
 
         if (user)
             p->applyUser(user, shader);
@@ -947,10 +1114,10 @@ void Sprite::draw()
         
         shader.bind();
         shader.applyViewportProj();
-        shader.setSpriteMat(p->trans.getMatrix());
+        shader.setSpriteMat(spriteMat);
         
         shader.setTone(p->tone->norm);
-        shader.setOpacity(p->opacity.norm);
+        shader.setOpacity(opacity);
         shader.setBushDepth(p->efBushDepth);
         shader.setBushOpacity(p->bushOpacity.norm);
         
@@ -981,12 +1148,12 @@ void Sprite::draw()
         
         base = &shader;
     }
-    else if (p->opacity != 255)
+    else if (!dot && p->opacity != 255)
     {
         AlphaSpriteShader &shader = shState->shaders().alphaSprite;
         shader.bind();
         
-        shader.setSpriteMat(p->trans.getMatrix());
+        shader.setSpriteMat(spriteMat);
         shader.setAlpha(p->opacity.norm);
         shader.applyViewportProj();
         base = &shader;
@@ -996,9 +1163,18 @@ void Sprite::draw()
         SimpleSpriteShader &shader = shState->shaders().simpleSprite;
         shader.bind();
         
-        shader.setSpriteMat(p->trans.getMatrix());
+        shader.setSpriteMat(spriteMat);
         shader.applyViewportProj();
         base = &shader;
+    }
+    
+    if (dot)
+    {
+        p->bitmap->bindTex(*base);
+        p->meshArray->draw();
+        p->endDot(screenFbo);
+        p->drawDot();
+        return;
     }
     
     glState.blendMode.pushSet(p->blendType);
