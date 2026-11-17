@@ -1758,6 +1758,7 @@ static const int TRK_MAX_V = 65000;
 static const int64_t TRK_MAX_PX = 1 << 21;  // flow image pixels (about 50 bytes each per worker)
 struct Sprite {
   int fw = 0, fh = 0, k = 0, nf = 0, W = 0, H = 0; bool bgra = false;
+  double face_k = 1.0;                  // facet spacing scale (1.0 = v3 spacing)
   std::vector<uint8_t> px;              // nf frames, frame-major, fw*fh*4 each
   std::vector<float> p0; std::vector<int32_t> tri; int nv = 0, nt = 0;
   std::vector<int> vx, vy;              // rounded, clipped vertex pixel
@@ -1776,7 +1777,7 @@ struct Sprite {
     for (int f = 0; f < nf; f++) { const uint8_t* p = frame(f); for (size_t i = 0; i < n1; i++) if (p[i * 4 + 3]) uni[i] = 1; }
     long area = 0; for (uint8_t u : uni) area += u;
     if (area == 0) return 21;
-    const double spacing = 0.12 * std::sqrt((double)area);
+    const double spacing = 0.12 * std::sqrt((double)area) * face_k;
     const double s = spacing * k;
     if (!(s >= 1.0)) return 22;
     const double est = ((W + 2 * s) / s + 2) * ((H + 2 * s) / (s * 0.87) + 2) + 400;
@@ -2168,7 +2169,7 @@ static Pool& pool() { static Pool* p = new Pool(); return *p; }  // never destro
 }}  // namespace tmap::trk
 
 extern "C" {
-// ip = int32[8] {frame_w, frame_h, nf, k, flags (bit0 BGRA), threads (0 = cores-1, at most 3), 0, 0}
+// ip = int32[8] {frame_w, frame_h, nf, k, flags (bit0 BGRA), threads (0 = cores-1, at most 3), face_k*1000 (0 = 1.0), 0}
 // rgba = nf frames one after another (frame i at i*fw*fh*4), copied here. returns handle > 0, or 0 for bad input / no threads
 TMAP_EXPORT int tmap_batch_new(const int32_t* ip, const uint8_t* rgba) {
   using namespace tmap::trk;
@@ -2178,6 +2179,7 @@ TMAP_EXPORT int tmap_batch_new(const int32_t* ip, const uint8_t* rgba) {
     if (fw <= 0 || fh <= 0 || nf <= 0 || nf > 4096 || k <= 0 || k > 8 || (int64_t)fw * k > 8192 || (int64_t)fh * k > 8192) return 0;
     auto b = std::make_shared<Batch>();
     b->S.fw = fw; b->S.fh = fh; b->S.nf = nf; b->S.k = k; b->S.bgra = (ip[4] & 1) != 0;
+    if (ip[6] > 0) b->S.face_k = ip[6] / 1000.0;
     b->S.px.assign(rgba, rgba + (size_t)fw * fh * 4 * nf);
     Pool& P = pool();
     std::lock_guard<std::mutex> lk(P.mu);
