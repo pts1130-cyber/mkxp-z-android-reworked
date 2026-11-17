@@ -489,7 +489,7 @@ diff --git a/shader/spriteMaterial.frag b/shader/spriteMaterial.frag
 index a8982ff..533d23d 100644
 --- a/shader/spriteMaterial.frag
 +++ b/shader/spriteMaterial.frag
-@@ -202,6 +202,31 @@ vec4 haloStage(vec4 frag)
+@@ -202,6 +202,32 @@ vec4 haloStage(vec4 frag)
  	return vec4(materialP3.rgb, clamp(g * materialP0.x, 0.0, 1.0));
  }
  
@@ -516,12 +516,13 @@ index a8982ff..533d23d 100644
 +#else
 +#define arcBushCoord(uv) (uv)
 +#endif
++#define ARC_MATERIAL 1
 +/*ARC_USER*/
 +
  void main()
  {
  	vec4 frag = texture2D(texture, v_texCoord);
-@@ -229,6 +254,10 @@ void main()
+@@ -229,6 +255,10 @@ void main()
  		}
  	}
  
@@ -532,7 +533,7 @@ index a8982ff..533d23d 100644
  	float luma = dot(frag.rgb, lumaF);
  	frag.rgb = mix(frag.rgb, vec3(luma), tone.w);
  	frag.rgb += tone.rgb;
-@@ -238,8 +267,8 @@ void main()
+@@ -238,8 +268,8 @@ void main()
  	if (invert)
  		frag.rgb = vec3(1.0) - frag.rgb;
  

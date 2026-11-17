@@ -20,7 +20,8 @@ struct Params {
   double accent = 0.0, accent_v = 0.0;
   double white_frac = 0.0, white_lev = 1.0, white_comp = 0.0;
   double keep_small = 0.0, keep_w = 0.1;
-  double dark_frac = 0.0, dark_lev = 0.12, dark_w = 1.0;
+  double dark_frac = 0.0, dark_lev = 0.12, dark_w = 1.0, thin = 0.0;   // thin: no dark facet within thin*k px of the outline
+  double keep_upper = 0.0;         // > 0: keep_small spots only in the top keep_upper of the body rows
   double edge = 0.0, edge_frac = 0.4;
   double rim = 0.0, rim_w = 0.0, rim_min = 0.35;
   double lum_base = 0.0, lum_ratio = 0.0;
@@ -63,10 +64,11 @@ double hmix(uint32_t a, uint32_t b, uint32_t c);
 #else
 #define TMAP_EXPORT __attribute__((visibility("default")))
 #endif
-#define TMAP_VERSION 1
+#define TMAP_VERSION 3
 
 // C ABI (MiniFFI: integers and pointers only, <= 10 args; returns are numbers)
-// ip = int32[6] {sheet_w, h, frame_w, k, sid, frame}; rgba = whole sheet RGBA; tmv = .tmv with zlib part inflated;
+// ip = int32[8] {buf_w, h, frame_w, k, sid, frame, src_x, flags}: rgba = buf_w x h pixels holding the frame at x = src_x
+// (src_x < 0: frame * frame_w), flags bit0 = rgba is BGRA (Bitmap#raw_data order); tmv = .tmv with zlib part inflated;
 // par = params text; out = (h*k)*(frame_w*k)*4 bytes. Errors are positive codes (11..19), 0 = ok.
 extern "C" {
 TMAP_EXPORT int tmap_version(void);  // TMAP_VERSION
@@ -75,4 +77,13 @@ TMAP_EXPORT intptr_t tmap_job_new(const int32_t* ip, const uint8_t* rgba, const 
 TMAP_EXPORT int tmap_job_step(intptr_t job, int budget_us);   // 1 done, 0 more work, >= 11 error
 TMAP_EXPORT int tmap_job_take(intptr_t job, uint8_t* out);    // after step returned 1
 TMAP_EXPORT void tmap_job_free(intptr_t job);
+// crc32 of the pixels in RGBA order with fully transparent pixels as 0 (picture key); ip = int32[2] {npx, flags}, io = uint32 seed in / crc out
+TMAP_EXPORT int tmap_hash(const uint8_t* rgba, const int32_t* ip, uint32_t* io);
+// v3: vertex tracks (.tmv) for a picture the pack does not have, worked out on background threads.
+// ip = int32[8] {frame_w, frame_h, nf, k, flags (bit0 BGRA), threads (0 = cores-1, at most 3), 0, 0};
+// rgba = the nf frames one after another (copied). Handles are small positive ints (0 = refused).
+TMAP_EXPORT int tmap_batch_new(const int32_t* ip, const uint8_t* rgba);
+TMAP_EXPORT int tmap_batch_poll(int batch, int32_t* io);   // 0 running, 1 done, >= 11 error; io int32[4] {done, nf, bytes, state}
+TMAP_EXPORT int tmap_batch_take(int batch, uint8_t* out);  // .tmv, zlib part not applied (io[2] bytes)
+TMAP_EXPORT int tmap_batch_free(int batch);                // cancels if still running
 }

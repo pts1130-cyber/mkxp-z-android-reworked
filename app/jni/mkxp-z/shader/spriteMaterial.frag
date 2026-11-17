@@ -222,6 +222,7 @@ vec2 arcBushCoord(vec2 uv)
 #else
 #define arcBushCoord(uv) (uv)
 #endif
+#define ARC_MATERIAL 1
 /*ARC_USER*/
 
 void main()

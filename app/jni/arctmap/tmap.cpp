@@ -1,7 +1,27 @@
 // Tera body material map builder (port of build.py make_map). C++17, no dependencies.
 // Build with -ffp-contract=off so float32/float64 steps round like numpy (matters on arm64, which fuses by default).
 #include "tmap.h"
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__) || defined(__ANDROID__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -50,7 +70,7 @@ bool parse_params(const std::string& text, Params& P) {
     else if (key == "a_lo") { P.has_a_lo = true; P.a_lo = a; }
     F(shade_w) F(tilt) F(smooth_n) F(broad) F(broad_gain) F(broad_tilt) F(facet_n) F(thick_blur) F(lx) F(ly)
     F(facet) F(facet_pow) F(lam) F(base) F(thick) F(thick_pow) F(thick_facet) F(accent) F(accent_v)
-    F(white_frac) F(white_lev) F(white_comp) F(keep_small) F(keep_w) F(dark_frac) F(dark_lev) F(dark_w)
+    F(white_frac) F(white_lev) F(white_comp) F(keep_small) F(keep_w) F(dark_frac) F(dark_lev) F(dark_w) F(thin) F(keep_upper)
     F(edge) F(edge_frac) F(rim) F(rim_w) F(rim_min) F(lum_base) F(lum_ratio) F(outline_comp) F(outline_rim)
     F(line_floor) F(inner_comp) F(inner_lum) F(keep_sat) F(main_frac0) F(main_frac_w) F(a_pow)
     else if (key == "broad_fast") P.broad_fast = a != 0;
@@ -862,6 +882,12 @@ struct Job {
       std::vector<int> sz(nc, 0);
       for (size_t i = 0; i < n1; i++) if (lab[i] >= 0) sz[lab[i]]++;
       for (size_t i = 0; i < n1; i++) keep1[i] = lab[i] >= 0 && sz[lab[i]] <= P.keep_small;
+      if (P.keep_upper > 0) {
+        int ry0 = h, ry1 = -1;
+        for (size_t i = 0; i < n1; i++) if (a1[i]) { int y = (int)(i / w); ry0 = std::min(ry0, y); ry1 = std::max(ry1, y); }
+        const double lim = ry0 + P.keep_upper * (ry1 - ry0 + 1);
+        for (size_t i = 0; i < n1; i++) if (keep1[i] && !((double)(i / w) < lim)) keep1[i] = 0;
+      }
     }
     wmask.assign(N, 0); dark.assign(N, 0);
     wf.assign(nt, 0); df.assign(nt, 0);
@@ -875,7 +901,7 @@ struct Job {
       int I = bp[q];
       size_t i1 = UP(I); int id = ids[I];
       if (P.white_frac > 0 && wf[id] && !acc1[i1]) { wmask[I] = 1; lev[I] = std::max(lev[I], P.white_lev); }
-      if (P.dark_frac > 0 && df[id]) { dark[I] = 1; lev[I] = std::min(lev[I], P.dark_lev); }
+      if (P.dark_frac > 0 && df[id] && !(P.thin > 0 && !(edg[I] > P.thin * k))) { dark[I] = 1; lev[I] = std::min(lev[I], P.dark_lev); }
       if (acc1[i1]) lev[I] = std::min(lev[I], P.accent);
       if (P.edge > 0) {
         int x = I % W, y = I / W;
@@ -990,6 +1016,914 @@ int build(const uint8_t* rgba, int w, int h, int k, int nv, const float* p0, int
   return 0;
 }
 
+// ================================================================ v3: mesh tracks (.tmv) from the sprite frames
+// Port of tmv.track (build.Mesh + cv2 DIS PRESET_MEDIUM, frame 0 -> frame i, flow blurred by k*1.2, read at the vertex).
+// Mesh points use numpy's PCG64(seed 5) stream, so they are the same float32 values as the Python precompute.
+namespace trk {
+
+// ---------------------------------------------------------------- numpy Generator(PCG64), seed 5
+struct U128 { uint64_t hi, lo; };
+static inline U128 mul64(uint64_t a, uint64_t b) {
+  const uint64_t a0 = a & 0xffffffffu, a1 = a >> 32, b0 = b & 0xffffffffu, b1 = b >> 32;
+  const uint64_t p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+  const uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffu) + (p10 & 0xffffffffu);
+  U128 r; r.lo = (p00 & 0xffffffffu) | (mid << 32); r.hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+  return r;
+}
+struct Pcg64 {
+  uint64_t sh = 0xe500c1d129ce9183ULL, sl = 0xd973b921e554efeeULL;  // default_rng(5).bit_generator.state
+  uint64_t ih = 0xaf6f7b8c936ab4a4ULL, il = 0x4f020b7b2d10234dULL;
+  bool has32 = false; uint32_t u32 = 0;
+  uint64_t next64() {
+    const uint64_t mh = 0x2360ED051FC65DA4ULL, ml = 0x4385DF649FCCF645ULL;
+    U128 p = mul64(sl, ml);
+    uint64_t hi = p.hi + sl * mh + sh * ml, lo = p.lo + il;
+    hi += ih + (lo < il ? 1 : 0);
+    sh = hi; sl = lo;
+    const uint64_t x = sh ^ sl; const unsigned rot = (unsigned)(sh >> 58);
+    return (x >> rot) | (x << ((64 - rot) & 63));
+  }
+  uint32_t next32() {
+    if (has32) { has32 = false; return u32; }
+    const uint64_t n = next64(); has32 = true; u32 = (uint32_t)(n >> 32); return (uint32_t)n;
+  }
+  double next_double() { return (double)(next64() >> 11) * (1.0 / 9007199254740992.0); }
+  double uniform(double lo, double hi) { return lo + (hi - lo) * next_double(); }
+  uint64_t bounded(uint64_t rng) {  // random_bounded_uint64(off 0, rng, use_masked 0), rng < 2^32
+    if (rng == 0) return 0;
+    if (rng == 0xFFFFFFFFULL) return next32();
+    const uint32_t rexcl = (uint32_t)rng + 1;
+    uint64_t m = (uint64_t)next32() * rexcl; uint32_t left = (uint32_t)m;
+    if (left < rexcl) {
+      const uint32_t thr = (uint32_t)((0xFFFFFFFFu - (uint32_t)rng) % rexcl);
+      while (left < thr) { m = (uint64_t)next32() * rexcl; left = (uint32_t)m; }
+    }
+    return m >> 32;
+  }
+  void shuffle_int(int64_t n, int64_t first, int64_t* d) {
+    for (int64_t i = n - 1; i >= first; i--) { const int64_t j = (int64_t)bounded((uint64_t)i); std::swap(d[i], d[j]); }
+  }
+  // Generator.choice(pop, size, replace=False)
+  std::vector<int64_t> choice(int64_t pop, int64_t size) {
+    std::vector<int64_t> idx;
+    if (pop > 10000 && size > pop / 50) {
+      idx.resize(pop);
+      for (int64_t i = 0; i < pop; i++) idx[i] = i;
+      shuffle_int(pop, std::max<int64_t>(pop - size, 1), idx.data());
+      return std::vector<int64_t>(idx.end() - size, idx.end());
+    }
+    idx.resize(size);
+    uint64_t mask = (uint64_t)(1.2 * (double)size);
+    for (int s = 1; s < 64; s <<= 1) mask |= mask >> s;
+    std::vector<uint64_t> hs(mask + 1, ~0ULL);
+    for (int64_t j = pop - size; j < pop; j++) {
+      const uint64_t val = bounded((uint64_t)j);
+      uint64_t loc = val & mask;
+      while (hs[loc] != ~0ULL && hs[loc] != val) loc = (loc + 1) & mask;
+      if (hs[loc] == ~0ULL) { hs[loc] = val; idx[j - pop + size] = (int64_t)val; }
+      else {
+        loc = (uint64_t)j & mask;
+        while (hs[loc] != ~0ULL) loc = (loc + 1) & mask;
+        hs[loc] = (uint64_t)j; idx[j - pop + size] = j;
+      }
+    }
+    shuffle_int(size, 1, idx.data());
+    return idx;
+  }
+};
+
+// ---------------------------------------------------------------- exact orientation / in-circle (fixed point 2^-24 px)
+struct Big {  // sign-magnitude, 256-bit magnitude
+  int s = 0; uint32_t m[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  static Big of(int64_t v) {
+    Big b; if (v == 0) return b;
+    b.s = v < 0 ? -1 : 1; uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    b.m[0] = (uint32_t)u; b.m[1] = (uint32_t)(u >> 32); return b;
+  }
+  static int cmpmag(const Big& a, const Big& b) {
+    for (int i = 7; i >= 0; i--) if (a.m[i] != b.m[i]) return a.m[i] < b.m[i] ? -1 : 1;
+    return 0;
+  }
+  static Big addmag(const Big& a, const Big& b, int s) {
+    Big r; uint64_t c = 0;
+    for (int i = 0; i < 8; i++) { c += (uint64_t)a.m[i] + b.m[i]; r.m[i] = (uint32_t)c; c >>= 32; }
+    r.s = s; return r;
+  }
+  static Big submag(const Big& a, const Big& b, int s) {  // |a| >= |b|
+    Big r; int64_t c = 0;
+    for (int i = 0; i < 8; i++) { int64_t t = (int64_t)a.m[i] - b.m[i] + c; c = t < 0 ? -1 : 0; r.m[i] = (uint32_t)(t + (c ? (1LL << 32) : 0)); }
+    r.s = s; bool z = true;
+    for (int i = 0; i < 8; i++) if (r.m[i]) z = false;
+    if (z) r.s = 0;
+    return r;
+  }
+  Big operator+(const Big& b) const {
+    if (!s) return b;
+    if (!b.s) return *this;
+    if (s == b.s) return addmag(*this, b, s);
+    const int c = cmpmag(*this, b);
+    if (c == 0) return Big();
+    return c > 0 ? submag(*this, b, s) : submag(b, *this, b.s);
+  }
+  Big neg() const { Big r = *this; r.s = -s; return r; }
+  Big operator-(const Big& b) const { return *this + b.neg(); }
+  Big operator*(const Big& b) const {
+    Big r; if (!s || !b.s) return r;
+    uint64_t t[16] = {0};
+    for (int i = 0; i < 8; i++) {
+      if (!m[i]) continue;
+      uint64_t c = 0;
+      for (int j = 0; j + i < 8; j++) { uint64_t p = (uint64_t)m[i] * b.m[j] + t[i + j] + c; t[i + j] = p & 0xffffffffu; c = p >> 32; }
+    }
+    for (int i = 0; i < 8; i++) r.m[i] = (uint32_t)t[i];
+    r.s = s * b.s; return r;
+  }
+};
+struct FP { int64_t x, y; double dx, dy; };
+static const double EPSD = 1.1102230246251565e-16;  // 2^-53
+static int orient_sign(const FP& a, const FP& b, const FP& c) {  // sign of (b-a) x (c-a)
+  const double l = (b.dx - a.dx) * (c.dy - a.dy), r = (b.dy - a.dy) * (c.dx - a.dx), d = l - r;
+  const double bound = (3.0 + 16.0 * EPSD) * EPSD * (std::fabs(l) + std::fabs(r));
+  if (d > bound) return 1;
+  if (-d > bound) return -1;
+  Big e = Big::of(b.x - a.x) * Big::of(c.y - a.y) - Big::of(b.y - a.y) * Big::of(c.x - a.x);
+  return e.s;
+}
+static int incircle_sign(const FP& a, const FP& b, const FP& c, const FP& p) {  // > 0: p inside circle of ccw abc
+  const double adx = a.dx - p.dx, ady = a.dy - p.dy, bdx = b.dx - p.dx, bdy = b.dy - p.dy, cdx = c.dx - p.dx, cdy = c.dy - p.dy;
+  const double bc1 = bdx * cdy, bc2 = cdx * bdy, ca1 = cdx * ady, ca2 = adx * cdy, ab1 = adx * bdy, ab2 = bdx * ady;
+  const double al = adx * adx + ady * ady, bl = bdx * bdx + bdy * bdy, cl = cdx * cdx + cdy * cdy;
+  const double det = al * (bc1 - bc2) + bl * (ca1 - ca2) + cl * (ab1 - ab2);
+  const double perm = (std::fabs(bc1) + std::fabs(bc2)) * al + (std::fabs(ca1) + std::fabs(ca2)) * bl + (std::fabs(ab1) + std::fabs(ab2)) * cl;
+  const double bound = (10.0 + 96.0 * EPSD) * EPSD * perm;
+  if (det > bound) return 1;
+  if (-det > bound) return -1;
+  const Big ax = Big::of(a.x - p.x), ay = Big::of(a.y - p.y), bx = Big::of(b.x - p.x), by = Big::of(b.y - p.y);
+  const Big cx = Big::of(c.x - p.x), cy = Big::of(c.y - p.y);
+  Big e = (ax * ax + ay * ay) * (bx * cy - cx * by) + (bx * bx + by * by) * (cx * ay - ax * cy) + (cx * cx + cy * cy) * (ax * by - bx * ay);
+  return e.s;
+}
+
+// ---------------------------------------------------------------- Delaunay (sorted sweep + flips, delaunator layout)
+struct Delaunay {
+  std::vector<FP> P;
+  std::vector<int32_t> tri, half;
+  std::vector<int> hnext, hprev, htri, stack;
+  int hstart = 0;
+  // hull edge q->r is visible from new point p (hull kept clockwise, as in delaunator)
+  bool vis(int p, int q, int r) const { return orient_sign(P[p], P[q], P[r]) > 0; }
+  void link(int a, int b) { half[a] = b; if (b != -1) half[b] = a; }
+  int add(int i0, int i1, int i2, int a, int b, int c) {
+    const int t = (int)tri.size();
+    tri.push_back(i0); tri.push_back(i1); tri.push_back(i2);
+    half.push_back(-1); half.push_back(-1); half.push_back(-1);
+    link(t, a); link(t + 1, b); link(t + 2, c);
+    return t;
+  }
+  int legalize(int a) {
+    int ar = 0; stack.clear();
+    for (;;) {
+      const int b = half[a];
+      const int a0 = a - a % 3; ar = a0 + (a + 2) % 3;
+      if (b == -1) { if (stack.empty()) break; a = stack.back(); stack.pop_back(); continue; }
+      const int b0 = b - b % 3, al = a0 + (a + 1) % 3, bl = b0 + (b + 2) % 3;
+      const int p0 = tri[ar], pr = tri[a], pl = tri[al], p1 = tri[bl];
+      // triangles are clockwise in y-up terms: p1 inside the circle of (p0, pr, pl) <=> in-circle determinant < 0
+      if (incircle_sign(P[p0], P[pr], P[pl], P[p1]) < 0) {
+        tri[a] = p1; tri[b] = p0;
+        const int hbl = half[bl];
+        if (hbl == -1) {
+          int e = hstart;
+          do { if (htri[e] == bl) { htri[e] = a; break; } e = hprev[e]; } while (e != hstart);
+        }
+        link(a, hbl); link(b, half[ar]); link(ar, bl);
+        stack.push_back(b0 + (b + 1) % 3);
+      } else {
+        if (stack.empty()) break;
+        a = stack.back(); stack.pop_back();
+      }
+    }
+    return ar;
+  }
+  // returns 0 ok, 1 all points collinear / too few
+  int run(const float* xy, int n) {
+    P.resize(n);
+    for (int i = 0; i < n; i++) {
+      const double x = (double)xy[2 * i], y = (double)xy[2 * i + 1];
+      FP f; f.x = (int64_t)std::llround(x * 16777216.0); f.y = (int64_t)std::llround(y * 16777216.0);
+      f.dx = (double)f.x; f.dy = (double)f.y; P[i] = f;
+    }
+    if (n < 3) return 1;
+    std::vector<int> ord(n);
+    for (int i = 0; i < n; i++) ord[i] = i;
+    std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+      if (P[a].x != P[b].x) return P[a].x < P[b].x;
+      if (P[a].y != P[b].y) return P[a].y < P[b].y;
+      return a < b;
+    });
+    int i0 = ord[0], i1 = -1, k1 = 1;
+    while (k1 < n && P[ord[k1]].x == P[i0].x && P[ord[k1]].y == P[i0].y) k1++;
+    if (k1 >= n) return 1;
+    i1 = ord[k1];
+    int k2 = k1 + 1;
+    while (k2 < n && orient_sign(P[i0], P[i1], P[ord[k2]]) == 0) k2++;
+    if (k2 >= n) return 1;
+    int i2 = ord[k2];
+    if (orient_sign(P[i0], P[i1], P[i2]) > 0) std::swap(i1, i2);  // clockwise seed (delaunator)
+    hnext.assign(n, -1); hprev.assign(n, -1); htri.assign(n, -1);
+    tri.clear(); half.clear(); tri.reserve((size_t)n * 6); half.reserve((size_t)n * 6);
+    hstart = i0;
+    hnext[i0] = hprev[i2] = i1; hnext[i1] = hprev[i0] = i2; hnext[i2] = hprev[i1] = i0;
+    htri[i0] = 0; htri[i1] = 1; htri[i2] = 2;
+    add(i0, i1, i2, -1, -1, -1);
+    int last = ord[k2] == i2 ? i2 : i1;  // the seed vertex greatest in sort order
+    std::vector<int> rest; rest.reserve(n);
+    for (int k = k1 + 1; k < k2; k++) rest.push_back(ord[k]);
+    for (int k = k2 + 1; k < n; k++) rest.push_back(ord[k]);
+    int hsize = 3;
+    for (int i : rest) {
+      int e = last, q;
+      if (!vis(i, e, hnext[e])) e = hprev[last];
+      if (!vis(i, e, hnext[e])) {
+        bool found = false; e = last;
+        for (int guard = 0; guard <= hsize; guard++) {
+          if (vis(i, e, hnext[e])) { found = true; break; }
+          e = hnext[e];
+        }
+        if (!found) continue;  // duplicate point
+      }
+      for (int guard = 0; guard <= hsize && vis(i, hprev[e], e); guard++) e = hprev[e];
+      int t = add(e, i, hnext[e], -1, -1, htri[e]);
+      htri[i] = legalize(t + 2); htri[e] = t; hsize++;
+      int nn = hnext[e];
+      while (q = hnext[nn], vis(i, nn, q)) {
+        t = add(nn, i, q, htri[i], -1, htri[nn]);
+        htri[i] = legalize(t + 2); hnext[nn] = nn; hsize--; nn = q;
+      }
+      hstart = hprev[i] = e; hnext[e] = hprev[nn] = i; hnext[i] = nn;
+      last = i;
+    }
+    return 0;
+  }
+};
+
+// ---------------------------------------------------------------- image helpers (cv2 equivalents)
+static inline int refl101(int i, int n) {
+  if (n == 1) return 0;
+  while (i < 0 || i >= n) { if (i < 0) i = -i; if (i >= n) i = 2 * n - 2 - i; }
+  return i;
+}
+// cv2.resize INTER_AREA, uint8, downscale (dsize given)
+static void resize_area_u8(const uint8_t* s, int sw, int sh, uint8_t* d, int dw, int dh) {
+  const double sx = 1.0 / ((double)dw / sw), sy = 1.0 / ((double)dh / sh);
+  const int ix = (int)std::lround(sx), iy = (int)std::lround(sy);
+  if (std::fabs(sx - ix) < 2.220446049250313e-16 && std::fabs(sy - iy) < 2.220446049250313e-16 && ix == 2 && iy == 2) {
+    for (int y = 0; y < dh; y++) {
+      const uint8_t* a = s + (size_t)(2 * y) * sw; const uint8_t* b = a + sw; uint8_t* o = d + (size_t)y * dw;
+      for (int x = 0; x < dw; x++) o[x] = (uint8_t)((a[2 * x] + a[2 * x + 1] + b[2 * x] + b[2 * x + 1] + 2) >> 2);
+    }
+    return;
+  }
+  if (std::fabs(sx - ix) < 2.220446049250313e-16 && std::fabs(sy - iy) < 2.220446049250313e-16 && ix >= 1 && iy >= 1) {
+    const int area = ix * iy; const float sc = 1.f / area;
+    for (int y = 0; y < dh; y++)
+      for (int x = 0; x < dw; x++) {
+        int sum = 0;
+        for (int j = 0; j < iy; j++) for (int i = 0; i < ix; i++) sum += s[(size_t)(y * iy + j) * sw + x * ix + i];
+        d[(size_t)y * dw + x] = (uint8_t)std::min(255L, std::max(0L, std::lrint(sum * sc)));
+      }
+    return;
+  }
+  struct T { int di, si; float a; };
+  auto tab = [](int ss, int ds, double scale, std::vector<T>& t) {
+    for (int dx = 0; dx < ds; dx++) {
+      const double f1 = dx * scale, f2 = f1 + scale, cw = std::min(scale, ss - f1);
+      int s1 = (int)std::ceil(f1), s2 = (int)std::floor(f2);
+      s2 = std::min(s2, ss - 1); s1 = std::min(s1, s2);
+      if (s1 - f1 > 1e-3) t.push_back({dx, s1 - 1, (float)((s1 - f1) / cw)});
+      for (int q = s1; q < s2; q++) t.push_back({dx, q, (float)(1.0 / cw)});
+      if (f2 - s2 > 1e-3) t.push_back({dx, s2, (float)(std::min(std::min(f2 - s2, 1.), cw) / cw)});
+    }
+  };
+  std::vector<T> xt, yt; tab(sw, dw, sx, xt); tab(sh, dh, sy, yt);
+  std::vector<float> buf(dw), sum(dw, 0.f);
+  int prev = yt.empty() ? 0 : yt[0].di;
+  auto store = [&](int row) { for (int x = 0; x < dw; x++) d[(size_t)row * dw + x] = (uint8_t)std::min(255L, std::max(0L, std::lrint(sum[x]))); };
+  for (size_t j = 0; j < yt.size(); j++) {
+    const float beta = yt[j].a; const int dy = yt[j].di; const uint8_t* S = s + (size_t)yt[j].si * sw;
+    std::fill(buf.begin(), buf.end(), 0.f);
+    for (const T& t : xt) buf[t.di] += S[t.si] * t.a;
+    if (dy != prev) { store(prev); for (int x = 0; x < dw; x++) sum[x] = buf[x] * beta; prev = dy; }
+    else for (int x = 0; x < dw; x++) sum[x] += buf[x] * beta;
+  }
+  store(prev);
+}
+// cv2.resize INTER_LINEAR, float32, any size (dsize given)
+static void resize_linear_any(const float* s, int sw, int sh, float* d, int dw, int dh) {
+  const double scx = 1.0 / ((double)dw / sw), scy = 1.0 / ((double)dh / sh);
+  std::vector<int> xo(dw), yo(dh); std::vector<float> xa(dw), ya(dh), xb(dw), yb(dh);
+  auto coef = [](int dd, int n, double sc, int& so, float& a0, float& a1) {  // weights from the double position (closest to cv2 on x86)
+    double f = (dd + 0.5) * sc - 0.5;
+    int q = (int)std::floor(f); f -= q;
+    if (q < 0) { f = 0; q = 0; }
+    if (q >= n - 1) { f = 0; q = n - 1; }
+    so = q; a0 = (float)(1.0 - f); a1 = (float)f;
+  };
+  for (int x = 0; x < dw; x++) coef(x, sw, scx, xo[x], xb[x], xa[x]);
+  for (int y = 0; y < dh; y++) coef(y, sh, scy, yo[y], yb[y], ya[y]);
+  std::vector<float> rows((size_t)sh * dw);
+  for (int y = 0; y < sh; y++) {
+    const float* S = s + (size_t)y * sw; float* D = &rows[(size_t)y * dw];
+    for (int x = 0; x < dw; x++) { const int q = xo[x]; const float a1 = xa[x], a0 = xb[x]; D[x] = q + 1 < sw ? S[q] * a0 + S[q + 1] * a1 : S[q] * a0; }
+  }
+  for (int y = 0; y < dh; y++) {
+    const int s0 = yo[y], s1 = std::min(s0 + 1, sh - 1); const float b1 = ya[y], b0 = yb[y];
+    const float* R0 = &rows[(size_t)s0 * dw]; const float* R1 = &rows[(size_t)s1 * dw]; float* D = d + (size_t)y * dw;
+    for (int x = 0; x < dw; x++) D[x] = R0[x] * b0 + R1[x] * b1;
+  }
+}
+// cv2.spatialGradient (Sobel 3x3, BORDER_REFLECT_101), int16
+static void spatial_gradient(const uint8_t* I, int w, int h, int16_t* gx, int16_t* gy) {
+  for (int y = 0; y < h; y++) {
+    const uint8_t* U = I + (size_t)refl101(y - 1, h) * w; const uint8_t* C = I + (size_t)y * w; const uint8_t* D = I + (size_t)refl101(y + 1, h) * w;
+    for (int x = 0; x < w; x++) {
+      const int l = refl101(x - 1, w), r = refl101(x + 1, w);
+      gx[(size_t)y * w + x] = (int16_t)((U[r] - U[l]) + 2 * (C[r] - C[l]) + (D[r] - D[l]));
+      gy[(size_t)y * w + x] = (int16_t)((D[l] - U[l]) + 2 * (D[x] - U[x]) + (D[r] - U[r]));
+    }
+  }
+}
+
+// flow image of one frame (build.flow_img): uint8 (h*k) x (w*k)
+static void flow_img(const uint8_t* rgba, int w, int h, int k, bool bgra, std::vector<uint8_t>& out) {
+  const int W = w * k, H = h * k;
+  std::vector<float> g((size_t)w * h), G((size_t)W * H);
+  for (size_t i = 0; i < g.size(); i++) {
+    const uint8_t* p = rgba + i * 4;
+    const double r = bgra ? p[2] : p[0], gg = p[1], b = bgra ? p[0] : p[2];
+    const double L = (r * .299 + gg * .587 + b * .114) / 255.0, a = p[3] / 255.0;
+    g[i] = (float)((L * 0.6 + 0.4) * a);
+  }
+  tmap::resize_linear_f32(g.data(), w, h, k, G.data());
+  tmap::gauss_f32(G.data(), W, H, k * 0.6);
+  out.resize((size_t)W * H);
+  for (size_t i = 0; i < G.size(); i++) {
+    float t = G[i] * 255.0f;
+    t = t < 0.f ? 0.f : (t > 255.f ? 255.f : t);
+    out[i] = (uint8_t)t;
+  }
+}
+
+// ---------------------------------------------------------------- DIS optical flow (OpenCV PRESET_MEDIUM, CPU path)
+static const float DEPS = 0.001f, DINF = 1e10f;
+struct DisCfg { int finest = 1, coarsest = 0, ps = 8, stride = 3, gd = 25, vr = 5; };
+// call n (0 = first) of one DISOpticalFlow object on W x H images (calc() may move finest_scale for good)
+static DisCfg dis_cfg(int W, int H, int call) {
+  DisCfg c; int finest_state = 1;
+  for (int n = 0; n <= call; n++) {
+    c.ps = 8;
+    const int mx = std::max(W, H), mn = std::min(W, H);
+    const int a = (int)(std::log(mx / (4.0 * 8)) / std::log(2.0) + 0.5), b = (int)(std::log((double)(mn / 8)) / std::log(2.0));
+    c.coarsest = std::min(a, b);
+    c.finest = finest_state;
+    if (c.coarsest < 0) { c.coarsest = -1; return c; }
+    if (c.coarsest < c.finest) {
+      const float r = (2.0f * (float)W) / ((float)5 * (float)8);
+      c.coarsest = std::max(0, (int)std::floor(std::log2(r)));
+      c.finest = std::max(c.coarsest - 2, 0);
+      finest_state = c.finest;
+    }
+  }
+  return c;
+}
+struct DisLevel {  // frame-0 side of one pyramid level (shared by all frames of a sprite)
+  int w = 0, h = 0, ws = 0, hs = 0;
+  std::vector<uint8_t> I0; std::vector<int16_t> Ix, Iy;
+  std::vector<float> xx, yy, xy, sx, sy;
+};
+static void structure_tensor(DisLevel& L, int ps, int st) {
+  const int w = L.w, h = L.h, ws = L.ws;
+  std::vector<float> axx((size_t)h * ws), ayy(axx.size()), axy(axx.size()), ax(axx.size()), ay(axx.size());
+  for (int i = 0; i < h; i++) {
+    float sxx = 0, syy = 0, sxy = 0, sx = 0, sy = 0;
+    const int16_t* xr = &L.Ix[(size_t)i * w]; const int16_t* yr = &L.Iy[(size_t)i * w];
+    for (int j = 0; j < ps; j++) { sxx += xr[j] * xr[j]; syy += yr[j] * yr[j]; sxy += xr[j] * yr[j]; sx += xr[j]; sy += yr[j]; }
+    axx[(size_t)i * ws] = sxx; ayy[(size_t)i * ws] = syy; axy[(size_t)i * ws] = sxy; ax[(size_t)i * ws] = sx; ay[(size_t)i * ws] = sy;
+    int js = 1;
+    for (int j = ps; j < w; j++) {
+      sxx += (xr[j] * xr[j] - xr[j - ps] * xr[j - ps]); syy += (yr[j] * yr[j] - yr[j - ps] * yr[j - ps]);
+      sxy += (xr[j] * yr[j] - xr[j - ps] * yr[j - ps]); sx += (xr[j] - xr[j - ps]); sy += (yr[j] - yr[j - ps]);
+      if ((j - ps + 1) % st == 0 && js < ws) {
+        const size_t o = (size_t)i * ws + js; axx[o] = sxx; ayy[o] = syy; axy[o] = sxy; ax[o] = sx; ay[o] = sy; js++;
+      }
+    }
+  }
+  const size_t n = (size_t)L.hs * ws;
+  L.xx.assign(n, 0); L.yy.assign(n, 0); L.xy.assign(n, 0); L.sx.assign(n, 0); L.sy.assign(n, 0);
+  std::vector<float> s1(ws, 0), s2(ws, 0), s3(ws, 0), s4(ws, 0), s5(ws, 0);
+  for (int i = 0; i < ps; i++)
+    for (int j = 0; j < ws; j++) { const size_t o = (size_t)i * ws + j; s1[j] += axx[o]; s2[j] += ayy[o]; s3[j] += axy[o]; s4[j] += ax[o]; s5[j] += ay[o]; }
+  for (int j = 0; j < ws; j++) { L.xx[j] = s1[j]; L.yy[j] = s2[j]; L.xy[j] = s3[j]; L.sx[j] = s4[j]; L.sy[j] = s5[j]; }
+  int is = 1;
+  for (int i = ps; i < h; i++) {
+    for (int j = 0; j < ws; j++) {
+      const size_t o = (size_t)i * ws + j, q = (size_t)(i - ps) * ws + j;
+      s1[j] += (axx[o] - axx[q]); s2[j] += (ayy[o] - ayy[q]); s3[j] += (axy[o] - axy[q]); s4[j] += (ax[o] - ax[q]); s5[j] += (ay[o] - ay[q]);
+    }
+    if ((i - ps + 1) % st == 0 && is < L.hs) {
+      for (int j = 0; j < ws; j++) { const size_t o = (size_t)is * ws + j; L.xx[o] = s1[j]; L.yy[o] = s2[j]; L.xy[o] = s3[j]; L.sx[o] = s4[j]; L.sy[o] = s5[j]; }
+      is++;
+    }
+  }
+}
+struct DisRef {  // frame-0 pyramid for one DisCfg
+  DisCfg c; int W = 0, H = 0; std::vector<DisLevel> lv;  // index = scale
+  bool ok() const { return c.coarsest >= 0 && !lv.empty(); }
+};
+static void level_sizes(const DisCfg& c, int W, int H, std::vector<std::pair<int, int>>& sz) {
+  sz.assign(c.coarsest + 1, {0, 0});
+  int f = 1 << c.finest;
+  sz[c.finest] = {W / f, H / f};
+  for (int i = c.finest + 1; i <= c.coarsest; i++) sz[i] = {sz[i - 1].first / 2, sz[i - 1].second / 2};
+}
+static void pyramid(const uint8_t* I, int W, int H, const DisCfg& c, std::vector<std::vector<uint8_t>>& out) {
+  std::vector<std::pair<int, int>> sz; level_sizes(c, W, H, sz);
+  out.assign(c.coarsest + 1, {});
+  for (int i = c.finest; i <= c.coarsest; i++) {
+    out[i].resize((size_t)sz[i].first * sz[i].second);
+    if (i == c.finest) resize_area_u8(I, W, H, out[i].data(), sz[i].first, sz[i].second);
+    else resize_area_u8(out[i - 1].data(), sz[i - 1].first, sz[i - 1].second, out[i].data(), sz[i].first, sz[i].second);
+  }
+}
+static void dis_ref(const uint8_t* I0, int W, int H, const DisCfg& c, DisRef& R) {
+  R.c = c; R.W = W; R.H = H; R.lv.clear();
+  if (c.coarsest < 0) return;
+  std::vector<std::vector<uint8_t>> p; pyramid(I0, W, H, c, p);
+  std::vector<std::pair<int, int>> sz; level_sizes(c, W, H, sz);
+  R.lv.resize(c.coarsest + 1);
+  for (int i = c.finest; i <= c.coarsest; i++) {
+    DisLevel& L = R.lv[i];
+    L.w = sz[i].first; L.h = sz[i].second; L.I0.swap(p[i]);
+    L.ws = 1 + (L.w - c.ps) / c.stride; L.hs = 1 + (L.h - c.ps) / c.stride;
+    L.Ix.resize(L.I0.size()); L.Iy.resize(L.I0.size());
+    spatial_gradient(L.I0.data(), L.w, L.h, L.Ix.data(), L.Iy.data());
+    structure_tensor(L, c.ps, c.stride);
+  }
+}
+
+// variational refinement (cv::VariationalRefinement as configured by DIS), plain grid form of the red-black solver
+struct Varref {
+  int w = 0, h = 0;
+  std::vector<float> Ix, Iy, Iz, Ixx, Ixy, Iyy, Ixz, Iyz, A11, A12, A22, b1, b2, wt, dU, dV, tU, tV, Wu, Wv, avg, warp;
+  std::vector<float> rbW[2], rbU[2], rbV[2], rbA11[2], rbA12[2], rbA22[2], rbB1[2], rbB2[2];
+  void sobel_x(const float* s, float* d) const {
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { const float* r = s + (size_t)y * w; d[(size_t)y * w + x] = r[std::min(x + 1, w - 1)] - r[std::max(x - 1, 0)]; }
+  }
+  void sobel_y(const float* s, float* d) const {
+    for (int y = 0; y < h; y++) {
+      const float* u = s + (size_t)std::max(y - 1, 0) * w; const float* dn = s + (size_t)std::min(y + 1, h - 1) * w;
+      for (int x = 0; x < w; x++) d[(size_t)y * w + x] = dn[x] - u[x];
+    }
+  }
+  void run(const uint8_t* I0, const uint8_t* I1, int w_, int h_, float* U, float* V, int fp_iter) {
+    w = w_; h = h_; const size_t N = (size_t)w * h;
+    for (auto* v : {&Ix, &Iy, &Iz, &Ixx, &Ixy, &Iyy, &Ixz, &Iyz, &A11, &A12, &A22, &b1, &b2, &wt, &dU, &dV, &tU, &tV, &Wu, &Wv, &avg, &warp}) v->assign(N, 0.f);
+    // warp I1 by the flow (cv2.remap INTER_LINEAR, BORDER_REPLICATE; OpenCV 5 interpolates float coordinates)
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        const size_t o = (size_t)y * w + x;
+        const float fx = x + U[o], fy = y + V[o];
+        const float flx = std::floor(fx), fly = std::floor(fy);
+        const int sx = (int)flx, sy = (int)fly;
+        const float ax = fx - flx, ay = fy - fly;
+        const int x0 = std::min(std::max(sx, 0), w - 1), x1 = std::min(std::max(sx + 1, 0), w - 1);
+        const int y0 = std::min(std::max(sy, 0), h - 1), y1 = std::min(std::max(sy + 1, 0), h - 1);
+        const float a00 = I1[(size_t)y0 * w + x0], a01 = I1[(size_t)y0 * w + x1], a10 = I1[(size_t)y1 * w + x0], a11 = I1[(size_t)y1 * w + x1];
+        const float p = a00 + (a01 - a00) * ax, q = a10 + (a11 - a10) * ax;
+        const float v = p + (q - p) * ay;
+        warp[o] = v;
+        avg[o] = (float)I0[o] * 0.5f + v * 0.5f;
+        Iz[o] = v - (float)I0[o];
+      }
+    sobel_x(avg.data(), Ix.data()); sobel_y(avg.data(), Iy.data());
+    sobel_x(Iz.data(), Ixz.data()); sobel_y(Iz.data(), Iyz.data());
+    sobel_x(Ix.data(), Ixx.data()); sobel_y(Ix.data(), Ixy.data()); sobel_y(Iy.data(), Iyy.data());
+    std::memcpy(Wu.data(), U, N * 4); std::memcpy(Wv.data(), V, N * 4);
+    tU = Wu; tV = Wv;
+    const float alpha = 20.f, gamma = 10.f, delta = 5.f, eps = 0.01f, omega = 1.6f, zeta = 0.1f;
+    const float z2 = zeta * zeta, e2 = eps * eps, g2 = gamma / 2, d2 = delta / 2, a2 = alpha / 2;
+    // red-black SOR on split rows: colour c of row y holds x = ((y + c) & 1) + 2m at column m + 1 (columns 0 and last stay 0)
+    const int cwp = (w + 1) / 2 + 2;
+    for (int c = 0; c < 2; c++) for (auto* v : {&rbW[c], &rbU[c], &rbV[c], &rbA11[c], &rbA12[c], &rbA22[c], &rbB1[c], &rbB2[c]}) v->assign((size_t)(h + 2) * cwp, 0.f);
+    auto rb = [&](int, int y, int m) { return (size_t)(y + 1) * cwp + m + 1; };
+    auto split = [&](const std::vector<float>& src, std::vector<float>* dst) {
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) { const int c = (x + y) & 1; dst[c][rb(c, y, x >> 1)] = src[(size_t)y * w + x]; }
+    };
+    for (int it = 0; it < fp_iter; it++) {
+      for (size_t o = 0; o < N; o++) {
+        const float ix = Ix[o], iy = Iy[o], iz = Iz[o], du = dU[o], dv = dV[o];
+        float dn = ix * ix + iy * iy + z2;
+        const float ik = iz + ix * du + iy * dv;
+        float wgt = (d2 / std::sqrt(ik * ik / dn + e2)) / dn;
+        float a11 = wgt * (ix * ix) + z2, a12 = wgt * (ix * iy), a22 = wgt * (iy * iy) + z2;
+        float c1 = -wgt * (iz * ix), c2 = -wgt * (iz * iy);
+        const float ixx = Ixx[o], ixy = Ixy[o], iyy = Iyy[o], ixz = Ixz[o], iyz = Iyz[o];
+        dn = ixx * ixx + ixy * ixy + z2;
+        const float dn2 = iyy * iyy + ixy * ixy + z2;
+        const float kx = ixz + ixx * du + ixy * dv, ky = iyz + ixy * du + iyy * dv;
+        wgt = g2 / std::sqrt(kx * kx / dn + ky * ky / dn2 + e2);
+        a11 += wgt * (ixx * ixx / dn + ixy * ixy / dn2);
+        a12 += wgt * (ixx * ixy / dn + ixy * iyy / dn2);
+        a22 += wgt * (ixy * ixy / dn + iyy * iyy / dn2);
+        c1 += -wgt * (ixx * ixz / dn + ixy * iyz / dn2);
+        c2 += -wgt * (ixy * ixz / dn + iyy * iyz / dn2);
+        A11[o] = a11; A12[o] = a12; A22[o] = a22; b1[o] = c1; b2[o] = c2;
+      }
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+          const size_t o = (size_t)y * w + x, r = x + 1 < w ? o + 1 : o, d = y + 1 < h ? o + w : o;
+          const float ux = tU[r] - tU[o], vx = tV[r] - tV[o], uy = tU[d] - tU[o], vy = tV[d] - tV[o];
+          wt[o] = a2 / std::sqrt(ux * ux + vx * vx + uy * uy + vy * vy + e2);
+        }
+      // smoothness terms in the order the red pass / black pass add them
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+          const size_t o = (size_t)y * w + x;
+          const bool red = ((x + y) & 1) == 0, hr = x + 1 < w, hl = x > 0, hd = y + 1 < h, hu = y > 0;
+          float a11 = A11[o], a22 = A22[o], c1 = b1[o], c2 = b2[o];
+          const float wo = wt[o];
+          auto own_r = [&]() { if (hr) { c1 += wo * (Wu[o + 1] - Wu[o]); a11 += wo; c2 += wo * (Wv[o + 1] - Wv[o]); a22 += wo; } };
+          auto from_l = [&]() { if (hl) { const float wl = wt[o - 1]; c1 -= wl * (Wu[o] - Wu[o - 1]); a11 += wl; c2 -= wl * (Wv[o] - Wv[o - 1]); a22 += wl; } };
+          auto own_d = [&]() { if (hd) { c1 += wo * (Wu[o + w] - Wu[o]); a11 += wo; c2 += wo * (Wv[o + w] - Wv[o]); a22 += wo; } };
+          auto from_u = [&]() { if (hu) { const float wu = wt[o - w]; c1 -= wu * (Wu[o] - Wu[o - w]); a11 += wu; c2 -= wu * (Wv[o] - Wv[o - w]); a22 += wu; } };
+          if (red) { own_r(); from_l(); own_d(); from_u(); } else { from_l(); own_r(); from_u(); own_d(); }
+          A11[o] = a11; A22[o] = a22; b1[o] = c1; b2[o] = c2;
+        }
+      split(wt, rbW); split(dU, rbU); split(dV, rbV); split(A11, rbA11); split(A12, rbA12); split(A22, rbA22); split(b1, rbB1); split(b2, rbB2);
+      for (int s = 0; s < 5; s++)
+        for (int c = 0; c < 2; c++) {
+          const int oc = 1 - c;
+          for (int y = 0; y < h; y++) {
+            const int x0 = (y + c) & 1, cnt = (w - x0 + 1) / 2, sh = x0;  // odd x: left/right neighbours sit one column further
+            float* pu = &rbU[c][rb(c, y, 0)]; float* pv = &rbV[c][rb(c, y, 0)];
+            const float* pw = &rbW[c][rb(c, y, 0)];
+            const float* a11 = &rbA11[c][rb(c, y, 0)]; const float* a12 = &rbA12[c][rb(c, y, 0)]; const float* a22 = &rbA22[c][rb(c, y, 0)];
+            const float* q1 = &rbB1[c][rb(c, y, 0)]; const float* q2 = &rbB2[c][rb(c, y, 0)];
+            const float* nu = &rbU[oc][rb(oc, y, 0)] - 1 + sh; const float* nv = &rbV[oc][rb(oc, y, 0)] - 1 + sh;
+            const float* nw = &rbW[oc][rb(oc, y, 0)] - 1 + sh;
+            const float* uu = &rbU[oc][rb(oc, y - 1, 0)]; const float* uv = &rbV[oc][rb(oc, y - 1, 0)]; const float* uw = &rbW[oc][rb(oc, y - 1, 0)];
+            const float* du = &rbU[oc][rb(oc, y + 1, 0)]; const float* dv = &rbV[oc][rb(oc, y + 1, 0)];
+            for (int m = 0; m < cnt; m++) {
+              const float wc = pw[m];
+              const float su = nw[m] * nu[m] + wc * nu[m + 1] + uw[m] * uu[m] + wc * du[m];
+              const float sv = nw[m] * nv[m] + wc * nv[m + 1] + uw[m] * uv[m] + wc * dv[m];
+              const float nu_ = pu[m] + omega * ((su + q1[m] - pv[m] * a12[m]) / a11[m] - pu[m]);
+              pu[m] = nu_;
+              pv[m] = pv[m] + omega * ((sv + q2[m] - nu_ * a12[m]) / a22[m] - pv[m]);
+            }
+          }
+        }
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) { const int c = (x + y) & 1; const size_t o = (size_t)y * w + x; dU[o] = rbU[c][rb(c, y, x >> 1)]; dV[o] = rbV[c][rb(c, y, x >> 1)]; }
+      for (size_t o = 0; o < N; o++) { tU[o] = Wu[o] + dU[o]; tV[o] = Wv[o] + dV[o]; }
+    }
+    std::memcpy(U, tU.data(), N * 4); std::memcpy(V, tV.data(), N * 4);
+  }
+};
+
+// per-thread buffers for one frame's flow
+struct DisWork {
+  std::vector<std::vector<uint8_t>> I1;
+  std::vector<uint8_t> ext;
+  std::vector<float> Ux, Uy, Nx, Ny, Sx, Sy;
+  Varref vr;
+};
+// 8x8 patch sums in the lane order of OpenCV's SIMD128 path (4 lanes, left/right half rows, (l0+l1)+(l2+l3)).
+// GCC/clang vector extension: each lane is the same IEEE float operation as scalar code.
+typedef float v4f __attribute__((vector_size(16)));
+typedef int32_t v4i __attribute__((vector_size(16)));
+static inline v4f ld8(const uint8_t* p) { v4i t = {p[0], p[1], p[2], p[3]}; return __builtin_convertvector(t, v4f); }
+static inline v4f ld16(const int16_t* p) { v4i t = {p[0], p[1], p[2], p[3]}; return __builtin_convertvector(t, v4f); }
+static inline float red4(v4f v) { return (v[0] + v[1]) + (v[2] + v[3]); }
+static inline float ssd_mn(const uint8_t* I0, const uint8_t* I1, int s0, int s1, float w00, float w01, float w10, float w11) {
+  const v4f W00 = {w00, w00, w00, w00}, W01 = {w01, w01, w01, w01}, W10 = {w10, w10, w10, w10}, W11 = {w11, w11, w11, w11};
+  v4f sd = {0, 0, 0, 0}, sq = {0, 0, 0, 0};
+  for (int i = 0; i < 8; i++) {
+    const uint8_t* a = I1 + i * s1; const uint8_t* b = a + s1; const uint8_t* z = I0 + i * s0;
+    const v4f dl = W00 * ld8(a) + W01 * ld8(a + 1) + W10 * ld8(b) + W11 * ld8(b + 1) - ld8(z);
+    const v4f dr = W00 * ld8(a + 4) + W01 * ld8(a + 5) + W10 * ld8(b + 4) + W11 * ld8(b + 5) - ld8(z + 4);
+    sq = sq + (dl * dl + dr * dr); sd = sd + (dl + dr);
+  }
+  const float SD = red4(sd), SQ = red4(sq);
+  return SQ - SD * SD / 64.0f;
+}
+static inline float patch_mn(float& dux, float& duy, const uint8_t* I0, const uint8_t* I1, const int16_t* gx, const int16_t* gy, int s0, int s1,
+                             float w00, float w01, float w10, float w11, float xs, float ys) {
+  const v4f W00 = {w00, w00, w00, w00}, W01 = {w01, w01, w01, w01}, W10 = {w10, w10, w10, w10}, W11 = {w11, w11, w11, w11};
+  v4f sd = {0, 0, 0, 0}, sq = {0, 0, 0, 0}, mx = {0, 0, 0, 0}, my = {0, 0, 0, 0};
+  for (int i = 0; i < 8; i++) {
+    const uint8_t* a = I1 + i * s1; const uint8_t* b = a + s1; const uint8_t* z = I0 + i * s0;
+    const int16_t* X = gx + i * s0; const int16_t* Y = gy + i * s0;
+    const v4f dl = W00 * ld8(a) + W01 * ld8(a + 1) + W10 * ld8(b) + W11 * ld8(b + 1) - ld8(z);
+    const v4f dr = W00 * ld8(a + 4) + W01 * ld8(a + 5) + W10 * ld8(b + 4) + W11 * ld8(b + 5) - ld8(z + 4);
+    mx = mx + (dl * ld16(X) + dr * ld16(X + 4));
+    my = my + (dl * ld16(Y) + dr * ld16(Y + 4));
+    sq = sq + (dl * dl + dr * dr); sd = sd + (dl + dr);
+  }
+  const float SD = red4(sd), SQ = red4(sq), MX = red4(mx), MY = red4(my);
+  dux = MX - SD * xs / 64.0f; duy = MY - SD * ys / 64.0f;
+  return SQ - SD * SD / 64.0f;
+}
+static void inverse_search(const DisCfg& c, const DisLevel& L, const uint8_t* I1e, const float* Ux, const float* Uy, float* Sx, float* Sy) {
+  const int psz = c.ps, psz2 = psz / 2, bsz = 16, w = L.w, h = L.h, ws = L.ws, hs = L.hs, wext = w + 2 * bsz;
+  const float il = std::max(bsz - psz + 1.0f, 0.0f), iu = std::min(bsz + h - 1.0f, h + 2.0f * bsz - 1.0f - psz);
+  const float jl = std::max(bsz - psz + 1.0f, 0.0f), ju = std::min(bsz + w - 1.0f, w + 2.0f * bsz - 1.0f - psz);
+  const int num_iter = 2, inner = (int)std::floor(c.gd / (float)num_iter), nstripes = 8;
+  const int stripe = (int)std::ceil(hs / (double)nstripes);
+  for (int sn = 0; sn < nstripes; sn++) {
+    for (int iter = 0; iter < num_iter; iter++) {
+      int dir, sis, eis, sjs, ejs, si, sj;
+      if (iter % 2 == 0) { dir = 1; sis = std::min(sn * stripe, hs); eis = std::min((sn + 1) * stripe, hs); sjs = 0; ejs = ws; si = sis * c.stride; sj = 0; }
+      else { dir = -1; sis = std::min((sn + 1) * stripe, hs) - 1; eis = std::min(sn * stripe, hs) - 1; sjs = ws - 1; ejs = -1; si = sis * c.stride; sj = (ws - 1) * c.stride; }
+      int i = si;
+      for (int is = sis; dir * is < dir * eis; is += dir) {
+        int j = sj;
+        for (int js = sjs; dir * js < dir * ejs; js += dir) {
+          const size_t o = (size_t)is * ws + js;
+          if (iter == 0) { Sx[o] = Ux[(size_t)(i + psz2) * w + j + psz2]; Sy[o] = Uy[(size_t)(i + psz2) * w + j + psz2]; }
+          float w00, w01, w10, w11; float iI, jI;
+          auto weights = [&](float ux, float uy) {
+            iI = std::min(std::max(i + uy + bsz, il), iu); jI = std::min(std::max(j + ux + bsz, jl), ju);
+            const float di = iI - std::floor(iI), dj = jI - std::floor(jI);
+            w11 = di * dj; w10 = di * (1 - dj); w01 = (1 - di) * dj; w00 = (1 - di) * (1 - dj);
+          };
+          auto ssd = [&](float ux, float uy) {
+            weights(ux, uy);
+            return ssd_mn(&L.I0[(size_t)i * w + j], I1e + (size_t)(int)iI * wext + (int)jI, w, wext, w00, w01, w10, w11);
+          };
+          float mins = ssd(Sx[o], Sy[o]), cur;
+          if (dir * js > dir * sjs) {
+            cur = ssd(Sx[o - dir], Sy[o - dir]);
+            if (cur < mins) { mins = cur; Sx[o] = Sx[o - dir]; Sy[o] = Sy[o - dir]; }
+          }
+          if (dir * is > dir * sis) {
+            const size_t q = (size_t)(is - dir) * ws + js;
+            cur = ssd(Sx[q], Sy[q]);
+            if (cur < mins) { mins = cur; Sx[o] = Sx[q]; Sy[o] = Sy[q]; }
+          }
+          float cx = Sx[o], cy = Sy[o];
+          float det = L.xx[o] * L.yy[o] - L.xy[o] * L.xy[o];
+          if (std::fabs(det) < DEPS) det = DEPS;
+          const float h11 = L.yy[o] / det, h12 = -L.xy[o] / det, h22 = L.xx[o] / det;
+          float prev = DINF;
+          for (int t = 0; t < inner; t++) {
+            weights(cx, cy);
+            float dux, duy;
+            const float s = patch_mn(dux, duy, &L.I0[(size_t)i * w + j], I1e + (size_t)(int)iI * wext + (int)jI, &L.Ix[(size_t)i * w + j], &L.Iy[(size_t)i * w + j],
+                                     w, wext, w00, w01, w10, w11, L.sx[o], L.sy[o]);
+            const float dx = h11 * dux + h12 * duy, dy = h12 * dux + h22 * duy;
+            cx -= dx; cy -= dy;
+            if (s >= prev) break;
+            prev = s;
+          }
+          const float ex = cx - Sx[o], ey = cy - Sy[o];
+          if (std::sqrt(ex * ex + ey * ey) <= (float)psz) { Sx[o] = cx; Sy[o] = cy; }
+          j += dir * c.stride;
+        }
+        i += dir * c.stride;
+      }
+    }
+  }
+}
+static void densify(const DisCfg& c, const DisLevel& L, const uint8_t* I1, const float* Sx, const float* Sy, float* Ux, float* Uy) {
+  const int psz = c.ps, pstr = c.stride, w = L.w, h = L.h, ws = L.ws;
+  int sis = 0, eis = -1;
+  for (int i = 0; i < h; i++) {
+    if (i % pstr == 0 && i + psz <= h) eis++;
+    if (i - psz >= 0 && (i - psz) % pstr == 0 && sis < eis) sis++;
+    int sjs = 0, ejs = -1;
+    for (int j = 0; j < w; j++) {
+      if (j % pstr == 0 && j + psz <= w) ejs++;
+      if (j - psz >= 0 && (j - psz) % pstr == 0 && sjs < ejs) sjs++;
+      float sc = 0.f, su = 0.f, sv = 0.f;
+      for (int is = sis; is <= eis; is++)
+        for (int js = sjs; js <= ejs; js++) {
+          const float sx = Sx[(size_t)is * ws + js], sy = Sy[(size_t)is * ws + js];
+          const float jm = std::min(std::max(j + sx, 0.0f), w - 1.0f - DEPS), im = std::min(std::max(i + sy, 0.0f), h - 1.0f - DEPS);
+          const int jl_ = (int)jm, ju_ = jl_ + 1, il_ = (int)im, iu_ = il_ + 1;
+          const float diff = (jm - jl_) * (im - il_) * I1[(size_t)iu_ * w + ju_] + (ju_ - jm) * (im - il_) * I1[(size_t)iu_ * w + jl_] +
+                             (jm - jl_) * (iu_ - im) * I1[(size_t)il_ * w + ju_] + (ju_ - jm) * (iu_ - im) * I1[(size_t)il_ * w + jl_] - L.I0[(size_t)i * w + j];
+          const float coef = 1 / std::max(1.0f, std::fabs(diff));
+          su += coef * sx; sv += coef * sy; sc += coef;
+        }
+      Ux[(size_t)i * w + j] = su / sc; Uy[(size_t)i * w + j] = sv / sc;
+    }
+  }
+}
+// flow of frame I1 against the reference pyramid; out = finest-level U,V (size of R.lv[finest]); returns false on bad sizes
+static bool dis_calc(const DisRef& R, const uint8_t* I1, DisWork& K, const std::atomic<bool>* cancel = nullptr) {
+  const DisCfg& c = R.c;
+  if (!R.ok()) return false;
+  pyramid(I1, R.W, R.H, c, K.I1);
+  for (int i = c.coarsest; i >= c.finest; i--) {
+    if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+    const DisLevel& L = R.lv[i];
+    const int w = L.w, h = L.h, b = 16, we = w + 2 * b;
+    if (L.ws <= 0 || L.hs <= 0) return false;
+    K.ext.resize((size_t)we * (h + 2 * b));
+    for (int y = 0; y < h + 2 * b; y++) {
+      const uint8_t* s = &K.I1[i][(size_t)std::min(std::max(y - b, 0), h - 1) * w]; uint8_t* d = &K.ext[(size_t)y * we];
+      for (int x = 0; x < we; x++) d[x] = s[std::min(std::max(x - b, 0), w - 1)];
+    }
+    if (i == c.coarsest) { K.Ux.assign((size_t)w * h, 0.f); K.Uy.assign((size_t)w * h, 0.f); }
+    K.Sx.assign((size_t)L.ws * L.hs, 0.f); K.Sy.assign(K.Sx.size(), 0.f);
+    inverse_search(c, L, K.ext.data(), K.Ux.data(), K.Uy.data(), K.Sx.data(), K.Sy.data());
+    densify(c, L, K.I1[i].data(), K.Sx.data(), K.Sy.data(), K.Ux.data(), K.Uy.data());
+    if (c.vr > 0) K.vr.run(L.I0.data(), K.I1[i].data(), w, h, K.Ux.data(), K.Uy.data(), c.vr);
+    if (i > c.finest) {
+      const DisLevel& N = R.lv[i - 1];
+      K.Nx.resize((size_t)N.w * N.h); K.Ny.resize(K.Nx.size());
+      resize_linear_any(K.Ux.data(), w, h, K.Nx.data(), N.w, N.h);
+      resize_linear_any(K.Uy.data(), w, h, K.Ny.data(), N.w, N.h);
+      for (size_t q = 0; q < K.Nx.size(); q++) { K.Nx[q] *= 2; K.Ny[q] *= 2; }
+      K.Ux.swap(K.Nx); K.Uy.swap(K.Ny);
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------- the sprite: mesh on frame 0, vertex tracks per frame
+static const int TRK_MAX_V = 65000;
+static const int64_t TRK_MAX_PX = 1 << 21;  // flow image pixels (about 50 bytes each per worker)
+struct Sprite {
+  int fw = 0, fh = 0, k = 0, nf = 0, W = 0, H = 0; bool bgra = false;
+  std::vector<uint8_t> px;              // nf frames, frame-major, fw*fh*4 each
+  std::vector<float> p0; std::vector<int32_t> tri; int nv = 0, nt = 0;
+  std::vector<int> vx, vy;              // rounded, clipped vertex pixel
+  std::vector<uint8_t> g0;
+  DisRef ref0, ref1;                    // first call / later calls of the one DIS object
+  std::vector<float> kern; int kr = 0;  // cv2 Gaussian kernel for the flow blur
+  std::vector<int16_t> dv;              // nf * nv * 2 (1/16 px, minus p0)
+  std::vector<uint8_t> okb;             // nf * ((nt+7)/8)
+  const uint8_t* frame(int i) const { return &px[(size_t)i * fw * fh * 4]; }
+  // 0 ok; 21 empty body, 22 too many vertices, 23 triangulation failed, 24 too small for the flow, 26 too large
+  int prepare() {
+    W = fw * k; H = fh * k;
+    if ((int64_t)W * H > TRK_MAX_PX) return 26;
+    const size_t n1 = (size_t)fw * fh;
+    std::vector<uint8_t> uni(n1, 0);
+    for (int f = 0; f < nf; f++) { const uint8_t* p = frame(f); for (size_t i = 0; i < n1; i++) if (p[i * 4 + 3]) uni[i] = 1; }
+    long area = 0; for (uint8_t u : uni) area += u;
+    if (area == 0) return 21;
+    const double spacing = 0.12 * std::sqrt((double)area);
+    const double s = spacing * k;
+    if (!(s >= 1.0)) return 22;
+    const double est = ((W + 2 * s) / s + 2) * ((H + 2 * s) / (s * 0.87) + 2) + 400;
+    if (est > TRK_MAX_V) return 22;
+    Pcg64 rng;
+    std::vector<double> pts;
+    double y = -s; int row = 0;
+    while (y < H + s) {
+      double x = -s + (row % 2 ? s * 0.5 : 0);
+      while (x < W + s) {
+        const double ax = x + rng.uniform(-.38, .38) * s;
+        const double ay = y + rng.uniform(-.38, .38) * s;
+        pts.push_back(ax); pts.push_back(ay);
+        x += s;
+      }
+      y += s * 0.87; row++;
+    }
+    {
+      std::vector<float> a1(n1), m((size_t)W * H);
+      const uint8_t* f0 = frame(0);
+      for (size_t i = 0; i < n1; i++) a1[i] = f0[i * 4 + 3] ? 1.f : 0.f;
+      tmap::resize_linear_f32(a1.data(), fw, fh, k, m.data());
+      tmap::gauss_f32(m.data(), W, H, k * 0.45);
+      std::vector<uint8_t> mb((size_t)W * H);
+      for (size_t i = 0; i < mb.size(); i++) mb[i] = m[i] > 0.5f;
+      std::vector<double> dt((size_t)W * H);
+      tmap::edt(mb.data(), W, H, dt.data());
+      std::vector<int64_t> cand;
+      const double lim = s * 0.45;
+      for (size_t i = 0; i < mb.size(); i++) if (mb[i] && dt[i] < lim) cand.push_back((int64_t)i);
+      if (!cand.empty()) {
+        const int64_t q = std::max<int64_t>(1, (int64_t)(s * s * 0.9));
+        const int64_t npick = std::min<int64_t>((int64_t)cand.size() / q + 1, 400);
+        std::vector<int64_t> pick = rng.choice((int64_t)cand.size(), npick);
+        for (int64_t pi : pick) {
+          const int64_t c = cand[pi]; const int64_t py = c / W, pxx = c % W;
+          const double ax = (double)pxx + rng.uniform(-.5, .5);
+          const double ay = (double)py + rng.uniform(-.5, .5);
+          pts.push_back(ax); pts.push_back(ay);
+        }
+      }
+    }
+    nv = (int)(pts.size() / 2);
+    if (nv >= TRK_MAX_V) return 22;
+    p0.resize(pts.size());
+    for (size_t i = 0; i < pts.size(); i++) p0[i] = (float)pts[i];
+    for (int i = 0; i < nv * 2; i++) if (!(std::fabs(p0[i] * 16.0f) < 32767.0f)) return 22;
+    Delaunay D;
+    if (D.run(p0.data(), nv) != 0) return 23;
+    {  // canonical order: each triangle as ascending vertex ids, triangles sorted (pack.py can apply the same rule)
+      std::vector<std::array<int32_t, 3>> T(D.tri.size() / 3);
+      for (size_t t = 0; t < T.size(); t++) { T[t] = {D.tri[3 * t], D.tri[3 * t + 1], D.tri[3 * t + 2]}; std::sort(T[t].begin(), T[t].end()); }
+      std::sort(T.begin(), T.end());
+      tri.resize(T.size() * 3);
+      for (size_t t = 0; t < T.size(); t++) { tri[3 * t] = T[t][0]; tri[3 * t + 1] = T[t][1]; tri[3 * t + 2] = T[t][2]; }
+    }
+    nt = (int)(tri.size() / 3);
+    if (nt <= 0 || nt >= 65536) return 23;
+    vx.resize(nv); vy.resize(nv);
+    for (int i = 0; i < nv; i++) {
+      const float rx = std::nearbyint(p0[2 * i]), ry = std::nearbyint(p0[2 * i + 1]);
+      vx[i] = (int)std::min(std::max(rx, 0.f), (float)(W - 1)); vy[i] = (int)std::min(std::max(ry, 0.f), (float)(H - 1));
+    }
+    flow_img(frame(0), fw, fh, k, bgra, g0);
+    const DisCfg c0 = dis_cfg(W, H, 0), c1 = dis_cfg(W, H, 1);
+    if (c0.coarsest < 0 || c1.coarsest < 0) return 24;
+    dis_ref(g0.data(), W, H, c0, ref0);
+    if (c1.finest == c0.finest && c1.coarsest == c0.coarsest) ref1 = ref0; else dis_ref(g0.data(), W, H, c1, ref1);
+    const double sg = k * 1.2;
+    const int n = ((int)std::lround(sg * 4 * 2 + 1)) | 1;
+    kern.resize(n); kr = n / 2;
+    const double s2 = -0.5 / (sg * sg); double sum = 0;
+    for (int i = 0; i < n; i++) { const double x = i - (n - 1) * 0.5; kern[i] = (float)std::exp(s2 * x * x); sum += kern[i]; }
+    sum = 1. / sum;
+    for (int i = 0; i < n; i++) kern[i] = (float)(kern[i] * sum);
+    dv.assign((size_t)nf * nv * 2, 0); okb.assign((size_t)nf * ((nt + 7) / 8), 0);
+    return 0;
+  }
+  // track one frame (thread-safe for distinct f)
+  int track(int f, DisWork& K, const std::atomic<bool>* cancel = nullptr) {
+    std::vector<uint8_t> g;
+    flow_img(frame(f), fw, fh, k, bgra, g);
+    const DisRef& R = f == 0 ? ref0 : ref1;
+    if (!dis_calc(R, g.data(), K, cancel)) return 25;
+    const DisLevel& L = R.lv[R.c.finest];
+    std::vector<float> F[2];
+    for (int ch = 0; ch < 2; ch++) {
+      F[ch].resize((size_t)W * H);
+      resize_linear_any(ch ? K.Uy.data() : K.Ux.data(), L.w, L.h, F[ch].data(), W, H);
+      const float m = (float)(1 << R.c.finest);
+      for (float& v : F[ch]) v *= m;
+    }
+    std::vector<float> v((size_t)nv * 2), rowv(2 * kr + 1);
+    for (int i = 0; i < nv; i++) {
+      for (int ch = 0; ch < 2; ch++) {
+        const float* S = F[ch].data();
+        for (int a = -kr; a <= kr; a++) {
+          const float* r = S + (size_t)refl101(vy[i] + a, H) * W;
+          float acc = 0.f;
+          for (int b = -kr; b <= kr; b++) acc += kern[b + kr] * r[refl101(vx[i] + b, W)];
+          rowv[a + kr] = acc;
+        }
+        float acc = 0.f;
+        for (int a = 0; a <= 2 * kr; a++) acc += kern[a] * rowv[a];
+        v[2 * i + ch] = p0[2 * i + ch] + acc;
+      }
+    }
+    int16_t* d = &dv[(size_t)f * nv * 2];
+    for (int i = 0; i < nv * 2; i++) {
+      const long q = std::lrint(std::nearbyint(p0[i] * 16.0f)), r = std::lrint(std::nearbyint(v[i] * 16.0f));
+      long dd = r - q; dd = std::min(32767L, std::max(-32768L, dd));
+      d[i] = (int16_t)dd;
+    }
+    uint8_t* ok = &okb[(size_t)f * ((nt + 7) / 8)];
+    for (int t = 0; t < nt; t++) {
+      auto area = [&](const float* P) {
+        const float ax = P[2 * tri[3 * t]], ay = P[2 * tri[3 * t] + 1], bx = P[2 * tri[3 * t + 1]], by = P[2 * tri[3 * t + 1] + 1];
+        const float cx = P[2 * tri[3 * t + 2]], cy = P[2 * tri[3 * t + 2] + 1];
+        return 0.5f * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
+      };
+      const float a0 = area(p0.data()), a1 = area(v.data());
+      const float r = a1 / (std::fabs(a0) < 1e-6f ? 1e-6f : a0);
+      if (r > 0.5f && r < 2.0f) ok[t >> 3] |= (uint8_t)(1u << (t & 7));
+    }
+    return 0;
+  }
+  // .tmv with the body inflated: "TMV1" k nv nt nf crc32 | p0 | tri | dv | ok
+  void encode(std::vector<uint8_t>& out, uint32_t (*crc)(const uint8_t*, size_t)) const {
+    const size_t nb = (size_t)nv * 4 + (size_t)nt * 6 + (size_t)nf * nv * 4 + (size_t)nf * ((nt + 7) / 8);
+    out.assign(16 + nb, 0);
+    uint8_t* b = out.data() + 16;
+    for (int i = 0; i < nv * 2; i++) { const int16_t q = (int16_t)std::lrint(std::nearbyint(p0[i] * 16.0f)); std::memcpy(b + (size_t)i * 2, &q, 2); }
+    b += (size_t)nv * 4;
+    for (int i = 0; i < nt * 3; i++) { const uint16_t t = (uint16_t)tri[i]; std::memcpy(b + (size_t)i * 2, &t, 2); }
+    b += (size_t)nt * 6;
+    std::memcpy(b, dv.data(), dv.size() * 2); b += dv.size() * 2;
+    std::memcpy(b, okb.data(), okb.size());
+    std::memcpy(out.data(), "TMV1", 4);
+    const uint16_t hd[4] = {(uint16_t)k, (uint16_t)nv, (uint16_t)nt, (uint16_t)nf};
+    std::memcpy(out.data() + 4, hd, 8);
+    const uint32_t c = crc(out.data() + 16, nb);
+    std::memcpy(out.data() + 12, &c, 4);
+  }
+};
+
+}  // namespace trk
+
 }  // namespace tmap
 
 // ---------------------------------------------------------------- C ABI (ctypes / engine binding)
@@ -1011,11 +1945,12 @@ static tmap::Job* job_from(const int32_t* ip, const uint8_t* rgba, const uint8_t
   *err = 11;
   if (!ip || !rgba || !tmv) return nullptr;
   const int sw = ip[0], h = ip[1], fw = ip[2], k = ip[3], fi = ip[5]; const uint32_t sid = (uint32_t)ip[4];
+  const int sx = ip[6] < 0 ? fi * fw : ip[6]; const bool bgra = (ip[7] & 1) != 0;
   *err = 12;
   if (std::memcmp(tmv, "TMV1", 4) != 0) return nullptr;
   uint16_t hk, nv, nt, nf; std::memcpy(&hk, tmv + 4, 2); std::memcpy(&nv, tmv + 6, 2); std::memcpy(&nt, tmv + 8, 2); std::memcpy(&nf, tmv + 10, 2);
   *err = 13;
-  if (hk != k || k <= 0 || fw <= 0 || h <= 0 || fi < 0 || fi >= nf || sw < fw * (fi + 1)) return nullptr;
+  if (hk != k || k <= 0 || fw <= 0 || h <= 0 || fi < 0 || fi >= nf || sx < 0 || sw < sx + fw) return nullptr;
   const uint8_t* b = tmv + 16;
   std::vector<float> p0(nv * 2), v(nv * 2);
   std::vector<int32_t> tri(nt * 3);
@@ -1027,7 +1962,8 @@ static tmap::Job* job_from(const int32_t* ip, const uint8_t* rgba, const uint8_t
   }
   for (int i = 0; i < nt * 3; i++) { uint16_t t; std::memcpy(&t, b + o_tri + (size_t)i * 2, 2); if (t >= nv) return nullptr; tri[i] = t; }
   std::vector<uint8_t> fr((size_t)fw * h * 4);
-  for (int y = 0; y < h; y++) std::memcpy(&fr[(size_t)y * fw * 4], rgba + ((size_t)y * sw + (size_t)fi * fw) * 4, (size_t)fw * 4);
+  for (int y = 0; y < h; y++) std::memcpy(&fr[(size_t)y * fw * 4], rgba + ((size_t)y * sw + (size_t)sx) * 4, (size_t)fw * 4);
+  if (bgra) for (size_t i = 0; i < fr.size(); i += 4) std::swap(fr[i], fr[i + 2]);
   tmap::Params P; tmap::parse_params(par ? par : "", P);
   *err = 0;
   return new tmap::Job(fr.data(), fw, h, k, nv, p0.data(), nt, tri.data(), v.data(), sid, P, b + o_ok);
@@ -1060,6 +1996,23 @@ TMAP_EXPORT int tmap_job_take(intptr_t h, uint8_t* out) {
   return 0;
 }
 TMAP_EXPORT void tmap_job_free(intptr_t h) { delete (tmap::Job*)h; }
+static uint32_t crc_tab[256];
+static void crc_init() {
+  for (uint32_t n = 0; n < 256; n++) { uint32_t c = n; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; crc_tab[n] = c; }
+}
+TMAP_EXPORT int tmap_hash(const uint8_t* rgba, const int32_t* ip, uint32_t* io) {
+  if (!rgba || !ip || !io || ip[0] < 0) return 11;
+  static bool ready = false; if (!ready) { crc_init(); ready = true; }
+  const bool bgra = (ip[1] & 1) != 0;
+  uint32_t c = ~*io;
+  for (int32_t i = 0; i < ip[0]; i++) {
+    const uint8_t* p = rgba + (size_t)i * 4; uint8_t q[4] = {0, 0, 0, 0};
+    if (p[3]) { q[0] = bgra ? p[2] : p[0]; q[1] = p[1]; q[2] = bgra ? p[0] : p[2]; q[3] = p[3]; }
+    for (int j = 0; j < 4; j++) c = crc_tab[(c ^ q[j]) & 0xFF] ^ (c >> 8);
+  }
+  *io = ~c;
+  return 0;
+}
 TMAP_EXPORT void tm_resize_f32(const float* s, int w, int h, int k, float* d) { tmap::resize_linear_f32(s, w, h, k, d); }
 TMAP_EXPORT void tm_gauss_f32(float* a, int w, int h, double s) { tmap::gauss_f32(a, w, h, s); }
 TMAP_EXPORT void tm_gauss_f64(double* a, int w, int h, double s) { tmap::gauss_f64(a, w, h, s); }
@@ -1067,4 +2020,207 @@ TMAP_EXPORT void tm_edt(const uint8_t* m, int w, int h, double* o) { tmap::edt(m
 TMAP_EXPORT void tm_fill(const float* v, int nt, const int32_t* tri, int W, int H, int32_t* ids) { tmap::fill_tris(v, nt, tri, nullptr, W, H, ids); }
 TMAP_EXPORT void tm_hsv(const uint8_t* rgb, int n, uint8_t* hsv) { tmap::rgb2hsv8(rgb, 3, n, hsv); }
 TMAP_EXPORT double tm_hmix(unsigned a, unsigned b, unsigned c) { return tmap::hmix(a, b, c); }
+// ---- v3: tracks for pictures the pack does not have
+static uint32_t tm_crc(const uint8_t* p, size_t n) {
+  static bool ready = false; if (!ready) { crc_init(); ready = true; }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+  return ~c;
+}
+// checks (ctypes): whole sprite in one call. frames: nf frames frame-major, fw*fh*4 each. returns 0 / error code, *len = bytes
+TMAP_EXPORT int tm_track(const uint8_t* frames, int fw, int fh, int nf, int k, int flags, uint8_t* out, int cap, int* len) {
+  try {
+    if (!frames || fw <= 0 || fh <= 0 || nf <= 0 || k <= 0) return 11;
+    tmap::trk::Sprite S; S.fw = fw; S.fh = fh; S.nf = nf; S.k = k; S.bgra = (flags & 1) != 0;
+    S.px.assign(frames, frames + (size_t)fw * fh * 4 * nf);
+    int r = S.prepare(); if (r) return r;
+    tmap::trk::DisWork K;
+    for (int f = 0; f < nf; f++) { r = S.track(f, K); if (r) return r; }
+    std::vector<uint8_t> o; S.encode(o, tm_crc);
+    if (len) *len = (int)o.size();
+    if (!out || cap < (int)o.size()) return 16;
+    std::memcpy(out, o.data(), o.size());
+    return 0;
+  } catch (...) { return 19; }
+}
+TMAP_EXPORT int tm_mesh(const uint8_t* frames, int fw, int fh, int nf, int k, float* p0, int* nv, int32_t* tri, int* nt, int cap) {
+  try {
+    tmap::trk::Sprite S; S.fw = fw; S.fh = fh; S.nf = nf; S.k = k;
+    S.px.assign(frames, frames + (size_t)fw * fh * 4 * nf);
+    int r = S.prepare(); if (r) return r;
+    *nv = S.nv; *nt = S.nt;
+    if (S.nv * 2 > cap || S.nt * 3 > cap) return 16;
+    std::memcpy(p0, S.p0.data(), S.p0.size() * 4); std::memcpy(tri, S.tri.data(), S.tri.size() * 4);
+    return 0;
+  } catch (...) { return 19; }
+}
+TMAP_EXPORT void tm_flowimg(const uint8_t* rgba, int w, int h, int k, uint8_t* out) {
+  std::vector<uint8_t> g; tmap::trk::flow_img(rgba, w, h, k, false, g); std::memcpy(out, g.data(), g.size());
+}
+// full-resolution DIS flow (W*H*2 floats interleaved) as cv2 DISOpticalFlow.calc, call = how many calcs the object did before
+TMAP_EXPORT int tm_dis(const uint8_t* I0, const uint8_t* I1, int W, int H, int call, int vr, float* flow) {
+  try {
+    tmap::trk::DisCfg c = tmap::trk::dis_cfg(W, H, call); c.vr = vr;
+    tmap::trk::DisRef R; tmap::trk::dis_ref(I0, W, H, c, R);
+    tmap::trk::DisWork K;
+    if (!tmap::trk::dis_calc(R, I1, K)) return 25;
+    const tmap::trk::DisLevel& L = R.lv[c.finest];
+    std::vector<float> a((size_t)W * H), b((size_t)W * H);
+    tmap::trk::resize_linear_any(K.Ux.data(), L.w, L.h, a.data(), W, H);
+    tmap::trk::resize_linear_any(K.Uy.data(), L.w, L.h, b.data(), W, H);
+    const float m = (float)(1 << c.finest);
+    for (size_t i = 0; i < a.size(); i++) { flow[2 * i] = a[i] * m; flow[2 * i + 1] = b[i] * m; }
+    return 0;
+  } catch (...) { return 19; }
+}
+}  // extern "C"
+
+// ---- background worker threads: whole sprites are queued, frames are shared out between the workers
+namespace tmap { namespace trk {
+struct Batch {
+  int id = 0;
+  Sprite S;
+  std::atomic<bool> cancel{false};
+  std::atomic<int> state{0};            // 0 queued, 1 preparing, 2 tracking, 3 done, >= 11 error
+  std::atomic<int> done{0};
+  int next = 0;                         // next frame to hand out (under Pool::mu)
+  std::vector<uint8_t> out;
+};
+struct Pool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<Batch>> q;
+  std::vector<std::pair<int, std::shared_ptr<Batch>>> table;
+  int started = 0, limit = 0, next_id = 1;
+  std::shared_ptr<Batch> find(int id) {
+    for (auto& e : table) if (e.first == id) return e.second;
+    return nullptr;
+  }
+  // a unit of work for worker `wi`: kind 1 prepare, 2 frame f
+  bool pick(int wi, std::shared_ptr<Batch>& b, int& kind, int& f) {
+    if (wi >= limit) return false;
+    for (auto it = q.begin(); it != q.end();) {
+      auto& x = *it;
+      if (x->cancel.load()) { it = q.erase(it); continue; }
+      const int st = x->state.load();
+      if (st == 0) { x->state = 1; b = x; kind = 1; return true; }
+      if (st == 2 && x->next < x->S.nf) { b = x; kind = 2; f = x->next++; return true; }
+      if (st >= 3) { it = q.erase(it); continue; }
+      ++it;
+    }
+    return false;
+  }
+  void finish_frame(Batch& b) {
+    if (b.done.fetch_add(1) + 1 == b.S.nf && b.state.load() == 2) {
+      try { b.S.encode(b.out, tm_crc); b.state = 3; } catch (...) { b.state = 19; }
+      std::vector<uint8_t>().swap(b.S.px); std::vector<uint8_t>().swap(b.S.g0);
+      b.S.ref0 = DisRef(); b.S.ref1 = DisRef();
+    }
+  }
+  static void lower_priority() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__) || defined(__ANDROID__)
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+#endif
+  }
+  void worker(int wi) {
+    lower_priority();
+    DisWork K;
+    for (;;) {
+      std::shared_ptr<Batch> b; int kind = 0, f = 0;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        while (!pick(wi, b, kind, f)) {
+          if (q.empty()) K = DisWork();  // nothing queued: give the buffers back
+          cv.wait(lk);
+        }
+      }
+      try {
+        if (kind == 1) {
+          const int r = b->S.prepare();
+          if (r) b->state = r;
+          else { b->state = 2; }
+          std::lock_guard<std::mutex> lk(mu); cv.notify_all();
+        } else {
+          const int r = b->S.track(f, K, &b->cancel);
+          if (r) { if (!b->cancel.load()) b->state = r; }
+          else finish_frame(*b);
+        }
+      } catch (...) { b->state = 19; }
+    }
+  }
+  bool ensure(int want) {
+    if (want < 1) {
+      unsigned hc = std::thread::hardware_concurrency();
+      want = hc > 1 ? (int)hc - 1 : 1;
+      if (want > 3) want = 3;
+    }
+    limit = want;
+    try {
+      while (started < want) { std::thread t(&Pool::worker, this, started); t.detach(); started++; }
+    } catch (...) { if (started == 0) return false; limit = started; }
+    cv.notify_all();
+    return true;
+  }
+};
+static Pool& pool() { static Pool* p = new Pool(); return *p; }  // never destroyed: detached workers may outlive static destructors
+}}  // namespace tmap::trk
+
+extern "C" {
+// ip = int32[8] {frame_w, frame_h, nf, k, flags (bit0 BGRA), threads (0 = cores-1, at most 3), 0, 0}
+// rgba = nf frames one after another (frame i at i*fw*fh*4), copied here. returns handle > 0, or 0 for bad input / no threads
+TMAP_EXPORT int tmap_batch_new(const int32_t* ip, const uint8_t* rgba) {
+  using namespace tmap::trk;
+  try {
+    if (!ip || !rgba) return 0;
+    const int fw = ip[0], fh = ip[1], nf = ip[2], k = ip[3];
+    if (fw <= 0 || fh <= 0 || nf <= 0 || nf > 4096 || k <= 0 || k > 8 || (int64_t)fw * k > 8192 || (int64_t)fh * k > 8192) return 0;
+    auto b = std::make_shared<Batch>();
+    b->S.fw = fw; b->S.fh = fh; b->S.nf = nf; b->S.k = k; b->S.bgra = (ip[4] & 1) != 0;
+    b->S.px.assign(rgba, rgba + (size_t)fw * fh * 4 * nf);
+    Pool& P = pool();
+    std::lock_guard<std::mutex> lk(P.mu);
+    if (!P.ensure(ip[5])) return 0;
+    b->id = P.next_id; P.next_id = P.next_id >= 0x3fffffff ? 1 : P.next_id + 1;
+    P.table.push_back({b->id, b}); P.q.push_back(b);
+    P.cv.notify_all();
+    return b->id;
+  } catch (...) { return 0; }
+}
+// 0 running, 1 done, >= 11 error (11 unknown handle, 19 out of memory, 21 empty picture, 22 too many vertices,
+// 23 triangulation, 24 picture too small, 25 flow, 26 picture too large). io (optional) int32[4] {frames done, nf, .tmv bytes, state}
+TMAP_EXPORT int tmap_batch_poll(int h, int32_t* io) {
+  using namespace tmap::trk;
+  Pool& P = pool();
+  std::shared_ptr<Batch> b;
+  { std::lock_guard<std::mutex> lk(P.mu); b = P.find(h); }
+  if (!b) return 11;
+  const int st = b->state.load();
+  if (io) { io[0] = b->done.load(); io[1] = b->S.nf; io[2] = st == 3 ? (int)b->out.size() : 0; io[3] = st; }
+  return st == 3 ? 1 : (st >= 11 ? st : 0);
+}
+// .tmv (16-byte header + inflated body; the caller deflates the body to store it). out: io[2] bytes
+TMAP_EXPORT int tmap_batch_take(int h, uint8_t* out) {
+  using namespace tmap::trk;
+  if (!out) return 11;
+  Pool& P = pool();
+  std::shared_ptr<Batch> b;
+  { std::lock_guard<std::mutex> lk(P.mu); b = P.find(h); }
+  if (!b) return 11;
+  if (b->state.load() != 3) return 14;
+  std::memcpy(out, b->out.data(), b->out.size());
+  return 0;
+}
+// cancel (if running) and forget; memory goes when the last worker lets go of it
+TMAP_EXPORT int tmap_batch_free(int h) {
+  using namespace tmap::trk;
+  Pool& P = pool();
+  std::lock_guard<std::mutex> lk(P.mu);
+  for (size_t i = 0; i < P.table.size(); i++)
+    if (P.table[i].first == h) { P.table[i].second->cancel = true; P.table.erase(P.table.begin() + i); return 0; }
+  return 11;
+}
+TMAP_EXPORT void tm_resize_area(const uint8_t* s, int sw, int sh, uint8_t* d, int dw, int dh) { tmap::trk::resize_area_u8(s, sw, sh, d, dw, dh); }
+TMAP_EXPORT void tm_resize_lin(const float* s, int sw, int sh, float* d, int dw, int dh) { tmap::trk::resize_linear_any(s, sw, sh, d, dw, dh); }
 }
