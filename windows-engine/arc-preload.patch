@@ -1,8 +1,8 @@
 diff --git a/binding/bitmap-binding.cpp b/binding/bitmap-binding.cpp
-index 520af6b..b1bebe9 100644
+index 520af6b..7af92a0 100644
 --- a/binding/bitmap-binding.cpp
 +++ b/binding/bitmap-binding.cpp
-@@ -472,10 +472,44 @@ RB_METHOD_GUARD_END
+@@ -472,10 +472,72 @@ RB_METHOD_GUARD_END
  RB_METHOD(bitmapPreload) {
      RB_UNUSED_PARAM;
  
@@ -40,8 +40,36 @@ index 520af6b..b1bebe9 100644
 +    int maxDone = 0;
 +    unsigned long long maxBytes = 0;
 +    Bitmap::preloadLimits(&maxDone, &maxBytes);
- 
++
 +    return rb_ary_new3(2, INT2NUM(maxDone), ULL2NUM(maxBytes));
++}
+ 
++RB_METHOD(bitmapPreloadDrop) {
++    RB_UNUSED_PARAM;
++
++    /* same arguments as preload: paths or arrays of paths, then an optional Integer scale */
++    int scale = 1;
++    int n = argc;
++    if (n > 0 && FIXNUM_P(argv[n - 1])) {
++        scale = NUM2INT(argv[n - 1]);
++        --n;
++    }
++
++    for (int i = 0; i < n; ++i) {
++        VALUE arg = argv[i];
++        if (RB_TYPE_P(arg, T_ARRAY)) {
++            long m = RARRAY_LEN(arg);
++            for (long j = 0; j < m; ++j) {
++                VALUE e = rb_ary_entry(arg, j);
++                if (RB_TYPE_P(e, T_STRING))
++                    Bitmap::preloadDrop(StringValueCStr(e), scale);
++            }
++        } else if (RB_TYPE_P(arg, T_STRING)) {
++            Bitmap::preloadDrop(StringValueCStr(arg), scale);
++        }
++    }
++
++    return Qnil;
 +}
 +
 +RB_METHOD(bitmapPreloadClear) {
@@ -50,17 +78,18 @@ index 520af6b..b1bebe9 100644
      return Qnil;
  }
  
-@@ -947,6 +981,8 @@ void bitmapBindingInit() {
+@@ -947,6 +1009,9 @@ void bitmapBindingInit() {
      
      _rb_define_method(klass, "alpha_bounds", bitmapAlphaBounds);
      rb_define_singleton_method(klass, "preload", RUBY_METHOD_FUNC(bitmapPreload), -1);
 +    rb_define_singleton_method(klass, "preload_clear", RUBY_METHOD_FUNC(bitmapPreloadClear), -1);
++    rb_define_singleton_method(klass, "preload_drop", RUBY_METHOD_FUNC(bitmapPreloadDrop), -1);
 +    rb_define_singleton_method(klass, "preload_limits", RUBY_METHOD_FUNC(bitmapPreloadLimits), -1);
      _rb_define_method(klass, "raw_data", bitmapGetRawData);
      _rb_define_method(klass, "raw_data=", bitmapSetRawData);
      _rb_define_method(klass, "to_file", bitmapSaveToFile);
 diff --git a/src/display/bitmap.cpp b/src/display/bitmap.cpp
-index 676294d..ab75110 100644
+index 676294d..c46d0e4 100644
 --- a/src/display/bitmap.cpp
 +++ b/src/display/bitmap.cpp
 @@ -591,18 +591,30 @@ struct ArcImageHandler : FileSystem::OpenHandler
@@ -203,7 +232,7 @@ index 676294d..ab75110 100644
              queue.push_back(name);
  
              if (!worker.joinable())
-@@ -687,25 +725,69 @@ struct ArcImagePreload
+@@ -687,25 +725,103 @@ struct ArcImagePreload
          cond.notify_all();
      }
  
@@ -221,13 +250,10 @@ index 676294d..ab75110 100644
 +        for (;;)
 +        {
 +            auto it = items.find(name);
- 
--        auto it = done.find(name);
++
 +            if (it == items.end())
 +                return 0;
- 
--        if (it == done.end())
--            return 0;
++
 +            if (it->second.stage == QUEUED)
 +            {
 +                items.erase(it);
@@ -241,10 +267,7 @@ index 676294d..ab75110 100644
 +                }
 +                return 0;
 +            }
- 
--        SDL_Surface *surf = it->second;
--        doneBytes -= (size_t) surf->pitch * surf->h;
--        done.erase(it);
++
 +            if (it->second.stage == DONE)
 +            {
 +                SDL_Surface *surf = it->second.surf;
@@ -255,12 +278,52 @@ index 676294d..ab75110 100644
 +                cond.notify_all();
 +                return surf;
 +            }
- 
--        return surf;
++
 +            cond.wait(l);
 +        }
 +    }
 +
++    /* drops one picture (queued, being decoded or finished) and keeps the rest;
++     * a picture being decoded is freed by the worker when it finds the item gone */
++    void drop(const std::string &name)
++    {
++        {
++            std::lock_guard<std::mutex> l(lock);
++            auto it = items.find(name);
+ 
+-        auto it = done.find(name);
++            if (it == items.end())
++                return;
+ 
+-        if (it == done.end())
+-            return 0;
++            if (it->second.stage == DONE)
++            {
++                doneBytes -= bytesOf(it->second.surf);
++                --doneCount;
++                SDL_FreeSurface(it->second.surf);
++            }
++            else if (it->second.stage == QUEUED)
++            {
++                for (auto q = queue.begin(); q != queue.end(); ++q)
++                {
++                    if (*q == name)
++                    {
++                        queue.erase(q);
++                        break;
++                    }
++                }
++            }
+ 
+-        SDL_Surface *surf = it->second;
+-        doneBytes -= (size_t) surf->pitch * surf->h;
+-        done.erase(it);
++            items.erase(it);
++        }
++        cond.notify_all();
++    }
+ 
+-        return surf;
 +    void clear()
 +    {
 +        {
@@ -284,7 +347,7 @@ index 676294d..ab75110 100644
      }
  };
  
-@@ -715,11 +797,29 @@ static ArcImagePreload &arcImagePreload()
+@@ -715,11 +831,37 @@ static ArcImagePreload &arcImagePreload()
      return instance;
  }
  
@@ -304,6 +367,14 @@ index 676294d..ab75110 100644
 +    arcImagePreload().clear();
 +}
 +
++void Bitmap::preloadDrop(const char *filename, int logicalScale)
++{
++    if (!filename || !*filename || logicalScale > 1)
++        return;
++
++    arcImagePreload().drop(filename);
++}
++
 +void Bitmap::preloadLimits(int *maxDone, unsigned long long *maxBytes)
 +{
 +    if (maxDone)
@@ -316,16 +387,17 @@ index 676294d..ab75110 100644
  {
      std::string hiresPrefix = "Hires/";
 diff --git a/src/display/bitmap.h b/src/display/bitmap.h
-index 36586a9..13ecbf6 100644
+index 36586a9..670e04a 100644
 --- a/src/display/bitmap.h
 +++ b/src/display/bitmap.h
-@@ -100,7 +100,9 @@ public:
+@@ -100,7 +100,10 @@ public:
  
  	Color getPixel(int x, int y) const;
  	IntRect alphaBounds(int threshold, const IntRect &region) const;
 -	static void preload(const char *filename);
 +	static void preload(const char *filename, int logicalScale = 1);
 +	static void preloadClear();
++	static void preloadDrop(const char *filename, int logicalScale = 1);
 +	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
  	void setPixel(int x, int y, const Color &color);
      
