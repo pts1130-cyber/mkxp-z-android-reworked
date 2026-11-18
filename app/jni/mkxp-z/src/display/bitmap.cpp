@@ -1078,6 +1078,49 @@ void Bitmap::preloadClear()
     st->cond.notify_all();
 }
 
+/* ARC: drop one picture from the preload table (queued, being decoded or finished) and keep the rest.
+ * preloadClear() frees every finished picture, so evicting a few that way makes the worker decode the kept ones again */
+void Bitmap::preloadDrop(const char *filename, int lscale)
+{
+    if (!arcPre || !filename || !*filename)
+        return;
+
+    ArcPreState *st = arcPre;
+    std::string key = arcPreKey(filename, lscale < 1 ? 1 : lscale);
+
+    {
+        std::lock_guard<std::mutex> lk(st->lock);
+        std::map<std::string, ArcPreItem>::iterator it = st->items.find(key);
+
+        if (it == st->items.end())
+            return;
+
+        if (it->second.stage == PRE_DONE)
+        {
+            SDL_Surface *surf = it->second.surf;
+            st->doneBytes -= (size_t)surf->pitch * (size_t)surf->h;
+            --st->doneCount;
+            SDL_FreeSurface(surf);
+        }
+        else if (it->second.stage == PRE_QUEUED)
+        {
+            for (std::deque<std::string>::iterator q = st->queue.begin(); q != st->queue.end(); ++q)
+            {
+                if (*q == key)
+                {
+                    st->queue.erase(q);
+                    break;
+                }
+            }
+        }
+
+        /* PRE_WORKING: the worker frees the result when it finds the item gone */
+        st->items.erase(it);
+    }
+
+    st->cond.notify_all();
+}
+
 void Bitmap::preloadShutdown()
 {
     if (!arcPre)

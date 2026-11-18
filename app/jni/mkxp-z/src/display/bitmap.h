@@ -46,6 +46,7 @@ public:
 	/* ARC: decode image files on a worker thread before they are needed */
 	static void preload(const char *filename, int logicalScale = 1);
 	static void preloadClear();
+	static void preloadDrop(const char *filename, int logicalScale = 1);
 	static void preloadShutdown();
 	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
 	void releasePixels();

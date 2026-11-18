@@ -868,6 +868,31 @@ RB_METHOD(bitmapPreloadLimits) {
     return rb_ary_new3(2, INT2NUM(maxDone), ULL2NUM(maxBytes));
 }
 
+RB_METHOD(bitmapPreloadDrop) {
+    RB_UNUSED_PARAM;
+
+    /* ARC: same arguments as preload (paths or arrays of paths, optional trailing scale) */
+    int scale = 1;
+    int n = argc;
+    if (n > 0 && FIXNUM_P(argv[n - 1])) {
+        scale = NUM2INT(argv[n - 1]);
+        --n;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        VALUE arg = argv[i];
+        if (RB_TYPE_P(arg, T_ARRAY)) {
+            long m = RARRAY_LEN(arg);
+            for (long j = 0; j < m; ++j)
+                Bitmap::preloadDrop(objAsStringPtr(rb_ary_entry(arg, j)), scale);
+        } else {
+            Bitmap::preloadDrop(objAsStringPtr(arg), scale);
+        }
+    }
+
+    return Qnil;
+}
+
 RB_METHOD(bitmapPreloadClear) {
     RB_UNUSED_PARAM;
     Bitmap::preloadClear();
@@ -886,6 +911,7 @@ void bitmapBindingInit() {
     
     rb_define_class_method(klass, "preload", bitmapPreload);
     rb_define_class_method(klass, "preload_clear", bitmapPreloadClear);
+    rb_define_class_method(klass, "preload_drop", bitmapPreloadDrop);
     rb_define_class_method(klass, "preload_limits", bitmapPreloadLimits);
     
     _rb_define_method(klass, "initialize", bitmapInitialize);
