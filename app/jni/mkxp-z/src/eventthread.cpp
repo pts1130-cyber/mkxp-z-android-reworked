@@ -646,6 +646,7 @@ int EventThread::eventFilter(void *data, SDL_Event *event)
 
 		case SDL_APP_LOWMEMORY:
 			Debug() << "SDL_APP_LOWMEMORY";
+			arcLowMemRequest();
 			return 0;
 
 		/*

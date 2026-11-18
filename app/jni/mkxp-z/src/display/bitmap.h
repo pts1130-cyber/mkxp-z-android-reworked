@@ -181,5 +181,8 @@ private:
 void arcMemStats(unsigned long long *keptBytes, unsigned long long *preDoneBytes, int *preDone, int *preQueued);
 void arcBitmapStats(unsigned long long *bytes, int *count,
                     int *bigW, int *bigH);
+void arcLowMemFreePictures(unsigned long long *preBytes, int *preDone, int *preQueued,
+                           unsigned long long *keptBytes, int *keptCount,
+                           unsigned long long *decBytes, int *decCount);
 
 #endif // BITMAP_H

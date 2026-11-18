@@ -517,6 +517,36 @@ void SoundEmitter::preload(const std::string &filename, bool pin)
 	arcCond.notify_all();
 }
 
+/* ARC: low memory: drop cached effects that no source holds and the game did not pin */
+uint32_t SoundEmitter::trimUnused(int *count)
+{
+	uint32_t freed = 0;
+	*count = 0;
+
+	IntruListLink<SoundBuffer> *node = buffers.begin();
+
+	while (node != buffers.end())
+	{
+		IntruListLink<SoundBuffer> *next = node->next;
+		SoundBuffer *buf = node->data;
+
+		if (buf->refCount == 1 && !buf->pinned)
+		{
+			bufferHash.remove(buf->key);
+			buffers.remove(buf->link);
+			freed += buf->bytes;
+			++*count;
+			SoundBuffer::deref(buf);
+		}
+
+		node = next;
+	}
+
+	bufferBytes = bufferBytes > freed ? bufferBytes - freed : 0;
+
+	return freed;
+}
+
 void SoundEmitter::unpinAll()
 {
 	arcPinned.clear();

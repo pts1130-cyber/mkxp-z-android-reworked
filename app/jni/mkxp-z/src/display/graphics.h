@@ -104,6 +104,9 @@ private:
 	GraphicsPrivate *p;
 };
 
+/* ARC: low-memory signal (any thread); the game thread frees spare caches on its next frame */
+void arcLowMemRequest();
+
 #define GFX_LOCK shState->graphics().lock()
 #define GFX_UNLOCK shState->graphics().unlock()
 

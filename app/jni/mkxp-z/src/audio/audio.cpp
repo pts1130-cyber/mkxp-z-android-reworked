@@ -320,6 +320,11 @@ void Audio::seUnpinAll()
 	p->se.unpinAll();
 }
 
+unsigned int Audio::seTrimUnused(int *count)
+{
+	return p->se.trimUnused(count);
+}
+
 void Audio::setupMidi()
 {
 	shState->midiState().initIfNeeded(shState->config());

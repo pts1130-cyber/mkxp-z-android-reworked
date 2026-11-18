@@ -246,6 +246,21 @@ public class MainActivity extends SDLActivity
         }
     }
 
+    // ARC: memory pressure -> same path as onLowMemory (SDL_APP_LOWMEMORY); the engine frees spare caches
+    @Override
+    public void onTrimMemory(int level)
+    {
+        super.onTrimMemory(level);
+
+        if (level == TRIM_MEMORY_RUNNING_LOW ||
+            level == TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= TRIM_MEMORY_BACKGROUND) {
+            Log.v(TAG, "onTrimMemory(" + level + ")");
+            if (!SDLActivity.mBrokenLibraries)
+                SDLActivity.nativeLowMemory();
+        }
+    }
+
     @Override
     protected void onDestroy()
     {

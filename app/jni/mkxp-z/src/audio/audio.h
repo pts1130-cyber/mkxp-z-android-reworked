@@ -64,6 +64,7 @@ public:
 	void seStop();
 	void sePreload(const char *filename, bool pin = false);
 	void seUnpinAll();
+	unsigned int seTrimUnused(int *count);
 
 	void setupMidi();
 	float bgmPos();

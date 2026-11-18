@@ -1636,14 +1636,49 @@ unsigned long long Graphics::lastUpdate() {
     return p->last_update;
 }
 
+/* ARC: set by the low-memory signal (event filter / Android onTrimMemory), served on the game thread */
+static SDL_atomic_t arcLowMemFlag;
+
+void arcLowMemRequest() {
+    SDL_AtomicSet(&arcLowMemFlag, 1);
+}
+
+static void arcLowMemServe() {
+    if (SDL_AtomicGet(&arcLowMemFlag) == 0 || !SDL_AtomicCAS(&arcLowMemFlag, 1, 0))
+        return;
+
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    unsigned long long preBytes, keptBytes, decBytes;
+    int preDone, preQueued, keptCount, decCount, seCount = 0;
+    arcLowMemFreePictures(&preBytes, &preDone, &preQueued,
+                          &keptBytes, &keptCount, &decBytes, &decCount);
+    unsigned long long seBytes = shState->audio().seTrimUnused(&seCount);
+    double ms = arcTicksToMs(SDL_GetPerformanceCounter() - t0);
+
+    FILE *lf = fopen("_log/engine_img.txt", "a");
+    if (lf) {
+        char clk[16];
+        fprintf(lf, "[%s 엔진 %.1f초] 메모리 부족 신호: 캐시 비움 합계 %.1fMB (%.1fms) | 선읽기 %.1fMB 완료%d개 대기%d개 | 그림 RAM 사본 %.1fMB %d개 | 그림기억 %.1fMB %d개 | 효과음 %.1fMB %d개\n",
+                arcClockStr(clk), SDL_GetTicks() / 1000.0,
+                (preBytes + keptBytes + decBytes + seBytes) / 1048576.0, ms,
+                preBytes / 1048576.0, preDone, preQueued,
+                keptBytes / 1048576.0, keptCount,
+                decBytes / 1048576.0, decCount,
+                seBytes / 1048576.0, seCount);
+        fclose(lf);
+    }
+}
+
 void Graphics::update(bool checkForShutdown) {
     p->threadData->rqWindowAdjust.wait();
     p->last_update = shState->runTime();
-    
+
     if (checkForShutdown)
         p->checkShutDownReset();
-    
+
     p->checkSyncLock();
+
+    arcLowMemServe();
     
     
 #ifdef MKXPZ_STEAM

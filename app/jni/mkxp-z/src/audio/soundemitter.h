@@ -70,6 +70,9 @@ struct SoundEmitter
 	 * are already cached or queued. */
 	void preload(const std::string &filename, bool pin = false);
 
+	/* ARC: low memory: free cached effects not attached to a source and not pinned; returns bytes */
+	uint32_t trimUnused(int *count);
+
 	/* ARC: pinned effects are never pushed out of the cache until unpinAll() */
 	void unpinAll();
 

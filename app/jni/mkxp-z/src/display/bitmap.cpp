@@ -1235,6 +1235,65 @@ namespace
     }
 }
 
+/* ARC: low memory (game thread only): drop the spare RAM copies. Textures in use are untouched */
+void arcLowMemFreePictures(unsigned long long *preBytes, int *preDone, int *preQueued,
+                           unsigned long long *keptBytes, int *keptCount,
+                           unsigned long long *decBytes, int *decCount)
+{
+    *preBytes = 0;
+    *preDone = 0;
+    *preQueued = 0;
+
+    if (arcPre)
+    {
+        ArcPreState *st = arcPre;
+
+        {
+            std::lock_guard<std::mutex> lk(st->lock);
+
+            *preBytes = (unsigned long long) st->doneBytes;
+            *preDone = (int) st->doneCount;
+            *preQueued = (int) st->queue.size();
+            st->queue.clear();
+
+            for (std::map<std::string, ArcPreItem>::iterator it = st->items.begin(); it != st->items.end();)
+            {
+                if (it->second.surf)
+                    SDL_FreeSurface(it->second.surf);
+                it = st->items.erase(it);
+            }
+
+            st->doneCount = 0;
+            st->doneBytes = 0;
+        }
+
+        st->cond.notify_all();
+    }
+
+    *keptBytes = (unsigned long long) arcKeepBytes;
+    *keptCount = (int) arcKeepList.size();
+
+    while (!arcKeepList.empty())
+    {
+        BitmapPrivate *old = arcKeepList.back();
+        arcKeepRemove(old);
+        if (old->surface)
+        {
+            old->flushPending();
+            SDL_FreeSurface(old->surface);
+            old->surface = 0;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(arcDecMx);
+        *decBytes = (unsigned long long) arcDecBytes;
+        *decCount = (int) arcDec.size();
+    }
+
+    arcDecClear();
+}
+
 Bitmap::Bitmap(const char *filename, int lscale)
 {
     Uint64 arcT0 = SDL_GetPerformanceCounter();
