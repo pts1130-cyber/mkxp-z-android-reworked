@@ -520,6 +520,9 @@ struct Job {
   EdtJob e_m, e_b;
   std::vector<uint8_t> out;
   std::vector<int32_t> ids_keep;
+  // facet attributes taken from frame 0 (same facet ids): a facet keeps its normal and mean thickness while the sprite moves
+  const std::vector<double>* ref_fx = nullptr; const std::vector<double>* ref_fy = nullptr; const std::vector<double>* ref_tm = nullptr; const std::vector<float>* ref_cnt = nullptr;
+  bool stable_holes = false;
   std::vector<std::function<void()>> units; size_t next = 0;
   Timing T;
   std::function<double(uint32_t, uint32_t, uint32_t)> Hs;
@@ -734,8 +737,13 @@ struct Job {
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return key[first[a]] < key[first[b]]; });
         std::vector<int> rank(nc);
         for (int r = 0; r < nc; r++) rank[order[r]] = r;
-        for (int I : bp) if (lab[I] >= 0) ids[I] = nt0 + rank[lab[I]];
-        nt = nt0 + nc;
+        if (stable_holes) {  // hole facets numbered by their direction cell, the same in every frame
+          for (int I : bp) if (lab[I] >= 0) ids[I] = nt0 + key[I];
+          nt = nt0 + na * nb;
+        } else {
+          for (int I : bp) if (lab[I] >= 0) ids[I] = nt0 + rank[lab[I]];
+          nt = nt0 + nc;
+        }
       }
     }
     {
@@ -770,6 +778,10 @@ struct Job {
       double a = mx + (r0[i] - .5) * 2 * tilt, b = my + (r1[i] - .5) * 2 * tilt;
       double r = std::sqrt(a * a + b * b), sc = std::min(1.0, 0.97 / std::max(r, 1e-6));
       fx[i] = a * sc; fy[i] = b * sc;
+    }
+    if (ref_fx) {
+      const int m = std::min<int>(nt0, (int)std::min(ref_fx->size(), ref_cnt->size()));
+      for (int i = 0; i < m; i++) if ((*ref_cnt)[i] > 0.f) { fx[i] = (*ref_fx)[i]; fy[i] = (*ref_fy)[i]; }
     }
     NX.assign(N, 0.f); NY.assign(N, 0.f);
     const double sw = P.smooth_n;
@@ -828,6 +840,10 @@ struct Job {
   }
   void thick_facets() {
     for (int i = 0; i < nt; i++) tm_[i] = tm_[i] / (double)std::max(cnt[i], 1.f);
+    if (ref_tm) {
+      const int m = std::min<int>(nt0, (int)std::min(ref_tm->size(), ref_cnt->size()));
+      for (int i = 0; i < m; i++) if ((*ref_cnt)[i] > 0.f) tm_[i] = (*ref_tm)[i];
+    }
     flev.resize(nt);
     for (int i = 0; i < nt; i++) {
       double lam = clip(-(fx[i] * P.lx + fy[i] * P.ly), -1.0, 1.0);
@@ -2224,6 +2240,13 @@ TMAP_EXPORT void tm_resize_lin(const float* s, int sw, int sh, float* d, int dw,
 // shelf pack into atlases of side <= 4096), so the bytes match. Blob (little endian):
 //   "TMA1" u32 nf u32 mw u32 mh u32 natl u32 0 f64 dc | nf x i32 {row0, row1, atlas (-1 none), rect_x, rect_y} |
 //   natl x u32 {w, h} | atlas pixels (RGBA, w*h*4 each)
+// v6 maps (ip[11] bit0): "TMA2" u32 nf u32 mw u32 mh u32 natl u32 naux f64 dc |
+//   nf x i32 {row0, row1, atlas, rect_x, rect_y, aux_atlas (-1 none), aux_dx, aux_dy, body_top, body_bottom} |
+//   natl x u32 {w, h} | naux x u32 {w, h} | map atlases | facet atlases (same layout) | aux atlases
+//   map pixel: R = level (frame 0 where the sprite has not moved), G,B = frame-0 facet normal (moved with the mesh),
+//              A = 0 keep original, 1 facet without a frame-0 facet, 2..255 frame-0 facet level
+//   facet pixel: four bytes of facet hashes (frame-0 facet ids), 0 = none
+//   aux pixel (sprite resolution, body box + 1): R = edge distance x16, G = max distance within 6 px x16, B,A = outward normal x127+128
 // Cache file: "TBC1" u32 TMAP_VERSION u32 key u32 blob_len u32 crc(blob) | blob as runs of 32-bit pixels
 //   (u32 n: bit31 set = n&0x7fffffff copies of the next pixel, else n literal pixels)
 namespace tmap { namespace mp {
@@ -2253,10 +2276,23 @@ struct Map {
   std::vector<std::vector<uint8_t>> px;
   double dc = 0.5;
   std::vector<uint8_t> blob;
+  bool v6 = false;
+  int nv = 0, nt = 0;
+  std::vector<int16_t> q0, dv;
+  std::vector<int32_t> tri;
+  std::vector<double> rfx, rfy, rtm;
+  std::vector<float> rcnt;
+  std::vector<uint8_t> out0;
+  std::vector<int32_t> ids0;
+  std::vector<std::vector<uint8_t>> fpx, apx;
+  std::vector<int32_t> acrop;  // x0, y0, w, h, top, bottom per frame (w 0 = none)
   size_t fsz() const { return (size_t)fw * fh * 4; }
   ~Map() {
     long long n = (long long)(frames.size() + tmv.size() + eyes.size() + blob.size());
     for (auto& p : px) n += (long long)p.size();
+    for (auto& p : fpx) n += (long long)p.size();
+    for (auto& p : apx) n += (long long)p.size();
+    n += (long long)(out0.size() + ids0.size() * 4);
     mem_add(-n);
   }
 };
@@ -2321,7 +2357,7 @@ static bool load_cache(Map& m) {
   std::vector<uint8_t>().swap(raw);
   uint32_t nf = 0;
   if (ok && b.size() >= 32) std::memcpy(&nf, &b[4], 4);
-  if (!ok || b.size() < 32 || std::memcmp(b.data(), "TMA1", 4) != 0 || (int)nf != m.nf || crc_more(0, b.data(), b.size()) != crc) {
+  if (!ok || b.size() < 32 || std::memcmp(b.data(), m.v6 ? "TMA2" : "TMA1", 4) != 0 || (int)nf != m.nf || crc_more(0, b.data(), b.size()) != crc) {
     mem_add(-(long long)len);
     return false;
   }
@@ -2359,7 +2395,7 @@ static void save_cache(const Map& m) {
 }
 
 // the Ruby finish: eyes off, body rows, frame-0 centre, crop
-static int finish(Map& m, int i, std::vector<uint8_t>& out) {
+static int finish(Map& m, int i, std::vector<uint8_t>& out, const std::vector<uint8_t>* face = nullptr) {
   const int fw = m.fw, fh = m.fh, k = m.k, mw = fw * k, mh = fh * k;
   const uint8_t* fr = &m.frames[(size_t)i * m.fsz()];
   int top = -1, bot = -1, left = fw, right = -1;
@@ -2433,7 +2469,220 @@ static int finish(Map& m, int i, std::vector<uint8_t>& out) {
     std::memcpy(&buf[((size_t)r * cw + (sx0 - x0)) * 4], &out[((size_t)y * mw + sx0) * 4], (size_t)(sx1 - sx0) * 4);
   }
   cr[0] = x0; cr[1] = y0; cr[2] = cw; cr[3] = ch;
+  if (face) {
+    std::vector<uint8_t>& fb = m.fpx[i];
+    fb.assign((size_t)cw * ch * 4, 0);
+    mem_add((long long)fb.size());
+    for (int r = 0; r < ch; r++) {
+      const int y = y0 + r;
+      if (y < 0 || y >= mh) continue;
+      std::memcpy(&fb[((size_t)r * cw + (sx0 - x0)) * 4], &(*face)[((size_t)y * mw + sx0) * 4], (size_t)(sx1 - sx0) * 4);
+    }
+  }
   return 0;
+}
+
+// ---- v6: mesh of the .tmv (frame vertices), frame-0 reference, frame-0 facet attributes moved with the mesh, aux values
+static bool tmv_mesh(Map& m) {
+  if (m.tmv.size() < 16 || std::memcmp(m.tmv.data(), "TMV1", 4) != 0) return false;
+  uint16_t hk, nv, nt, nf; std::memcpy(&hk, &m.tmv[4], 2); std::memcpy(&nv, &m.tmv[6], 2); std::memcpy(&nt, &m.tmv[8], 2); std::memcpy(&nf, &m.tmv[10], 2);
+  const size_t need = 16 + (size_t)nv * 4 + (size_t)nt * 6 + (size_t)nf * nv * 4;
+  if (hk != m.k || nf != m.nf || m.tmv.size() < need) return false;
+  const uint8_t* b = &m.tmv[16];
+  m.nv = nv; m.nt = nt;
+  m.q0.resize((size_t)nv * 2); std::memcpy(m.q0.data(), b, (size_t)nv * 4);
+  m.tri.resize((size_t)nt * 3);
+  for (size_t i = 0; i < (size_t)nt * 3; i++) { uint16_t t; std::memcpy(&t, b + (size_t)nv * 4 + i * 2, 2); if (t >= nv) return false; m.tri[i] = t; }
+  m.dv.resize((size_t)nf * nv * 2); std::memcpy(m.dv.data(), b + (size_t)nv * 4 + (size_t)nt * 6, (size_t)nf * nv * 4);
+  return true;
+}
+static inline void vert(const Map& m, int f, int v, double& x, double& y) {
+  const size_t o = (size_t)f * m.nv * 2 + (size_t)v * 2;
+  x = (m.q0[(size_t)v * 2] + m.dv[o]) / 16.0; y = (m.q0[(size_t)v * 2 + 1] + m.dv[o + 1]) / 16.0;
+}
+static void cut_eyes(Map& m, int i, std::vector<uint8_t>& out) {
+  if (m.eyes.empty()) return;
+  const int fw = m.fw, fh = m.fh, k = m.k, mw = fw * k;
+  const size_t rb = (fw + 7) / 8, base = (size_t)i * fh * rb, len = m.eyes.size();
+  for (int y = 0; y < fh; y++) {
+    const size_t o = base + y * rb;
+    if (o + rb > len) return;
+    for (size_t bx = 0; bx < rb; bx++) {
+      const uint8_t v = m.eyes[o + bx];
+      if (!v) continue;
+      for (int b = 0; b < 8; b++) {
+        if (!(v & (0x80 >> b))) continue;
+        const int x = (int)bx * 8 + b;
+        if (x >= fw) continue;
+        for (int dy = 0; dy < k; dy++) {
+          const size_t q = (((size_t)y * k + dy) * mw + (size_t)x * k) * 4 + 3;
+          for (int dx = 0; dx < k; dx++) out[q + dx * 4] = 0;
+        }
+      }
+    }
+  }
+}
+// frame 0 with its own vertices: facet normals / mean thickness for the other frames, its map and facet ids
+static int ref_frame(Map& m) {
+  int ip[8] = {m.fw, m.fh, m.fw, m.k, m.sid, 0, 0, 0};
+  int err = 0;
+  std::unique_ptr<tmap::Job> j(job_from(ip, &m.frames[0], m.tmv.data(), m.par.c_str(), &err));
+  if (!j) return err ? err : 19;
+  j->stable_holes = true;
+  while (!j->step(5.0)) if (m.cancel.load()) return 0;
+  if (j->empty) return 0;
+  m.rfx = j->fx; m.rfy = j->fy; m.rcnt = j->cnt; m.rtm.assign(j->tm_.begin(), j->tm_.end());
+  m.out0.swap(j->out);
+  m.ids0.swap(j->ids);
+  cut_eyes(m, 0, m.out0);
+  mem_add((long long)(m.out0.size() + m.ids0.size() * 4));
+  return 0;
+}
+static inline uint8_t fhash8(int32_t id, uint32_t o) {
+  uint32_t x = (uint32_t)id + o + 1u;
+  x = (x ^ 61u) ^ (x >> 16); x *= 9u; x ^= x >> 4; x *= 0x27d4eb2du; x ^= x >> 15;
+  return (uint8_t)((x & 0xffffu) >> 8);
+}
+// rule23 c0: where the sprite equals frame 0 within 1 sprite px use frame 0 as it is, elsewhere frame-0 facet attributes
+// found through this frame's triangle (barycentric -> frame-0 position); the level keeps this frame's map there
+static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
+  const int fw = m.fw, fh = m.fh, k = m.k, W = fw * k, H = fh * k;
+  const size_t N = (size_t)W * H;
+  std::vector<uint8_t>& out = j.out;
+  face.assign(N * 4, 0);
+  const bool ref = !m.out0.empty() && m.ids0.size() == N && j.ids.size() == N;
+  std::vector<uint8_t> diff((size_t)fw * fh, 0);
+  if (ref && f != 0) {
+    const uint8_t* a = &m.frames[(size_t)f * m.fsz()]; const uint8_t* b = &m.frames[0];
+    for (size_t i = 0; i < (size_t)fw * fh; i++) diff[i] = std::memcmp(a + i * 4, b + i * 4, 4) != 0;
+  }
+  for (int Y = 0; Y < H; Y++)
+    for (int X = 0; X < W; X++) {
+      const size_t I = (size_t)Y * W + X;
+      uint8_t mb[4], mf[4];
+      int32_t idf;
+      std::memcpy(mb, &out[I * 4], 4); std::memcpy(mf, mb, 4);
+      idf = j.ids.size() == N ? j.ids[I] : -1;
+      if (ref) {
+        bool same = true;
+        if (f != 0) {
+          const int sx0 = std::max((X - k) / k, 0), sx1 = std::min((X + k) / k, fw - 1);
+          const int sy0 = std::max((Y - k) / k, 0), sy1 = std::min((Y + k) / k, fh - 1);
+          for (int sy = sy0; sy <= sy1 && same; sy++) for (int sx = sx0; sx <= sx1; sx++) if (diff[(size_t)sy * fw + sx]) { same = false; break; }
+        }
+        if (same) {
+          std::memcpy(mb, &m.out0[I * 4], 4); std::memcpy(mf, mb, 4); idf = m.ids0[I];
+        } else if (idf >= 0 && idf < m.nt) {
+          double ax, ay, bx, by, cx, cy, a0x, a0y, b0x, b0y, c0x, c0y;
+          vert(m, f, m.tri[idf * 3], ax, ay); vert(m, f, m.tri[idf * 3 + 1], bx, by); vert(m, f, m.tri[idf * 3 + 2], cx, cy);
+          vert(m, 0, m.tri[idf * 3], a0x, a0y); vert(m, 0, m.tri[idf * 3 + 1], b0x, b0y); vert(m, 0, m.tri[idf * 3 + 2], c0x, c0y);
+          const double e1x = bx - ax, e1y = by - ay, e2x = cx - ax, e2y = cy - ay, rx = X + 0.5 - ax, ry = Y + 0.5 - ay;
+          double den = e1x * e2y - e1y * e2x;
+          if (std::fabs(den) < 1e-6) den = 1e-6;
+          const double l1 = (rx * e2y - ry * e2x) / den, l2 = (e1x * ry - e1y * rx) / den;
+          const double qx = a0x + l1 * (b0x - a0x) + l2 * (c0x - a0x), qy = a0y + l1 * (b0y - a0y) + l2 * (c0y - a0y);
+          const int ix = std::min(std::max((int)std::floor(qx), 0), W - 1), iy = std::min(std::max((int)std::floor(qy), 0), H - 1);
+          const size_t Q = (size_t)iy * W + ix;
+          if (m.out0[Q * 4 + 3] > 0) std::memcpy(mf, &m.out0[Q * 4], 4);
+          if (m.ids0[Q] >= 0) idf = m.ids0[Q];
+        }
+      }
+      out[I * 4] = mb[0]; out[I * 4 + 1] = mf[1]; out[I * 4 + 2] = mf[2];
+      out[I * 4 + 3] = mb[3] == 0 ? 0 : (mf[3] > 0 ? std::max<uint8_t>(mf[0], 2) : 1);
+      if (idf >= 0) {
+        face[I * 4] = fhash8(idf, 0); face[I * 4 + 1] = fhash8(idf, 7919); face[I * 4 + 2] = fhash8(idf, 104729); face[I * 4 + 3] = fhash8(idf, 15485863);
+      }
+    }
+}
+// aux values of one frame at sprite resolution (same steps as the game's Ruby ARCTeraBodyAux)
+static void edt1(const std::vector<double>& f, int n, std::vector<int>& v, std::vector<double>& z, std::vector<double>& d) {
+  const double INF = 1e9;
+  int k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+  for (int q = 1; q < n; q++) {
+    const double fq = f[q] + (double)q * q;
+    double s = 0;
+    for (;;) {
+      const int p = v[k];
+      s = (fq - (f[p] + (double)p * p)) / (2.0 * (q - p));
+      if (s > z[k] || k == 0) break;
+      k--;
+    }
+    if (s <= z[k]) { v[0] = q; z[0] = -INF; z[1] = INF; k = 0; }
+    else { k++; v[k] = q; z[k] = s; z[k + 1] = INF; }
+  }
+  k = 0;
+  for (int q = 0; q < n; q++) { while (z[k + 1] < q) k++; const int p = v[k]; d[q] = (double)(q - p) * (q - p) + f[p]; }
+}
+static void aux_frame(Map& m, int i) {
+  const int fw = m.fw, fh = m.fh;
+  const uint8_t* fr = &m.frames[(size_t)i * m.fsz()];
+  int32_t* ac = &m.acrop[(size_t)i * 6];
+  int top = -1, bot = -1, left = fw, right = -1;
+  for (int y = 0; y < fh; y++) for (int x = 0; x < fw; x++) if (fr[((size_t)y * fw + x) * 4 + 3] > 127) { if (top < 0) top = y; bot = y; left = std::min(left, x); right = std::max(right, x); }
+  if (top < 0) { ac[2] = 0; return; }
+  const int x0 = left - 1, y0 = top - 1, w = right - left + 3, h = bot - top + 3;
+  const size_t n = (size_t)w * h;
+  std::vector<uint8_t> a(n, 0);
+  for (int yy = 1; yy < h - 1; yy++) for (int xx = 1; xx < w - 1; xx++) a[(size_t)yy * w + xx] = fr[(((size_t)(y0 + yy)) * fw + x0 + xx) * 4 + 3] > 127;
+  const int mx = std::max(w, h);
+  std::vector<int> v(mx); std::vector<double> z(mx + 1), f(mx), d(mx), g(n), dc(n);
+  for (int x = 0; x < w; x++) {
+    for (int y = 0; y < h; y++) f[y] = a[(size_t)y * w + x] ? 1e9 : 0.0;
+    edt1(f, h, v, z, d);
+    for (int y = 0; y < h; y++) g[(size_t)y * w + x] = d[y];
+  }
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) f[x] = g[(size_t)y * w + x];
+    edt1(f, w, v, z, d);
+    for (int x = 0; x < w; x++) dc[(size_t)y * w + x] = std::sqrt(d[x]);
+  }
+  static const int SPAN[7] = {6, 5, 5, 5, 4, 3, 0};
+  std::vector<std::vector<double>> span(7);
+  span[0] = dc;
+  for (int s = 1; s <= 6; s++) {
+    span[s].assign(n, 0.0);
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+      const size_t I = (size_t)y * w + x;
+      double b = span[s - 1][I];
+      if (x >= s) b = std::max(b, dc[I - s]);
+      if (x + s < w) b = std::max(b, dc[I + s]);
+      span[s][I] = b;
+    }
+  }
+  std::vector<double> th = span[6];
+  for (int y = 0; y < h; y++) for (int dy = 1; dy <= 6; dy++) for (int yy : {y - dy, y + dy}) {
+    if (yy < 0 || yy >= h) continue;
+    const std::vector<double>& src = span[SPAN[dy]];
+    for (int x = 0; x < w; x++) th[(size_t)y * w + x] = std::max(th[(size_t)y * w + x], src[(size_t)yy * w + x]);
+  }
+  double G[13], gs = 0;
+  for (int t = -6; t <= 6; t++) { G[t + 6] = std::exp(-t * t / (2.0 * 1.5 * 1.5)); gs += G[t + 6]; }
+  for (double& gv : G) gv /= gs;
+  std::vector<double> bh(n, 0.0), bl(n, 0.0);
+  for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+    double s = 0;
+    for (int t = 0; t < 13; t++) { const int xx = x + t - 6; if (xx >= 0 && xx < w && a[(size_t)y * w + xx]) s += G[t]; }
+    bh[(size_t)y * w + x] = s;
+  }
+  for (int x = 0; x < w; x++) for (int y = 0; y < h; y++) {
+    double s = 0;
+    for (int t = 0; t < 13; t++) { const int yy = y + t - 6; if (yy >= 0 && yy < h) s += G[t] * bh[(size_t)yy * w + x]; }
+    bl[(size_t)y * w + x] = s;
+  }
+  std::vector<uint8_t>& o = m.apx[i];
+  o.assign(n * 4, 0);
+  mem_add((long long)o.size());
+  for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+    const size_t I = (size_t)y * w + x;
+    const double gx = x == 0 ? bl[I + 1] - bl[I] : (x == w - 1 ? bl[I] - bl[I - 1] : (bl[I + 1] - bl[I - 1]) * 0.5);
+    const double gy = y == 0 ? bl[I + w] - bl[I] : (y == h - 1 ? bl[I] - bl[I - w] : (bl[I + w] - bl[I - w]) * 0.5);
+    const double mg = std::sqrt(gx * gx + gy * gy);
+    o[I * 4] = (uint8_t)std::min(255.0, std::floor(dc[I] * 16 + 0.5));
+    o[I * 4 + 1] = (uint8_t)std::min(255.0, std::floor(th[I] * 16 + 0.5));
+    o[I * 4 + 2] = mg > 1e-5 ? (uint8_t)(std::lround(-gx / mg * 127) + 128) : 128;
+    o[I * 4 + 3] = mg > 1e-5 ? (uint8_t)(std::lround(-gy / mg * 127) + 128) : 128;
+  }
+  ac[0] = x0; ac[1] = y0; ac[2] = w; ac[3] = h; ac[4] = top; ac[5] = bot;
 }
 
 // shelf pack (as the Ruby pack) and the blob
@@ -2453,32 +2702,70 @@ static void pack(Map& m) {
   if (cur) sheets.push_back(s);
   std::vector<int32_t> cell((size_t)m.nf * 3, 0);
   for (int i = 0; i < m.nf; i++) cell[(size_t)i * 3] = -1;
-  size_t total = 32 + (size_t)m.nf * 20 + sheets.size() * 8;
-  for (auto& t : sheets) total += (size_t)std::max(t.w, 1) * std::max(t.h, 1) * 4;
+  // v6 aux atlases: own shelf pack, 1 px gap
+  std::vector<Sheet> xs; std::vector<int32_t> xcell((size_t)m.nf * 3, 0);
+  for (int i = 0; i < m.nf; i++) xcell[(size_t)i * 3] = -1;
+  if (m.v6) {
+    bool xc = false; Sheet t;
+    for (int i = 0; i < m.nf; i++) {
+      const int32_t* c = &m.acrop[(size_t)i * 6];
+      if (c[2] == 0) continue;
+      const int w = c[2] + 1, h = c[3] + 1;
+      if (!xc) { t = Sheet(); xc = true; }
+      if (t.x + w > MAX_SIDE) { t.y += t.row; t.x = 0; t.row = 0; }
+      if (t.y + h > MAX_SIDE) { xs.push_back(t); t = Sheet(); }
+      t.list.push_back({i, t.x, t.y});
+      t.w = std::max(t.w, t.x + w); t.h = std::max(t.h, t.y + h); t.row = std::max(t.row, h); t.x += w;
+    }
+    if (xc) xs.push_back(t);
+  }
+  const size_t rec = m.v6 ? 40 : 20, hdr = 32 + (size_t)m.nf * rec + (sheets.size() + xs.size()) * 8;
+  size_t total = hdr;
+  for (auto& t : sheets) total += (size_t)std::max(t.w, 1) * std::max(t.h, 1) * 4 * (m.v6 ? 2 : 1);
+  for (auto& t : xs) total += (size_t)std::max(t.w, 1) * std::max(t.h, 1) * 4;
   std::vector<uint8_t>& b = m.blob;
   b.assign(total, 0);
   mem_add((long long)total);
-  std::memcpy(&b[0], "TMA1", 4);
-  uint32_t hd[4] = {(uint32_t)m.nf, (uint32_t)(m.fw * m.k), (uint32_t)(m.fh * m.k), (uint32_t)sheets.size()};
-  std::memcpy(&b[4], hd, 16); std::memcpy(&b[24], &m.dc, 8);
-  size_t po = 32 + (size_t)m.nf * 20 + sheets.size() * 8;
-  for (size_t ai = 0; ai < sheets.size(); ai++) {
-    const Sheet& t = sheets[ai]; const int aw = std::max(t.w, 1), ah = std::max(t.h, 1);
+  std::memcpy(&b[0], m.v6 ? "TMA2" : "TMA1", 4);
+  uint32_t hd[5] = {(uint32_t)m.nf, (uint32_t)(m.fw * m.k), (uint32_t)(m.fh * m.k), (uint32_t)sheets.size(), (uint32_t)xs.size()};
+  std::memcpy(&b[4], hd, m.v6 ? 20 : 16); std::memcpy(&b[24], &m.dc, 8);
+  const size_t wo = 32 + (size_t)m.nf * rec;
+  size_t po = hdr;
+  for (int pass = 0; pass < (m.v6 ? 2 : 1); pass++)  // map atlases, then facet atlases in the same layout
+    for (size_t ai = 0; ai < sheets.size(); ai++) {
+      const Sheet& t = sheets[ai]; const int aw = std::max(t.w, 1), ah = std::max(t.h, 1);
+      uint32_t wh[2] = {(uint32_t)aw, (uint32_t)ah};
+      if (pass == 0) std::memcpy(&b[wo + ai * 8], wh, 8);
+      for (auto& e : t.list) {
+        const int i = e[0], ax = e[1], ay = e[2];
+        const int32_t* c = &m.crop[(size_t)i * 4];
+        std::vector<uint8_t>& src = pass == 0 ? m.px[i] : m.fpx[i];
+        if (src.size() == (size_t)c[2] * c[3] * 4)
+          for (int r = 0; r < c[3]; r++) std::memcpy(&b[po + ((size_t)(ay + r) * aw + ax) * 4], &src[(size_t)r * c[2] * 4], (size_t)c[2] * 4);
+        cell[(size_t)i * 3] = (int32_t)ai; cell[(size_t)i * 3 + 1] = ax - c[0]; cell[(size_t)i * 3 + 2] = ay - c[1];
+        mem_add(-(long long)src.size());
+        std::vector<uint8_t>().swap(src);
+      }
+      po += (size_t)aw * ah * 4;
+    }
+  for (size_t xi = 0; xi < xs.size(); xi++) {
+    const Sheet& t = xs[xi]; const int aw = std::max(t.w, 1), ah = std::max(t.h, 1);
     uint32_t wh[2] = {(uint32_t)aw, (uint32_t)ah};
-    std::memcpy(&b[32 + (size_t)m.nf * 20 + ai * 8], wh, 8);
+    std::memcpy(&b[wo + (sheets.size() + xi) * 8], wh, 8);
     for (auto& e : t.list) {
       const int i = e[0], ax = e[1], ay = e[2];
-      const int32_t* c = &m.crop[(size_t)i * 4];
-      for (int r = 0; r < c[3]; r++) std::memcpy(&b[po + ((size_t)(ay + r) * aw + ax) * 4], &m.px[i][(size_t)r * c[2] * 4], (size_t)c[2] * 4);
-      cell[(size_t)i * 3] = (int32_t)ai; cell[(size_t)i * 3 + 1] = ax - c[0]; cell[(size_t)i * 3 + 2] = ay - c[1];
-      mem_add(-(long long)m.px[i].size());
-      std::vector<uint8_t>().swap(m.px[i]);
+      const int32_t* c = &m.acrop[(size_t)i * 6];
+      for (int r = 0; r < c[3]; r++) std::memcpy(&b[po + ((size_t)(ay + r) * aw + ax) * 4], &m.apx[i][(size_t)r * c[2] * 4], (size_t)c[2] * 4);
+      xcell[(size_t)i * 3] = (int32_t)xi; xcell[(size_t)i * 3 + 1] = ax - c[0]; xcell[(size_t)i * 3 + 2] = ay - c[1];
+      mem_add(-(long long)m.apx[i].size());
+      std::vector<uint8_t>().swap(m.apx[i]);
     }
     po += (size_t)aw * ah * 4;
   }
   for (int i = 0; i < m.nf; i++) {
-    int32_t v[5] = {m.rows[i * 2], m.rows[i * 2 + 1], cell[(size_t)i * 3], cell[(size_t)i * 3 + 1], cell[(size_t)i * 3 + 2]};
-    std::memcpy(&b[32 + (size_t)i * 20], v, 20);
+    int32_t v[10] = {m.rows[i * 2], m.rows[i * 2 + 1], cell[(size_t)i * 3], cell[(size_t)i * 3 + 1], cell[(size_t)i * 3 + 2],
+                     xcell[(size_t)i * 3], xcell[(size_t)i * 3 + 1], xcell[(size_t)i * 3 + 2], m.v6 ? m.acrop[(size_t)i * 6 + 4] : 0, m.v6 ? m.acrop[(size_t)i * 6 + 5] : 0};
+    std::memcpy(&b[32 + (size_t)i * rec], v, rec);
   }
 }
 
@@ -2488,6 +2775,9 @@ static void drop_inputs(Map& m) {
   std::vector<uint8_t>().swap(m.frames); std::vector<uint8_t>().swap(m.tmv); std::vector<uint8_t>().swap(m.eyes);
   for (auto& p : m.px) { mem_add(-(long long)p.size()); std::vector<uint8_t>().swap(p); }
   std::vector<std::vector<uint8_t>>().swap(m.px);
+  for (auto* v : {&m.fpx, &m.apx}) { for (auto& p : *v) { mem_add(-(long long)p.size()); std::vector<uint8_t>().swap(p); } std::vector<std::vector<uint8_t>>().swap(*v); }
+  mem_add(-(long long)(m.out0.size() + m.ids0.size() * 4));
+  std::vector<uint8_t>().swap(m.out0); std::vector<int32_t>().swap(m.ids0);
 }
 
 struct Pool {
@@ -2523,6 +2813,10 @@ struct Pool {
     c = crc_more(c, m.frames.data(), m.frames.size());
     m.key = c;
     if (load_cache(m)) { drop_inputs(m); m.hit = 1; m.done = m.nf; m.state = 4; return; }
+    if (m.v6) {
+      const int r = ref_frame(m);
+      if (r) { m.state = r; return; }
+    }
     m.state = 3;
   }
   void frame(Map& m, int f) {
@@ -2530,10 +2824,16 @@ struct Pool {
     int err = 0;
     std::unique_ptr<tmap::Job> j(job_from(ip, &m.frames[(size_t)f * m.fsz()], m.tmv.data(), m.par.c_str(), &err));
     if (!j) { m.state = err ? err : 19; return; }
+    if (m.v6) {
+      j->stable_holes = true;
+      if (f != 0 && !m.rfx.empty()) { j->ref_fx = &m.rfx; j->ref_fy = &m.rfy; j->ref_tm = &m.rtm; j->ref_cnt = &m.rcnt; }
+    }
     const long long jm = (long long)j->N * 120;  // rough working set of one frame job (about 30 planes of W*H)
     mem_add(jm);
     while (!j->step(5.0)) if (m.cancel.load()) { mem_add(-jm); return; }
-    const int r = finish(m, f, j->out);
+    std::vector<uint8_t> face;
+    if (m.v6) { c0(m, f, *j, face); aux_frame(m, f); }
+    const int r = finish(m, f, j->out, m.v6 ? &face : nullptr);
     j.reset();
     mem_add(-jm);
     if (r) { m.state = r; return; }
@@ -2583,7 +2883,8 @@ static Pool& pool() { static Pool* p = new Pool(); return *p; }
 }}  // namespace tmap::mp
 
 extern "C" {
-// ip = int32[12] {frame_w, frame_h, nf, k, sid, threads, tmv_len, eyes_len, grad*1e6, lr*1000, urgent (1 = before the others), 0}.
+// ip = int32[12] {frame_w, frame_h, nf, k, sid, threads, tmv_len, eyes_len, grad*1e6, lr*1000, urgent (1 = before the others),
+//                  flags (bit0 = v6 output TMA2: frame-0 facet attributes, facet atlases, aux atlases)}.
 // handle > 0, 0 = refused
 TMAP_EXPORT int tmap_map_new(const int32_t* ip, const uint8_t* tmv, const char* par, const uint8_t* eyes, const char* path) {
   using namespace tmap::mp;
@@ -2605,6 +2906,11 @@ TMAP_EXPORT int tmap_map_new(const int32_t* ip, const uint8_t* tmv, const char* 
     mem_add((long long)(m->frames.size() + m->tmv.size() + m->eyes.size()));
     m->have.assign(nf, 0);
     m->rows.assign((size_t)nf * 2, 0); m->crop.assign((size_t)nf * 4, 0); m->px.resize(nf);
+    m->v6 = (ip[11] & 1) != 0;
+    if (m->v6) {
+      if (!tmv_mesh(*m)) return 0;
+      m->fpx.resize(nf); m->apx.resize(nf); m->acrop.assign((size_t)nf * 6, 0);
+    }
     Pool& P = pool();
     std::lock_guard<std::mutex> lk(P.mu);
     if (!P.ensure(ip[5])) return 0;
