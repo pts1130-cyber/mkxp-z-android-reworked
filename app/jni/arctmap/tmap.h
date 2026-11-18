@@ -64,7 +64,7 @@ double hmix(uint32_t a, uint32_t b, uint32_t c);
 #else
 #define TMAP_EXPORT __attribute__((visibility("default")))
 #endif
-#define TMAP_VERSION 4
+#define TMAP_VERSION 5
 
 // C ABI (MiniFFI: integers and pointers only, <= 10 args; returns are numbers)
 // ip = int32[8] {buf_w, h, frame_w, k, sid, frame, src_x, flags}: rgba = buf_w x h pixels holding the frame at x = src_x
@@ -86,4 +86,14 @@ TMAP_EXPORT int tmap_batch_new(const int32_t* ip, const uint8_t* rgba);
 TMAP_EXPORT int tmap_batch_poll(int batch, int32_t* io);   // 0 running, 1 done, >= 11 error; io int32[4] {done, nf, bytes, state}
 TMAP_EXPORT int tmap_batch_take(int batch, uint8_t* out);  // .tmv, zlib part not applied (io[2] bytes)
 TMAP_EXPORT int tmap_batch_free(int batch);                // cancels if still running
+// v5: a whole body map (every frame's map, eye cut, body crop, frame-0 centre, atlas pack) on background threads,
+// read from / written to a disk cache file. ip = int32[12] {frame_w, frame_h, nf, k, sid, threads (0 = cores-1, at most 3),
+// tmv_len, eyes_len, grad*1e6, lr*1000, urgent, 0}; tmv/par/eyes copied; path = cache file (UTF-8, may be null/empty = no cache).
+// Then tmap_map_add every frame (RGBA fw*fh*4, copied), tmap_map_go. Result blob (see tmap.cpp) read with tmap_map_read.
+TMAP_EXPORT int tmap_map_new(const int32_t* ip, const uint8_t* tmv, const char* par, const uint8_t* eyes, const char* path);
+TMAP_EXPORT int tmap_map_add(int map, int frame, const uint8_t* rgba);
+TMAP_EXPORT int tmap_map_go(int map);
+TMAP_EXPORT int tmap_map_poll(int map, int32_t* io);  // 0 running, 1 done, >= 11 error; io int32[4] {frames done, nf, blob bytes, from cache}
+TMAP_EXPORT int tmap_map_read(int map, int off, int len, uint8_t* out);
+TMAP_EXPORT int tmap_map_free(int map);               // cancels if still running
 }

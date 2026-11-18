@@ -425,16 +425,10 @@ void fill_tris(const float* v, int nt, const int32_t* tri, const uint8_t* ok, in
 
 // ---------------------------------------------------------------- cv2 RGB2HSV (8U, H in 0..180)
 void rgb2hsv8(const uint8_t* rgb, int stride, int n, uint8_t* hsv) {
-  static int sdiv[256], hdiv[256]; static bool init = false;
   const int sh = 12;
-  if (!init) {
-    sdiv[0] = hdiv[0] = 0;
-    for (int i = 1; i < 256; i++) {
-      sdiv[i] = (int)std::lround((255 << sh) / (1. * i));
-      hdiv[i] = (int)std::lround((180 << sh) / (6. * i));
-    }
-    init = true;
-  }
+  struct Tab { int s[256], h[256]; Tab() { s[0] = h[0] = 0; for (int i = 1; i < 256; i++) { s[i] = (int)std::lround((255 << 12) / (1. * i)); h[i] = (int)std::lround((180 << 12) / (6. * i)); } } };
+  static const Tab tab;  // thread-safe one-time init
+  const int* sdiv = tab.s; const int* hdiv = tab.h;
   for (int i = 0; i < n; i++) {
     const uint8_t* p = rgb + (size_t)i * stride;
     int r = p[0], g = p[1], b = p[2];
@@ -1997,19 +1991,17 @@ TMAP_EXPORT int tmap_job_take(intptr_t h, uint8_t* out) {
   return 0;
 }
 TMAP_EXPORT void tmap_job_free(intptr_t h) { delete (tmap::Job*)h; }
-static uint32_t crc_tab[256];
-static void crc_init() {
-  for (uint32_t n = 0; n < 256; n++) { uint32_t c = n; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; crc_tab[n] = c; }
-}
+struct CrcTab { uint32_t t[256]; CrcTab() { for (uint32_t n = 0; n < 256; n++) { uint32_t c = n; for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; t[n] = c; } } };
+static const uint32_t* crc_table() { static const CrcTab T; return T.t; }
 TMAP_EXPORT int tmap_hash(const uint8_t* rgba, const int32_t* ip, uint32_t* io) {
   if (!rgba || !ip || !io || ip[0] < 0) return 11;
-  static bool ready = false; if (!ready) { crc_init(); ready = true; }
   const bool bgra = (ip[1] & 1) != 0;
+  const uint32_t* tab = crc_table();
   uint32_t c = ~*io;
   for (int32_t i = 0; i < ip[0]; i++) {
     const uint8_t* p = rgba + (size_t)i * 4; uint8_t q[4] = {0, 0, 0, 0};
     if (p[3]) { q[0] = bgra ? p[2] : p[0]; q[1] = p[1]; q[2] = bgra ? p[0] : p[2]; q[3] = p[3]; }
-    for (int j = 0; j < 4; j++) c = crc_tab[(c ^ q[j]) & 0xFF] ^ (c >> 8);
+    for (int j = 0; j < 4; j++) c = tab[(c ^ q[j]) & 0xFF] ^ (c >> 8);
   }
   *io = ~c;
   return 0;
@@ -2023,9 +2015,9 @@ TMAP_EXPORT void tm_hsv(const uint8_t* rgb, int n, uint8_t* hsv) { tmap::rgb2hsv
 TMAP_EXPORT double tm_hmix(unsigned a, unsigned b, unsigned c) { return tmap::hmix(a, b, c); }
 // ---- v3: tracks for pictures the pack does not have
 static uint32_t tm_crc(const uint8_t* p, size_t n) {
-  static bool ready = false; if (!ready) { crc_init(); ready = true; }
   uint32_t c = 0xFFFFFFFFu;
-  for (size_t i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+  const uint32_t* tab = crc_table();
+  for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
   return ~c;
 }
 // checks (ctypes): whole sprite in one call. frames: nf frames frame-major, fw*fh*4 each. returns 0 / error code, *len = bytes
@@ -2225,4 +2217,468 @@ TMAP_EXPORT int tmap_batch_free(int h) {
 }
 TMAP_EXPORT void tm_resize_area(const uint8_t* s, int sw, int sh, uint8_t* d, int dw, int dh) { tmap::trk::resize_area_u8(s, sw, sh, d, dw, dh); }
 TMAP_EXPORT void tm_resize_lin(const float* s, int sw, int sh, float* d, int dw, int dh) { tmap::trk::resize_linear_any(s, sw, sh, d, dw, dh); }
+}
+
+// ---- v5: whole body map on background threads + disk cache
+// Same steps as the game's Ruby path (tmap_job per frame, then eye cut, body crop with a 1 px margin, frame-0 centre,
+// shelf pack into atlases of side <= 4096), so the bytes match. Blob (little endian):
+//   "TMA1" u32 nf u32 mw u32 mh u32 natl u32 0 f64 dc | nf x i32 {row0, row1, atlas (-1 none), rect_x, rect_y} |
+//   natl x u32 {w, h} | atlas pixels (RGBA, w*h*4 each)
+// Cache file: "TBC1" u32 TMAP_VERSION u32 key u32 blob_len u32 crc(blob) | blob as runs of 32-bit pixels
+//   (u32 n: bit31 set = n&0x7fffffff copies of the next pixel, else n literal pixels)
+namespace tmap { namespace mp {
+static const int MARGIN = 1, MAX_SIDE = 4096;
+static std::atomic<long long> g_mem{0}, g_peak{0};
+static void mem_add(long long d) {
+  long long v = g_mem.fetch_add(d) + d, p = g_peak.load();
+  while (v > p && !g_peak.compare_exchange_weak(p, v)) {}
+}
+
+struct Map {
+  int id = 0;
+  int fw = 0, fh = 0, nf = 0, k = 0, sid = 0;
+  double grad = 0, lr = 0;
+  std::vector<int32_t> ip;
+  std::vector<uint8_t> frames, have, tmv, eyes;
+  std::string par, path;
+  std::atomic<bool> cancel{false};
+  std::atomic<int> state{0};  // 0 collecting, 1 queued, 2 cache check, 3 frames, 4 done, >= 11 error
+  std::atomic<int> done{0};
+  std::atomic<int> hit{0};
+  int next = 0;               // next frame to hand out (under Pool::mu)
+  int urgent = 0;
+  uint32_t key = 0;
+  std::vector<int32_t> rows;
+  std::vector<int32_t> crop;  // x0, y0, cw, ch per frame (cw 0 = none)
+  std::vector<std::vector<uint8_t>> px;
+  double dc = 0.5;
+  std::vector<uint8_t> blob;
+  size_t fsz() const { return (size_t)fw * fh * 4; }
+  ~Map() {
+    long long n = (long long)(frames.size() + tmv.size() + eyes.size() + blob.size());
+    for (auto& p : px) n += (long long)p.size();
+    mem_add(-n);
+  }
+};
+
+static uint32_t crc_more(uint32_t c, const void* d, size_t n) {
+  const uint32_t* tab = crc_table(); const uint8_t* p = (const uint8_t*)d; c = ~c;
+  for (size_t i = 0; i < n; i++) c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+  return ~c;
+}
+
+#if defined(_WIN32)
+static std::wstring wide(const std::string& s) {
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+  std::wstring w(n > 0 ? n : 1, L'\0');
+  if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+  return w;
+}
+static FILE* fopen8(const std::string& p, const char* m) { return _wfopen(wide(p).c_str(), wide(m).c_str()); }
+static bool replace8(const std::string& a, const std::string& b) { return MoveFileExW(wide(a).c_str(), wide(b).c_str(), MOVEFILE_REPLACE_EXISTING) != 0; }
+static void remove8(const std::string& p) { _wremove(wide(p).c_str()); }
+#else
+static FILE* fopen8(const std::string& p, const char* m) { return std::fopen(p.c_str(), m); }
+static bool replace8(const std::string& a, const std::string& b) { return std::rename(a.c_str(), b.c_str()) == 0; }
+static void remove8(const std::string& p) { std::remove(p.c_str()); }
+#endif
+
+static void put32(std::vector<uint8_t>& o, uint32_t v) { uint8_t b[4]; std::memcpy(b, &v, 4); o.insert(o.end(), b, b + 4); }
+
+static bool load_cache(Map& m) {
+  if (m.path.empty()) return false;
+  FILE* f = fopen8(m.path, "rb");
+  if (!f) return false;
+  std::vector<uint8_t> raw;
+  std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+  if (sz < 20 || sz > (1L << 30)) { std::fclose(f); return false; }
+  raw.resize((size_t)sz);
+  const bool rd = std::fread(raw.data(), 1, raw.size(), f) == raw.size();
+  std::fclose(f);
+  if (!rd || std::memcmp(raw.data(), "TBC1", 4) != 0) return false;
+  uint32_t ver, key, len, crc; std::memcpy(&ver, &raw[4], 4); std::memcpy(&key, &raw[8], 4); std::memcpy(&len, &raw[12], 4); std::memcpy(&crc, &raw[16], 4);
+  if (ver != TMAP_VERSION || key != m.key || len % 4 != 0 || len > (1u << 30)) return false;
+  mem_add((long long)raw.size() + len);
+  std::vector<uint8_t> b(len);
+  size_t i = 20, o = 0;
+  bool ok = true;
+  while (o < len) {
+    if (i + 4 > raw.size()) { ok = false; break; }
+    uint32_t c; std::memcpy(&c, &raw[i], 4); i += 4;
+    const bool run = (c & 0x80000000u) != 0; const size_t cnt = (size_t)(c & 0x7fffffffu) * 4;
+    if (cnt == 0 || o + cnt > len) { ok = false; break; }
+    if (run) {
+      if (i + 4 > raw.size()) { ok = false; break; }
+      for (size_t j = 0; j < cnt; j += 4) std::memcpy(&b[o + j], &raw[i], 4);
+      i += 4;
+    } else {
+      if (i + cnt > raw.size()) { ok = false; break; }
+      std::memcpy(&b[o], &raw[i], cnt); i += cnt;
+    }
+    o += cnt;
+  }
+  mem_add(-(long long)raw.size());
+  std::vector<uint8_t>().swap(raw);
+  uint32_t nf = 0;
+  if (ok && b.size() >= 32) std::memcpy(&nf, &b[4], 4);
+  if (!ok || b.size() < 32 || std::memcmp(b.data(), "TMA1", 4) != 0 || (int)nf != m.nf || crc_more(0, b.data(), b.size()) != crc) {
+    mem_add(-(long long)len);
+    return false;
+  }
+  m.blob.swap(b);
+  return true;
+}
+
+static void save_cache(const Map& m) {
+  if (m.path.empty() || m.blob.size() % 4 != 0) return;
+  std::vector<uint8_t> o;
+  o.reserve(m.blob.size() / 4);
+  o.insert(o.end(), {'T', 'B', 'C', '1'});
+  put32(o, TMAP_VERSION); put32(o, m.key); put32(o, (uint32_t)m.blob.size()); put32(o, crc_more(0, m.blob.data(), m.blob.size()));
+  const size_t np = m.blob.size() / 4; const uint8_t* p = m.blob.data();
+  size_t i = 0;
+  while (i < np) {
+    size_t r = 1;
+    while (i + r < np && r < 0x7fffffff && std::memcmp(p + (i + r) * 4, p + i * 4, 4) == 0) r++;
+    if (r >= 3) { put32(o, 0x80000000u | (uint32_t)r); o.insert(o.end(), p + i * 4, p + i * 4 + 4); i += r; continue; }
+    size_t s = i, e = i;
+    while (e < np && e - s < 0x7fffffff) {
+      if (e + 2 < np && std::memcmp(p + e * 4, p + (e + 1) * 4, 4) == 0 && std::memcmp(p + e * 4, p + (e + 2) * 4, 4) == 0) break;
+      e++;
+    }
+    put32(o, (uint32_t)(e - s)); o.insert(o.end(), p + s * 4, p + e * 4); i = e;
+  }
+  mem_add((long long)o.capacity());
+  const std::string tmp = m.path + ".tmp";
+  FILE* f = fopen8(tmp, "wb");
+  if (f) {
+    const bool ok = std::fwrite(o.data(), 1, o.size(), f) == o.size();
+    if (std::fclose(f) != 0 || !ok || !replace8(tmp, m.path)) remove8(tmp);
+  }
+  mem_add(-(long long)o.capacity());
+}
+
+// the Ruby finish: eyes off, body rows, frame-0 centre, crop
+static int finish(Map& m, int i, std::vector<uint8_t>& out) {
+  const int fw = m.fw, fh = m.fh, k = m.k, mw = fw * k, mh = fh * k;
+  const uint8_t* fr = &m.frames[(size_t)i * m.fsz()];
+  int top = -1, bot = -1, left = fw, right = -1;
+  for (int y = 0; y < fh; y++) {
+    int x0 = -1, x1 = -1;
+    for (int x = 0; x < fw; x++) { if (fr[((size_t)y * fw + x) * 4 + 3] == 0) continue; if (x0 < 0) x0 = x; x1 = x; }
+    if (x0 < 0) continue;
+    if (top < 0) top = y;
+    bot = y;
+    if (x0 < left) left = x0;
+    if (x1 > right) right = x1;
+  }
+  int32_t* cr = &m.crop[(size_t)i * 4];
+  if (top < 0) { m.rows[i * 2] = 0; m.rows[i * 2 + 1] = 0; cr[2] = 0; return 0; }
+  if (!m.eyes.empty()) {
+    const size_t rb = (fw + 7) / 8, base = (size_t)i * fh * rb, len = m.eyes.size();
+    for (int y = 0; y < fh; y++) {
+      const size_t o = base + y * rb;
+      if (o > len) continue;
+      if (o + rb > len) return 31;
+      for (size_t bx = 0; bx < rb; bx++) {
+        const uint8_t v = m.eyes[o + bx];
+        if (!v) continue;
+        for (int b = 0; b < 8; b++) {
+          if (!(v & (0x80 >> b))) continue;
+          const int x = (int)bx * 8 + b;
+          if (x >= fw) continue;
+          for (int dy = 0; dy < k; dy++) {
+            const size_t q = (((size_t)y * k + dy) * mw + (size_t)x * k) * 4 + 3;
+            for (int dx = 0; dx < k; dx++) out[q + dx * 4] = 0;
+          }
+        }
+      }
+    }
+  }
+  const int r0 = top * k, r1 = bot * k + k - 1;
+  m.rows[i * 2] = r0; m.rows[i * 2 + 1] = r1;
+  if (i == 0) {
+    const int h = k / 2;
+    const double span = std::max((double)(r1 - r0), 1.0);
+    std::vector<double> vals;
+    int st = (int)std::ceil(std::sqrt((bot - top + 1) * (right - left + 1) / 1024.0));
+    if (st < 1) st = 1;
+    for (int y = top; y <= bot; y += st)
+      for (int x = left; x <= right; x += st) {
+        const size_t o = ((size_t)y * fw + x) * 4;
+        if (fr[o + 3] == 0) continue;
+        const size_t mo = (((size_t)y * k + h) * mw + (size_t)x * k + h) * 4;
+        if (out[mo + 3] == 0) continue;
+        const double yy = (double)((y * k + h) - r0) / span;
+        const double rv = std::round(out[mo] + 255.0 * m.grad * (0.5 - yy));
+        const int r = (int)clip(rv, 0.0, 255.0);
+        const double lum = (fr[o] * 0.299 + fr[o + 1] * 0.587 + fr[o + 2] * 0.114) / 255.0;
+        vals.push_back(clip(r / 255.0 + (lum - 0.42) * m.lr, 0.0, 1.0));
+      }
+    if (!vals.empty()) {
+      std::sort(vals.begin(), vals.end());
+      const size_t n = vals.size();
+      m.dc = (n & 1) ? vals[n / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2.0;
+    }
+  }
+  const int x0 = left * k - MARGIN, y0 = top * k - MARGIN;
+  const int cw = (right - left + 1) * k + MARGIN * 2, ch = (bot - top + 1) * k + MARGIN * 2;
+  std::vector<uint8_t>& buf = m.px[i];
+  buf.assign((size_t)cw * ch * 4, 0);
+  mem_add((long long)buf.size());
+  const int sx0 = std::max(x0, 0), sx1 = std::min(x0 + cw, mw);
+  for (int r = 0; r < ch; r++) {
+    const int y = y0 + r;
+    if (y < 0 || y >= mh) continue;
+    std::memcpy(&buf[((size_t)r * cw + (sx0 - x0)) * 4], &out[((size_t)y * mw + sx0) * 4], (size_t)(sx1 - sx0) * 4);
+  }
+  cr[0] = x0; cr[1] = y0; cr[2] = cw; cr[3] = ch;
+  return 0;
+}
+
+// shelf pack (as the Ruby pack) and the blob
+static void pack(Map& m) {
+  struct Sheet { int w = 0, h = 0, x = 0, y = 0, row = 0; std::vector<std::array<int, 3>> list; };
+  std::vector<Sheet> sheets; bool cur = false; Sheet s;
+  for (int i = 0; i < m.nf; i++) {
+    const int32_t* c = &m.crop[(size_t)i * 4];
+    if (c[2] == 0) continue;
+    const int w = c[2], h = c[3];
+    if (!cur) { s = Sheet(); cur = true; }
+    if (s.x + w > MAX_SIDE) { s.y += s.row; s.x = 0; s.row = 0; }
+    if (s.y + h > MAX_SIDE) { sheets.push_back(s); s = Sheet(); }
+    s.list.push_back({i, s.x, s.y});
+    s.w = std::max(s.w, s.x + w); s.h = std::max(s.h, s.y + h); s.row = std::max(s.row, h); s.x += w;
+  }
+  if (cur) sheets.push_back(s);
+  std::vector<int32_t> cell((size_t)m.nf * 3, 0);
+  for (int i = 0; i < m.nf; i++) cell[(size_t)i * 3] = -1;
+  size_t total = 32 + (size_t)m.nf * 20 + sheets.size() * 8;
+  for (auto& t : sheets) total += (size_t)std::max(t.w, 1) * std::max(t.h, 1) * 4;
+  std::vector<uint8_t>& b = m.blob;
+  b.assign(total, 0);
+  mem_add((long long)total);
+  std::memcpy(&b[0], "TMA1", 4);
+  uint32_t hd[4] = {(uint32_t)m.nf, (uint32_t)(m.fw * m.k), (uint32_t)(m.fh * m.k), (uint32_t)sheets.size()};
+  std::memcpy(&b[4], hd, 16); std::memcpy(&b[24], &m.dc, 8);
+  size_t po = 32 + (size_t)m.nf * 20 + sheets.size() * 8;
+  for (size_t ai = 0; ai < sheets.size(); ai++) {
+    const Sheet& t = sheets[ai]; const int aw = std::max(t.w, 1), ah = std::max(t.h, 1);
+    uint32_t wh[2] = {(uint32_t)aw, (uint32_t)ah};
+    std::memcpy(&b[32 + (size_t)m.nf * 20 + ai * 8], wh, 8);
+    for (auto& e : t.list) {
+      const int i = e[0], ax = e[1], ay = e[2];
+      const int32_t* c = &m.crop[(size_t)i * 4];
+      for (int r = 0; r < c[3]; r++) std::memcpy(&b[po + ((size_t)(ay + r) * aw + ax) * 4], &m.px[i][(size_t)r * c[2] * 4], (size_t)c[2] * 4);
+      cell[(size_t)i * 3] = (int32_t)ai; cell[(size_t)i * 3 + 1] = ax - c[0]; cell[(size_t)i * 3 + 2] = ay - c[1];
+      mem_add(-(long long)m.px[i].size());
+      std::vector<uint8_t>().swap(m.px[i]);
+    }
+    po += (size_t)aw * ah * 4;
+  }
+  for (int i = 0; i < m.nf; i++) {
+    int32_t v[5] = {m.rows[i * 2], m.rows[i * 2 + 1], cell[(size_t)i * 3], cell[(size_t)i * 3 + 1], cell[(size_t)i * 3 + 2]};
+    std::memcpy(&b[32 + (size_t)i * 20], v, 20);
+  }
+}
+
+static void drop_inputs(Map& m) {
+  mem_add(-(long long)(m.frames.size() + m.tmv.size() + m.eyes.size()));
+  m.frames.clear(); m.tmv.clear(); m.eyes.clear();
+  std::vector<uint8_t>().swap(m.frames); std::vector<uint8_t>().swap(m.tmv); std::vector<uint8_t>().swap(m.eyes);
+  for (auto& p : m.px) { mem_add(-(long long)p.size()); std::vector<uint8_t>().swap(p); }
+  std::vector<std::vector<uint8_t>>().swap(m.px);
+}
+
+struct Pool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<Map>> q;
+  std::vector<std::pair<int, std::shared_ptr<Map>>> table;
+  int started = 0, limit = 0, next_id = 1;
+  std::shared_ptr<Map> find(int id) {
+    for (auto& e : table) if (e.first == id) return e.second;
+    return nullptr;
+  }
+  // kind 1 cache check, 2 frame f
+  bool pick(int wi, std::shared_ptr<Map>& b, int& kind, int& f) {
+    if (wi >= limit) return false;
+    for (auto it = q.begin(); it != q.end();) {
+      if ((*it)->cancel.load() || (*it)->state.load() >= 4) it = q.erase(it); else ++it;
+    }
+    for (int pass = 0; pass < 2; pass++)  // urgent maps (cut-in) first, then in queue order
+      for (auto& x : q) {
+        if ((x->urgent != 0) != (pass == 0)) continue;
+        const int st = x->state.load();
+        if (st == 1) { x->state = 2; b = x; kind = 1; return true; }
+        if (st == 3 && x->next < x->nf) { b = x; kind = 2; f = x->next++; return true; }
+      }
+    return false;
+  }
+  void check(Map& m) {
+    uint32_t c = crc_more(0, m.ip.data(), m.ip.size() * 4);
+    c = crc_more(c, m.tmv.data(), m.tmv.size());
+    c = crc_more(c, m.par.data(), m.par.size());
+    c = crc_more(c, m.eyes.data(), m.eyes.size());
+    c = crc_more(c, m.frames.data(), m.frames.size());
+    m.key = c;
+    if (load_cache(m)) { drop_inputs(m); m.hit = 1; m.done = m.nf; m.state = 4; return; }
+    m.state = 3;
+  }
+  void frame(Map& m, int f) {
+    int ip[8] = {m.fw, m.fh, m.fw, m.k, m.sid, f, 0, 0};
+    int err = 0;
+    std::unique_ptr<tmap::Job> j(job_from(ip, &m.frames[(size_t)f * m.fsz()], m.tmv.data(), m.par.c_str(), &err));
+    if (!j) { m.state = err ? err : 19; return; }
+    const long long jm = (long long)j->N * 120;  // rough working set of one frame job (about 30 planes of W*H)
+    mem_add(jm);
+    while (!j->step(5.0)) if (m.cancel.load()) { mem_add(-jm); return; }
+    const int r = finish(m, f, j->out);
+    j.reset();
+    mem_add(-jm);
+    if (r) { m.state = r; return; }
+    if (m.done.fetch_add(1) + 1 == m.nf && m.state.load() == 3) {
+      pack(m);
+      drop_inputs(m);
+      m.state = 4;
+      if (!m.cancel.load()) save_cache(m);
+    }
+  }
+  static void lower_priority() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__) || defined(__ANDROID__)
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
+#endif
+  }
+  void worker(int wi) {
+    lower_priority();
+    for (;;) {
+      std::shared_ptr<Map> b; int kind = 0, f = 0;
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        while (!pick(wi, b, kind, f)) cv.wait(lk);
+      }
+      try {
+        if (kind == 1) { check(*b); std::lock_guard<std::mutex> lk(mu); cv.notify_all(); }
+        else frame(*b, f);
+      } catch (...) { b->state = 19; }
+    }
+  }
+  bool ensure(int want) {
+    if (want < 1) {
+      unsigned hc = std::thread::hardware_concurrency();
+      want = hc > 1 ? (int)hc - 1 : 1;
+      if (want > 3) want = 3;
+    }
+    if (want > limit) limit = want;
+    try {
+      while (started < limit) { std::thread t(&Pool::worker, this, started); t.detach(); started++; }
+    } catch (...) { if (started == 0) return false; limit = started; }
+    cv.notify_all();
+    return true;
+  }
+};
+static Pool& pool() { static Pool* p = new Pool(); return *p; }
+}}  // namespace tmap::mp
+
+extern "C" {
+// ip = int32[12] {frame_w, frame_h, nf, k, sid, threads, tmv_len, eyes_len, grad*1e6, lr*1000, urgent (1 = before the others), 0}.
+// handle > 0, 0 = refused
+TMAP_EXPORT int tmap_map_new(const int32_t* ip, const uint8_t* tmv, const char* par, const uint8_t* eyes, const char* path) {
+  using namespace tmap::mp;
+  try {
+    if (!ip || !tmv || !par) return 0;
+    const int fw = ip[0], fh = ip[1], nf = ip[2], k = ip[3];
+    if (fw <= 0 || fh <= 0 || nf <= 0 || nf > 4096 || k <= 0 || k > 8 || (int64_t)fw * k > 8192 || (int64_t)fh * k > 8192) return 0;
+    if (ip[6] < 16 || ip[7] < 0 || (ip[7] > 0 && !eyes)) return 0;
+    auto m = std::make_shared<Map>();
+    m->fw = fw; m->fh = fh; m->nf = nf; m->k = k; m->sid = ip[4];
+    m->grad = ip[8] / 1e6; m->lr = ip[9] / 1000.0;
+    m->urgent = ip[10];
+    m->ip.assign(ip, ip + 12); m->ip[5] = 0; m->ip[10] = 0;
+    m->tmv.assign(tmv, tmv + ip[6]);
+    if (ip[7] > 0) m->eyes.assign(eyes, eyes + ip[7]);
+    m->par = par;
+    if (path) m->path = path;
+    m->frames.assign((size_t)nf * m->fsz(), 0);
+    mem_add((long long)(m->frames.size() + m->tmv.size() + m->eyes.size()));
+    m->have.assign(nf, 0);
+    m->rows.assign((size_t)nf * 2, 0); m->crop.assign((size_t)nf * 4, 0); m->px.resize(nf);
+    Pool& P = pool();
+    std::lock_guard<std::mutex> lk(P.mu);
+    if (!P.ensure(ip[5])) return 0;
+    m->id = P.next_id; P.next_id = P.next_id >= 0x3fffffff ? 1 : P.next_id + 1;
+    P.table.push_back({m->id, m});
+    return m->id;
+  } catch (...) { return 0; }
+}
+TMAP_EXPORT int tmap_map_add(int h, int f, const uint8_t* rgba) {
+  using namespace tmap::mp;
+  Pool& P = pool();
+  std::shared_ptr<Map> m;
+  { std::lock_guard<std::mutex> lk(P.mu); m = P.find(h); }
+  if (!m || !rgba) return 11;
+  if (m->state.load() != 0 || f < 0 || f >= m->nf) return 13;
+  std::memcpy(&m->frames[(size_t)f * m->fsz()], rgba, m->fsz());
+  m->have[f] = 1;
+  return 0;
+}
+TMAP_EXPORT int tmap_map_go(int h) {
+  using namespace tmap::mp;
+  Pool& P = pool();
+  std::lock_guard<std::mutex> lk(P.mu);
+  std::shared_ptr<Map> m = P.find(h);
+  if (!m) return 11;
+  if (m->state.load() != 0) return 13;
+  for (uint8_t v : m->have) if (!v) return 13;
+  m->state = 1;
+  P.q.push_back(m);
+  P.cv.notify_all();
+  return 0;
+}
+// 0 running, 1 done, >= 11 error (13 bad call, 19 out of memory, 31 eye bits short; job errors 11..14)
+// io int32[4] {frames done, nf, blob bytes, from cache}
+TMAP_EXPORT int tmap_map_poll(int h, int32_t* io) {
+  using namespace tmap::mp;
+  Pool& P = pool();
+  std::shared_ptr<Map> m;
+  { std::lock_guard<std::mutex> lk(P.mu); m = P.find(h); }
+  if (!m) return 11;
+  const int st = m->state.load();
+  if (io) { io[0] = m->done.load(); io[1] = m->nf; io[2] = st == 4 ? (int)m->blob.size() : 0; io[3] = m->hit.load(); }
+  return st == 4 ? 1 : (st >= 11 ? st : 0);
+}
+TMAP_EXPORT int tmap_map_read(int h, int off, int len, uint8_t* out) {
+  using namespace tmap::mp;
+  if (!out || off < 0 || len < 0) return 11;
+  Pool& P = pool();
+  std::shared_ptr<Map> m;
+  { std::lock_guard<std::mutex> lk(P.mu); m = P.find(h); }
+  if (!m) return 11;
+  if (m->state.load() != 4) return 14;
+  if ((size_t)off + (size_t)len > m->blob.size()) return 13;
+  std::memcpy(out, m->blob.data() + off, len);
+  return 0;
+}
+// cancels if still running
+TMAP_EXPORT int tmap_map_free(int h) {
+  using namespace tmap::mp;
+  Pool& P = pool();
+  std::shared_ptr<Map> m;
+  {
+    std::lock_guard<std::mutex> lk(P.mu);
+    for (size_t i = 0; i < P.table.size(); i++)
+      if (P.table[i].first == h) { m = P.table[i].second; m->cancel = true; P.table.erase(P.table.begin() + i); break; }
+  }
+  return m ? 0 : 11;  // the blob goes with the last holder (a worker may still be writing the cache file)
+}
+// bytes the map threads hold now / at most since start (inputs, crops, blobs, cache buffers, rough job planes)
+TMAP_EXPORT int tmap_map_mem(int32_t* io) {
+  if (!io) return 11;
+  using namespace tmap::mp;
+  long long a = g_mem.load(), b = g_peak.load();
+  io[0] = (int32_t)(a >> 10); io[1] = (int32_t)(b >> 10);
+  return 0;
+}
 }

@@ -185,7 +185,7 @@ jobs:
           g++ -std=c++17 -O3 -ffp-contract=off -shared -static -o "$DLL" patchrepo/app/jni/arctmap/tmap.cpp
           strip --strip-unneeded "$DLL"
           objdump -p "$DLL" > arctmap-pe.txt
-          for f in tmap_version tmap_frame tmap_job_new tmap_job_step tmap_job_take tmap_job_free tmap_hash tmap_batch_new tmap_batch_poll tmap_batch_take tmap_batch_free; do
+          for f in tmap_version tmap_frame tmap_job_new tmap_job_step tmap_job_take tmap_job_free tmap_hash tmap_batch_new tmap_batch_poll tmap_batch_take tmap_batch_free tmap_map_new tmap_map_add tmap_map_go tmap_map_poll tmap_map_read tmap_map_free tmap_map_mem; do
             grep -q -E "(^|[[:space:]])$f\$" arctmap-pe.txt || { echo "::error title=arctmap::missing export $f"; exit 1; }
           done
           if grep -i -E "DLL Name: (libstdc|libgcc|libwinpthread)" arctmap-pe.txt; then
