@@ -51,6 +51,10 @@ public:
 	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
 	void releasePixels();
 	int logicalScale() const;
+
+	/* Sprites draw this bitmap with linear filtering (default nearest) */
+	bool getSmooth() const;
+	void setSmooth(bool value);
 	Bitmap(int width, int height);
     Bitmap(void *pixeldata, int width, int height);
 	/* Clone constructor */
@@ -163,6 +167,9 @@ public:
 	/* Binds the backing texture and sets the correct
 	 * texture size uniform in shader */
 	void bindTex(ShaderBase &shader);
+
+	/* Rebinds the backing texture and puts its default filter back */
+	void restoreTexFilter();
 
 	/* Adds 'rect' to tainted area */
 	void taintArea(const IntRect &rect);

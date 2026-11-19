@@ -104,6 +104,30 @@ RB_METHOD(bitmapLogicalScale) {
     return INT2FIX(value);
 }
 
+RB_METHOD(bitmapGetSmooth) {
+    RB_UNUSED_PARAM;
+
+    rb_check_argc(argc, 0);
+
+    Bitmap *b = getPrivateData<Bitmap>(self);
+
+    bool ret = false;
+    GUARD_EXC(ret = b->getSmooth(););
+    return rb_bool_new(ret);
+}
+
+RB_METHOD(bitmapSetSmooth) {
+    RB_UNUSED_PARAM;
+
+    bool value;
+    rb_get_args(argc, argv, "b", &value RB_ARG_END);
+
+    Bitmap *b = getPrivateData<Bitmap>(self);
+
+    GUARD_EXC(b->setSmooth(value););
+    return rb_bool_new(value);
+}
+
 RB_METHOD(bitmapHeight) {
     RB_UNUSED_PARAM;
     
@@ -920,6 +944,8 @@ void bitmapBindingInit() {
     _rb_define_method(klass, "width", bitmapWidth);
     _rb_define_method(klass, "height", bitmapHeight);
     _rb_define_method(klass, "logical_scale", bitmapLogicalScale);
+    _rb_define_method(klass, "smooth", bitmapGetSmooth);
+    _rb_define_method(klass, "smooth=", bitmapSetSmooth);
     _rb_define_method(klass, "rect", bitmapRect);
     _rb_define_method(klass, "blt", bitmapBlt);
     _rb_define_method(klass, "stretch_blt", bitmapStretchBlt);

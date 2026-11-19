@@ -122,6 +122,14 @@ jobs:
           git apply ../patchrepo/windows-engine/mesh-warp.patch
           git diff --stat
 
+      - name: Apply bitmap smooth patch
+        shell: bash
+        run: |
+          cd mkxp-z
+          git apply --check ../patchrepo/windows-engine/bitmap-smooth.patch
+          git apply ../patchrepo/windows-engine/bitmap-smooth.patch
+          git diff --stat
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: mingw64

@@ -1168,10 +1168,16 @@ void Sprite::draw()
         base = &shader;
     }
     
+    const bool smooth = p->bitmap->getSmooth();
+
     if (dot)
     {
         p->bitmap->bindTex(*base);
+        if (smooth)
+            TEX::setSmooth(true);
         p->meshArray->draw();
+        if (smooth)
+            p->bitmap->restoreTexFilter();
         p->endDot(screenFbo);
         p->drawDot();
         return;
@@ -1180,6 +1186,8 @@ void Sprite::draw()
     glState.blendMode.pushSet(p->blendType);
     
     p->bitmap->bindTex(*base);
+    if (smooth)
+        TEX::setSmooth(true);
     
     if (p->mesh.deforms())
     {
@@ -1193,6 +1201,9 @@ void Sprite::draw()
         p->drawPadded();
     else
         p->quad.draw();
+    
+    if (smooth)
+        p->bitmap->restoreTexFilter();
     
     glState.blendMode.pop();
 }

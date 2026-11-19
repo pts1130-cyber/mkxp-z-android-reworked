@@ -1,0 +1,135 @@
+diff --git a/binding/bitmap-binding.cpp b/binding/bitmap-binding.cpp
+index 7af92a0..de61800 100644
+--- a/binding/bitmap-binding.cpp
++++ b/binding/bitmap-binding.cpp
+@@ -584,6 +584,31 @@ RB_METHOD_GUARD(bitmapSaveToFile) {
+ }
+ RB_METHOD_GUARD_END
+ 
++RB_METHOD_GUARD(bitmapGetSmooth){
++    RB_UNUSED_PARAM;
++
++    rb_check_argc(argc, 0);
++
++    Bitmap *b = getPrivateData<Bitmap>(self);
++
++    bool ret = b->getSmooth();
++    return rb_bool_new(ret);
++}
++RB_METHOD_GUARD_END
++
++RB_METHOD_GUARD(bitmapSetSmooth){
++    RB_UNUSED_PARAM;
++
++    bool value;
++    rb_get_args(argc, argv, "b", &value RB_ARG_END);
++
++    Bitmap *b = getPrivateData<Bitmap>(self);
++
++    b->setSmooth(value);
++    return rb_bool_new(value);
++}
++RB_METHOD_GUARD_END
++
+ RB_METHOD_GUARD(bitmapGetMega){
+     RB_UNUSED_PARAM;
+     
+@@ -1022,6 +1047,8 @@ void bitmapBindingInit() {
+     _rb_define_method(klass, "radial_blur", bitmapRadialBlur);
+     
+     _rb_define_method(klass, "mega?", bitmapGetMega);
++    _rb_define_method(klass, "smooth", bitmapGetSmooth);
++    _rb_define_method(klass, "smooth=", bitmapSetSmooth);
+     rb_define_singleton_method(klass, "max_size", RUBY_METHOD_FUNC(bitmapGetMaxSize), -1);
+     
+     _rb_define_method(klass, "animated?", bitmapGetAnimated);
+diff --git a/src/display/bitmap.cpp b/src/display/bitmap.cpp
+index c46d0e4..5a59f9d 100644
+--- a/src/display/bitmap.cpp
++++ b/src/display/bitmap.cpp
+@@ -261,6 +261,9 @@ struct BitmapPrivate
+     bool pendDirty;
+     int pendX1, pendY1, pendX2, pendY2;
+     int spStreak;
++
++    /* Sprite draws sample this bitmap with linear filtering */
++    bool smooth;
+     
+     BitmapPrivate(Bitmap *self)
+     : self(self),
+@@ -271,7 +274,8 @@ struct BitmapPrivate
+     assumingRubyGC(false),
+     pendDirty(false),
+     pendX1(0), pendY1(0), pendX2(0), pendY2(0),
+-    spStreak(0)
++    spStreak(0),
++    smooth(false)
+     {
+         format = SDL_AllocFormat(SDL_PIXELFORMAT_ABGR8888);
+         
+@@ -1315,6 +1319,20 @@ void Bitmap::setLores(Bitmap *lores) {
+         p->font->setHiresMult((float)width() / (float)lores->width());
+ }
+ 
++bool Bitmap::getSmooth() const
++{
++    guardDisposed();
++
++    return p->smooth;
++}
++
++void Bitmap::setSmooth(bool value)
++{
++    guardDisposed();
++
++    p->smooth = value;
++}
++
+ bool Bitmap::isMega() const{
+     guardDisposed();
+     
+diff --git a/src/display/bitmap.h b/src/display/bitmap.h
+index 670e04a..4a2fca2 100644
+--- a/src/display/bitmap.h
++++ b/src/display/bitmap.h
+@@ -58,6 +58,10 @@ public:
+ 	DECL_ATTR(Hires, Bitmap*)
+ 	void setLores(Bitmap *lores);
+ 	bool isMega() const;
++
++	/* Sprites draw this bitmap with linear filtering (default nearest) */
++	bool getSmooth() const;
++	void setSmooth(bool value);
+     bool isAnimated() const;
+ 
+ 	IntRect rect() const;
+diff --git a/src/display/sprite.cpp b/src/display/sprite.cpp
+index c466ca4..9710533 100644
+--- a/src/display/sprite.cpp
++++ b/src/display/sprite.cpp
+@@ -1513,10 +1513,16 @@ void Sprite::draw()
+         }        
+     }
+     
++    const bool smooth = p->bitmap->getSmooth();
++
+     if (dot)
+     {
+         p->bitmap->bindTex(*base, false);
++        if (smooth)
++            TEX::setSmooth(true);
+         p->meshArray->draw();
++        if (smooth)
++            TEX::setSmooth(false);
+         p->endDot(screenFbo);
+         p->drawDot();
+         return;
+@@ -1534,7 +1540,7 @@ void Sprite::draw()
+     }
+ #endif
+     
+-    TEX::setSmooth(scalingMethod == Bilinear);
++    TEX::setSmooth(scalingMethod == Bilinear || (scalingMethod == NearestNeighbor && smooth));
+ 
+     if (p->mesh.deforms())
+     {

@@ -282,6 +282,9 @@ struct BitmapPrivate
      * report gl size * lscale (see Bitmap(const char*, int)) */
     int lscale;
 
+    /* Sprite draws sample this bitmap with linear filtering */
+    bool smooth;
+
     /* ARC: 'surface' (decoded file pixels or a read-back) is kept in RAM, bounded
      * by ARC_KEEP_MAX_BYTES across all bitmaps, so raw_data/get_pixel on a fresh
      * picture is a memcpy instead of a GPU read-back */
@@ -296,6 +299,7 @@ struct BitmapPrivate
     pendX1(0), pendY1(0), pendX2(0), pendY2(0),
     spStreak(0),
     lscale(1),
+    smooth(false),
     kept(false)
     {
         format = SDL_AllocFormat(SDL_PIXELFORMAT_ABGR8888);
@@ -1714,6 +1718,31 @@ int Bitmap::logicalScale() const
     guardDisposed();
 
     return p->lscale;
+}
+
+bool Bitmap::getSmooth() const
+{
+    guardDisposed();
+
+    return p->smooth;
+}
+
+void Bitmap::setSmooth(bool value)
+{
+    guardDisposed();
+
+    p->smooth = value;
+}
+
+void Bitmap::restoreTexFilter()
+{
+    if (p->animation.enabled) {
+        TEX::bind(p->animation.currentFrame().tex);
+        TEX::setSmooth(false);
+        return;
+    }
+    TEX::bind(p->gl.tex);
+    TEX::setSmooth(p->lscale > 1);
 }
 
 bool Bitmap::isMega() const{
