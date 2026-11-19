@@ -3007,19 +3007,28 @@ static void cheb_dist(std::vector<int>& d, int w, int h) {
       if (y + 1 < h) for (int dx = -1; dx <= 1; dx++) if (x + dx >= 0 && x + dx < w) v = std::min(v, d[(size_t)(y + 1) * w + x + dx] + 1);
     }
 }
-// v6: where a frame equals the one before it out to the nearest colour edge on x and on y (at least 3 px), the map and
-// facet values are taken from the frame before (frames in order from frame 0), so parts that do not move stay as they were
+static bool sprite_flow(const uint8_t* a, const uint8_t* b, int fw, int fh, std::vector<float>& fx, std::vector<float>& fy);
+// sprite px still from frame f - 1 to frame f: equal out to the nearest colour edge on x and on y (at least 3 px), or
+// equal over its 3x3 with the sprite flow under 0.25 px over that 3x3 (a flat area that shifted has moving edges, which
+// the flow carries inside). There the map and facet values are taken from the frame before. Then, from frame 0 backward
+// round the loop, px still all the way into frame 0 (same still test per frame pair) take frame 0's values
 static void hold_still(Map& m) {
   const int fw = m.fw, fh = m.fh, k = m.k, mw = fw * k;
   const size_t n = (size_t)fw * fh;
   const int BIG = 1 << 20;
+  const float FLOW_STILL = 0.25f;
   std::vector<int> hx(n), vy(n), dd(n);
-  for (int f = 1; f < m.nf; f++) {
-    const int32_t* ca = &m.crop[(size_t)f * 4]; const int32_t* cb = &m.crop[(size_t)(f - 1) * 4];
-    if (ca[2] == 0 || cb[2] == 0) continue;
-    if (m.px[f].size() != (size_t)ca[2] * ca[3] * 4 || m.px[f - 1].size() != (size_t)cb[2] * cb[3] * 4) continue;
-    if (m.fpx[f].size() != m.px[f].size() || m.fpx[f - 1].size() != m.px[f - 1].size()) continue;
-    const uint8_t* a = &m.frames[(size_t)f * m.fsz()]; const uint8_t* b = &m.frames[(size_t)(f - 1) * m.fsz()];
+  std::vector<uint8_t> cand(n);
+  std::vector<float> fx, fy;
+  auto usable = [&](int f, int g) {
+    const int32_t* ca = &m.crop[(size_t)f * 4]; const int32_t* cb = &m.crop[(size_t)g * 4];
+    return ca[2] != 0 && cb[2] != 0 && m.px[f].size() == (size_t)ca[2] * ca[3] * 4 && m.px[g].size() == (size_t)cb[2] * cb[3] * 4 &&
+           m.fpx[f].size() == m.px[f].size() && m.fpx[g].size() == m.px[g].size();
+  };
+  auto still = [&](int f, int g, std::vector<uint8_t>& hold) {
+    hold.assign(n, 0);
+    if (!usable(f, g)) return;
+    const uint8_t* a = &m.frames[(size_t)f * m.fsz()]; const uint8_t* b = &m.frames[(size_t)g * m.fsz()];
     bool any = false;
     for (size_t i = 0; i < n; i++) {
       hx[i] = BIG; vy[i] = BIG;
@@ -3034,11 +3043,33 @@ static void hold_still(Map& m) {
       }
     cheb_dist(hx, fw, fh); cheb_dist(vy, fw, fh);
     if (any) cheb_dist(dd, fw, fh);
+    bool need = false;
+    for (size_t i = 0; i < n; i++) {
+      cand[i] = 0;
+      if (a[i * 4 + 3] == 0 || b[i * 4 + 3] == 0) continue;
+      if (dd[i] > std::max(3, std::max(hx[i], vy[i]))) hold[i] = 1;
+      else if (dd[i] >= 2) { cand[i] = 1; need = true; }
+    }
+    if (need && sprite_flow(a, b, fw, fh, fx, fy))
+      for (int y = 0; y < fh; y++)
+        for (int x = 0; x < fw; x++) {
+          const size_t i = (size_t)y * fw + x;
+          if (!cand[i]) continue;
+          bool s = true;
+          for (int sy = std::max(y - 1, 0); sy <= std::min(y + 1, fh - 1) && s; sy++)
+            for (int sx = std::max(x - 1, 0); sx <= std::min(x + 1, fw - 1); sx++) {
+              const size_t q = (size_t)sy * fw + sx;
+              if (std::fabs(fx[q]) >= FLOW_STILL || std::fabs(fy[q]) >= FLOW_STILL) { s = false; break; }
+            }
+          hold[i] = s;
+        }
+  };
+  auto copy = [&](int f, int g, const std::vector<uint8_t>& hold) {
+    if (!usable(f, g)) return;
+    const int32_t* ca = &m.crop[(size_t)f * 4]; const int32_t* cb = &m.crop[(size_t)g * 4];
     for (int sy = 0; sy < fh; sy++)
       for (int sx = 0; sx < fw; sx++) {
-        const size_t i = (size_t)sy * fw + sx;
-        if (a[i * 4 + 3] == 0 || b[i * 4 + 3] == 0) continue;
-        if (dd[i] <= std::max(3, std::max(hx[i], vy[i]))) continue;
+        if (!hold[(size_t)sy * fw + sx]) continue;
         for (int Y = sy * k; Y < sy * k + k; Y++) {
           const int ra = Y - ca[1], rb = Y - cb[1];
           if (ra < 0 || ra >= ca[3] || rb < 0 || rb >= cb[3]) continue;
@@ -3046,12 +3077,25 @@ static void hold_still(Map& m) {
             const int xa = X - ca[0], xb = X - cb[0];
             if (xa < 0 || xa >= ca[2] || xb < 0 || xb >= cb[2]) continue;
             const size_t qa = ((size_t)ra * ca[2] + xa) * 4, qb = ((size_t)rb * cb[2] + xb) * 4;
-            if (m.px[f][qa + 3] == 0 || m.px[f - 1][qb + 3] == 0) continue;
-            std::memcpy(&m.px[f][qa], &m.px[f - 1][qb], 4);
-            std::memcpy(&m.fpx[f][qa], &m.fpx[f - 1][qb], 4);
+            if (m.px[f][qa + 3] == 0 || m.px[g][qb + 3] == 0) continue;
+            std::memcpy(&m.px[f][qa], &m.px[g][qb], 4);
+            std::memcpy(&m.fpx[f][qa], &m.fpx[g][qb], 4);
           }
         }
       }
+  };
+  if (m.nf < 2) return;
+  std::vector<std::vector<uint8_t>> sm(m.nf);  // sm[f]: still from f - 1 to f
+  for (int f = 1; f < m.nf; f++) { still(f, f - 1, sm[f]); copy(f, f - 1, sm[f]); }
+  std::vector<uint8_t> link;
+  still(m.nf - 1, 0, link);
+  for (int f = m.nf - 1; f >= 1; f--) {
+    if (f < m.nf - 1)
+      for (size_t i = 0; i < n; i++) link[i] = link[i] && sm[f + 1][i];
+    bool any = false;
+    for (size_t i = 0; i < n && !any; i++) any = link[i] != 0;
+    if (!any) break;
+    copy(f, (f + 1) % m.nf, link);
   }
 }
 
