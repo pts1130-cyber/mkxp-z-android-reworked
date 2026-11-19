@@ -64,7 +64,7 @@ double hmix(uint32_t a, uint32_t b, uint32_t c);
 #else
 #define TMAP_EXPORT __attribute__((visibility("default")))
 #endif
-#define TMAP_VERSION 7
+#define TMAP_VERSION 8
 
 // C ABI (MiniFFI: integers and pointers only, <= 10 args; returns are numbers)
 // ip = int32[8] {buf_w, h, frame_w, k, sid, frame, src_x, flags}: rgba = buf_w x h pixels holding the frame at x = src_x

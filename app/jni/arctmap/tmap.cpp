@@ -1777,6 +1777,8 @@ struct Sprite {
   std::vector<float> kern; int kr = 0;  // cv2 Gaussian kernel for the flow blur
   std::vector<int16_t> dv;              // nf * nv * 2 (1/16 px, minus p0)
   std::vector<uint8_t> okb;             // nf * ((nt+7)/8)
+  std::vector<std::vector<int16_t>> lf, lb;  // flow of frame f to f+1 / to f-1 (cyclic), finest DIS level, 1/16 level px
+  int lw = 0, lh = 0, lsc = 1;
   const uint8_t* frame(int i) const { return &px[(size_t)i * fw * fh * 4]; }
   // 0 ok; 21 empty body, 22 too many vertices, 23 triangulation failed, 24 too small for the flow, 26 too large
   int prepare() {
@@ -1864,7 +1866,111 @@ struct Sprite {
     sum = 1. / sum;
     for (int i = 0; i < n; i++) kern[i] = (float)(kern[i] * sum);
     dv.assign((size_t)nf * nv * 2, 0); okb.assign((size_t)nf * ((nt + 7) / 8), 0);
+    if (nf >= 2) { lf.assign(nf, {}); lb.assign(nf, {}); }
     return 0;
+  }
+  // flows of frame f to its neighbours (cyclic) for the chained tracks
+  int pair_flows(int f, DisWork& K, const std::atomic<bool>* cancel) {
+    if (nf < 2) return 0;
+    std::vector<uint8_t> g, gn;
+    flow_img(frame(f), fw, fh, k, bgra, g);
+    const DisCfg c = dis_cfg(W, H, 1);
+    if (c.coarsest < 0) return 24;
+    DisRef R; dis_ref(g.data(), W, H, c, R);
+    for (int d = 0; d < 2; d++) {
+      const int j = d == 0 ? (f + 1) % nf : (f + nf - 1) % nf;
+      flow_img(frame(j), fw, fh, k, bgra, gn);
+      if (!dis_calc(R, gn.data(), K, cancel)) return 25;
+      const DisLevel& L = R.lv[c.finest];
+      std::vector<int16_t>& o = d == 0 ? lf[f] : lb[f];
+      o.resize((size_t)L.w * L.h * 2);
+      for (size_t i = 0; i < (size_t)L.w * L.h; i++) {
+        o[i * 2] = (int16_t)std::min(32767.f, std::max(-32768.f, std::nearbyint(K.Ux[i] * 16.f)));
+        o[i * 2 + 1] = (int16_t)std::min(32767.f, std::max(-32768.f, std::nearbyint(K.Uy[i] * 16.f)));
+      }
+      lw = L.w; lh = L.h; lsc = 1 << c.finest;
+    }
+    return 0;
+  }
+  // tracks of frames 1.. from the neighbour flows: between frames equal to frame 0 (and around the loop), a chain
+  // forward and a chain backward, mixed by place in the stretch so both ends meet; frames equal to an earlier frame
+  // take its track. Flow at a vertex is the Gaussian mean over the body pixels of the frame (all pixels off the body)
+  void chain() {
+    if (nf < 2) return;
+    for (int f = 0; f < nf; f++) if (lf[f].empty() || lb[f].empty()) return;
+    const size_t fsz = (size_t)fw * fh * 4;
+    std::vector<float> Fx((size_t)W * H), Fy((size_t)W * H), sx((size_t)lw * lh), sy((size_t)lw * lh);
+    auto load = [&](const std::vector<int16_t>& l) {
+      for (size_t i = 0; i < (size_t)lw * lh; i++) { sx[i] = l[i * 2] / 16.f; sy[i] = l[i * 2 + 1] / 16.f; }
+      resize_linear_any(sx.data(), lw, lh, Fx.data(), W, H); resize_linear_any(sy.data(), lw, lh, Fy.data(), W, H);
+      for (size_t i = 0; i < Fx.size(); i++) { Fx[i] *= (float)lsc; Fy[i] *= (float)lsc; }
+    };
+    auto step = [&](int f, std::vector<double>& P) {  // move P (map px) by the loaded flow of frame f
+      const uint8_t* A = frame(f);
+      for (int v = 0; v < nv; v++) {
+        const int x = (int)std::min(std::max(std::nearbyint(P[2 * v]), 0.0), (double)(W - 1));
+        const int y = (int)std::min(std::max(std::nearbyint(P[2 * v + 1]), 0.0), (double)(H - 1));
+        double s0 = 0, s1 = 0, m0 = 0, m1 = 0, wm = 0;
+        for (int a = -kr; a <= kr; a++) {
+          const int yy = refl101(y + a, H);
+          const uint8_t* ar = A + (size_t)(yy / k) * fw * 4;
+          for (int b = -kr; b <= kr; b++) {
+            const int xx = refl101(x + b, W);
+            const double w = (double)kern[a + kr] * kern[b + kr];
+            const size_t i = (size_t)yy * W + xx;
+            s0 += w * Fx[i]; s1 += w * Fy[i];
+            if (ar[(xx / k) * 4 + 3]) { m0 += w * Fx[i]; m1 += w * Fy[i]; wm += w; }
+          }
+        }
+        if (wm > 0.05) { P[2 * v] += m0 / wm; P[2 * v + 1] += m1 / wm; } else { P[2 * v] += s0; P[2 * v + 1] += s1; }
+      }
+    };
+    std::vector<int> anc{0};
+    for (int f = 1; f < nf; f++) if (std::memcmp(frame(f), frame(0), fsz) == 0) anc.push_back(f);
+    anc.push_back(nf);
+    std::vector<std::vector<double>> V(nf);
+    std::vector<double> base((size_t)nv * 2);
+    for (int i = 0; i < nv * 2; i++) base[i] = p0[i];
+    for (size_t s = 0; s + 1 < anc.size(); s++) {
+      const int a = anc[s], b = anc[s + 1];
+      std::vector<std::vector<double>> Fw(b - a + 1), Bw(b - a + 1);
+      Fw[0] = base;
+      for (int f = a; f < b; f++) { Fw[f - a + 1] = Fw[f - a]; load(lf[f]); step(f, Fw[f - a + 1]); }
+      Bw[b - a] = base;
+      for (int f = b; f > a; f--) { Bw[f - a - 1] = Bw[f - a]; load(lb[f % nf]); step(f % nf, Bw[f - a - 1]); }
+      for (int f = std::max(a, 1); f < b; f++) {
+        const double t = (double)(f - a) / (b - a);
+        V[f].resize((size_t)nv * 2);
+        for (int i = 0; i < nv * 2; i++) V[f][i] = (1 - t) * Fw[f - a][i] + t * Bw[f - a][i];
+      }
+    }
+    std::vector<double> V0((size_t)nv * 2);
+    for (int i = 0; i < nv * 2; i++) V0[i] = (std::nearbyint(p0[i] * 16.0f) + dv[i]) / 16.0;
+    for (int f = 1; f < nf; f++)
+      for (int j = 0; j < f; j++)
+        if (std::memcmp(frame(f), frame(j), fsz) == 0) { V[f] = j == 0 ? V0 : V[j]; break; }
+    std::vector<float> vf((size_t)nv * 2);
+    for (int f = 1; f < nf; f++) {
+      int16_t* d = &dv[(size_t)f * nv * 2];
+      for (int i = 0; i < nv * 2; i++) {
+        const long q = std::lrint(std::nearbyint(p0[i] * 16.0f)), r = std::lrint(std::nearbyint(V[f][i] * 16.0));
+        d[i] = (int16_t)std::min(32767L, std::max(-32768L, r - q));
+        vf[i] = (float)V[f][i];
+      }
+      uint8_t* ok = &okb[(size_t)f * ((nt + 7) / 8)];
+      std::memset(ok, 0, (nt + 7) / 8);
+      for (int t = 0; t < nt; t++) {
+        auto area = [&](const float* P) {
+          const float ax = P[2 * tri[3 * t]], ay = P[2 * tri[3 * t] + 1], bx = P[2 * tri[3 * t + 1]], by = P[2 * tri[3 * t + 1] + 1];
+          const float cx = P[2 * tri[3 * t + 2]], cy = P[2 * tri[3 * t + 2] + 1];
+          return 0.5f * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
+        };
+        const float a0 = area(p0.data()), a1 = area(vf.data());
+        const float r = a1 / (std::fabs(a0) < 1e-6f ? 1e-6f : a0);
+        if (r > 0.5f && r < 2.0f) ok[t >> 3] |= (uint8_t)(1u << (t & 7));
+      }
+    }
+    std::vector<std::vector<int16_t>>().swap(lf); std::vector<std::vector<int16_t>>().swap(lb);
   }
   // track one frame (thread-safe for distinct f)
   int track(int f, DisWork& K, const std::atomic<bool>* cancel = nullptr) {
@@ -2044,7 +2150,8 @@ TMAP_EXPORT int tm_track(const uint8_t* frames, int fw, int fh, int nf, int k, i
     S.px.assign(frames, frames + (size_t)fw * fh * 4 * nf);
     int r = S.prepare(); if (r) return r;
     tmap::trk::DisWork K;
-    for (int f = 0; f < nf; f++) { r = S.track(f, K); if (r) return r; }
+    for (int f = 0; f < nf; f++) { r = S.track(f, K); if (!r) r = S.pair_flows(f, K, nullptr); if (r) return r; }
+    S.chain();
     std::vector<uint8_t> o; S.encode(o, tm_crc);
     if (len) *len = (int)o.size();
     if (!out || cap < (int)o.size()) return 16;
@@ -2121,7 +2228,7 @@ struct Pool {
   }
   void finish_frame(Batch& b) {
     if (b.done.fetch_add(1) + 1 == b.S.nf && b.state.load() == 2) {
-      try { b.S.encode(b.out, tm_crc); b.state = 3; } catch (...) { b.state = 19; }
+      try { b.S.chain(); b.S.encode(b.out, tm_crc); b.state = 3; } catch (...) { b.state = 19; }
       std::vector<uint8_t>().swap(b.S.px); std::vector<uint8_t>().swap(b.S.g0);
       b.S.ref0 = DisRef(); b.S.ref1 = DisRef();
     }
@@ -2152,7 +2259,8 @@ struct Pool {
           else { b->state = 2; }
           std::lock_guard<std::mutex> lk(mu); cv.notify_all();
         } else {
-          const int r = b->S.track(f, K, &b->cancel);
+          int r = b->S.track(f, K, &b->cancel);
+          if (!r) r = b->S.pair_flows(f, K, &b->cancel);
           if (r) { if (!b->cancel.load()) b->state = r; }
           else finish_frame(*b);
         }
@@ -2285,6 +2393,7 @@ struct Map {
   std::vector<float> rcnt;
   std::vector<uint8_t> out0;
   std::vector<int32_t> ids0;
+  std::vector<uint8_t> alev0;  // frame-0 facet level for the map alpha (merge_levels)
   std::vector<std::vector<uint8_t>> fpx, apx;
   std::vector<int32_t> acrop;  // x0, y0, w, h, top, bottom per frame (w 0 = none)
   size_t fsz() const { return (size_t)fw * fh * 4; }
@@ -2293,7 +2402,7 @@ struct Map {
     for (auto& p : px) n += (long long)p.size();
     for (auto& p : fpx) n += (long long)p.size();
     for (auto& p : apx) n += (long long)p.size();
-    n += (long long)(out0.size() + ids0.size() * 4 + dv0.size() * 2 + ok0.size());
+    n += (long long)(out0.size() + ids0.size() * 4 + dv0.size() * 2 + ok0.size() + alev0.size());
     mem_add(-n);
   }
 };
@@ -2573,6 +2682,7 @@ static void cut_eyes(Map& m, int i, std::vector<uint8_t>& out) {
     }
   }
 }
+static void merge_levels(Map& m);
 // frame 0 with its own vertices: facet normals / mean thickness for the other frames, its map and facet ids
 static int ref_frame(Map& m) {
   int ip[8] = {m.fw, m.fh, m.fw, m.k, m.sid, 0, 0, 0};
@@ -2585,9 +2695,85 @@ static int ref_frame(Map& m) {
   m.rfx = j->fx; m.rfy = j->fy; m.rcnt = j->cnt; m.rtm.assign(j->tm_.begin(), j->tm_.end());
   m.out0.swap(j->out);
   m.ids0.swap(j->ids);
+  merge_levels(m);
   cut_eyes(m, 0, m.out0);
-  mem_add((long long)(m.out0.size() + m.ids0.size() * 4));
+  mem_add((long long)(m.out0.size() + m.ids0.size() * 4 + m.alev0.size()));
   return 0;
+}
+static void cheb_dist(std::vector<int>& d, int w, int h);
+// facet level of frame 0 (map alpha of every frame, through the mesh): a piece of one facet and one shader level step
+// smaller than LM_AREA dots or thinner than LM_THIN dots takes the level of the largest piece of the same facet it
+// touches (smallest pieces first, so a run of small pieces ends on a large one). Frame 0's own level is left as it is
+static void merge_levels(Map& m) {
+  const int k = m.k, W = m.fw * k, H = m.fh * k;
+  const size_t N = (size_t)W * H;
+  m.alev0.clear();
+  if (m.out0.size() != N * 4 || m.ids0.size() != N) return;
+  m.alev0.resize(N);
+  for (size_t I = 0; I < N; I++) m.alev0[I] = m.out0[I * 4];
+  const double LM_AREA = 6.0, LM_THIN = 1.0;
+  std::vector<int32_t> key(N), lab(N);
+  std::vector<int> d(N);
+  for (size_t I = 0; I < N; I++) {
+    const int32_t id = m.ids0[I];
+    key[I] = (id >= 0 && m.out0[I * 4 + 3] > 0) ? id * 64 + (int)std::floor(m.alev0[I] / 255.0 * 40.0 + 0.5) : -1;
+  }
+  const int nl = label4(key.data(), W, H, lab.data());
+  if (nl < 2) return;
+  std::vector<int> area(nl, 0), thick(nl, 0); std::vector<double> sum(nl, 0.0);
+  for (size_t I = 0; I < N; I++) {
+    const int l = lab[I];
+    if (l < 0) { d[I] = 0; continue; }
+    const int x = (int)(I % W), y = (int)(I / W);
+    const bool edge = x == 0 || y == 0 || x == W - 1 || y == H - 1 || lab[I - 1] != l || lab[I + 1] != l || lab[I - W] != l || lab[I + W] != l;
+    d[I] = edge ? 0 : 1 << 20;
+    area[l]++; sum[l] += m.alev0[I];
+  }
+  cheb_dist(d, W, H);
+  for (size_t I = 0; I < N; I++) if (lab[I] >= 0) thick[lab[I]] = std::max(thick[lab[I]], d[I]);
+  std::vector<uint8_t> small(nl, 0);
+  std::vector<int> order;
+  for (int l = 0; l < nl; l++) if (area[l] < LM_AREA * k * k || thick[l] < LM_THIN * k) { small[l] = 1; order.push_back(l); }
+  if (order.empty()) return;
+  std::vector<std::vector<int>> nb(nl);  // same-facet neighbour pieces
+  {
+    std::vector<uint64_t> raw;
+    for (size_t I = 0; I < N; I++) {
+      const int a = lab[I]; if (a < 0) continue;
+      const size_t nb2[2] = {(I % W) + 1 < (size_t)W ? I + 1 : N, I + W < N ? I + W : N};
+      for (size_t J : nb2) {
+        if (J >= N) continue;
+        const int b = lab[J];
+        if (b < 0 || b == a || key[I] / 64 != key[J] / 64) continue;
+        raw.push_back(((uint64_t)std::min(a, b) << 32) | (uint32_t)std::max(a, b));
+      }
+    }
+    std::sort(raw.begin(), raw.end()); raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
+    for (uint64_t q : raw) { const int a = (int)(q >> 32), b = (int)(q & 0xffffffffu); nb[a].push_back(b); nb[b].push_back(a); }
+  }
+  std::vector<int> par(nl), ga(area);
+  for (int l = 0; l < nl; l++) par[l] = l;
+  auto root = [&](int i) { while (par[i] != i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  std::vector<std::vector<int>> mem(nl);
+  for (int l = 0; l < nl; l++) mem[l].push_back(l);
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return area[a] < area[b]; });
+  for (int l : order) {
+    const int r = root(l);
+    if (!small[r]) continue;
+    int best = -1;
+    for (int u : mem[r]) for (int o : nb[u]) { const int q = root(o); if (q != r && (best < 0 || ga[q] > ga[best] || (ga[q] == ga[best] && q < best))) best = q; }
+    if (best < 0) continue;
+    par[r] = best; ga[best] += ga[r];
+    mem[best].insert(mem[best].end(), mem[r].begin(), mem[r].end()); std::vector<int>().swap(mem[r]);
+  }
+  std::vector<uint8_t> lv(nl);
+  for (int l = 0; l < nl; l++) lv[l] = (uint8_t)std::lround(sum[l] / std::max(area[l], 1));
+  for (size_t I = 0; I < N; I++) {
+    const int l = lab[I];
+    if (l < 0) continue;
+    const int r = root(l);
+    if (r != l) m.alev0[I] = lv[r];
+  }
 }
 static inline uint8_t fhash8(int32_t id, uint32_t o) {
   uint32_t x = (uint32_t)id + o + 1u;
@@ -2649,6 +2835,7 @@ static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
         const bool same = f == 0 || still[(size_t)std::min(Y / k, fh - 1) * fw + std::min(X / k, fw - 1)];
         if (same) {
           std::memcpy(mb, &m.out0[I * 4], 4); std::memcpy(mf, mb, 4); idf = m.ids0[I];
+          if (m.alev0.size() == N) mf[0] = m.alev0[I];
         } else if (idf >= 0 && idf < m.nt) {
           double ax, ay, bx, by, cx, cy, a0x, a0y, b0x, b0y, c0x, c0y;
           vert(m, f, m.tri[idf * 3], ax, ay); vert(m, f, m.tri[idf * 3 + 1], bx, by); vert(m, f, m.tri[idf * 3 + 2], cx, cy);
@@ -2660,7 +2847,7 @@ static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
           const double qx = a0x + l1 * (b0x - a0x) + l2 * (c0x - a0x), qy = a0y + l1 * (b0y - a0y) + l2 * (c0y - a0y);
           const int ix = std::min(std::max((int)std::floor(qx), 0), W - 1), iy = std::min(std::max((int)std::floor(qy), 0), H - 1);
           const size_t Q = (size_t)iy * W + ix;
-          if (m.out0[Q * 4 + 3] > 0) std::memcpy(mf, &m.out0[Q * 4], 4);
+          if (m.out0[Q * 4 + 3] > 0) { std::memcpy(mf, &m.out0[Q * 4], 4); if (m.alev0.size() == N) mf[0] = m.alev0[Q]; }
           if (m.ids0[Q] >= 0) idf = m.ids0[Q];
         }
       }
@@ -2709,7 +2896,7 @@ static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
         const int ix = std::min(std::max((int)std::floor(qx), 0), W - 1), iy = std::min(std::max((int)std::floor(qy), 0), H - 1);
         const size_t Q = (size_t)iy * W + ix;
         if (m.out0[Q * 4 + 3] == 0) continue;
-        out[I * 4 + 1] = m.out0[Q * 4 + 1]; out[I * 4 + 2] = m.out0[Q * 4 + 2]; out[I * 4 + 3] = std::max<uint8_t>(m.out0[Q * 4], 2);
+        out[I * 4 + 1] = m.out0[Q * 4 + 1]; out[I * 4 + 2] = m.out0[Q * 4 + 2]; out[I * 4 + 3] = std::max<uint8_t>(m.alev0.size() == N ? m.alev0[Q] : m.out0[Q * 4], 2);
         std::memcpy(&face[I * 4], fh8, 4);
       }
   }
