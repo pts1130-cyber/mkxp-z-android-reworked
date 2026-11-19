@@ -2278,7 +2278,8 @@ struct Map {
   std::vector<uint8_t> blob;
   bool v6 = false;
   int nv = 0, nt = 0;
-  std::vector<int16_t> q0, dv;
+  std::vector<int16_t> q0, dv, dv0;  // dv0 / ok0: the tracker's own values (other frames read these)
+  std::vector<uint8_t> ok0;
   std::vector<int32_t> tri;
   std::vector<double> rfx, rfy, rtm;
   std::vector<float> rcnt;
@@ -2292,7 +2293,7 @@ struct Map {
     for (auto& p : px) n += (long long)p.size();
     for (auto& p : fpx) n += (long long)p.size();
     for (auto& p : apx) n += (long long)p.size();
-    n += (long long)(out0.size() + ids0.size() * 4);
+    n += (long long)(out0.size() + ids0.size() * 4 + dv0.size() * 2 + ok0.size());
     mem_add(-n);
   }
 };
@@ -2494,11 +2495,61 @@ static bool tmv_mesh(Map& m) {
   m.tri.resize((size_t)nt * 3);
   for (size_t i = 0; i < (size_t)nt * 3; i++) { uint16_t t; std::memcpy(&t, b + (size_t)nv * 4 + i * 2, 2); if (t >= nv) return false; m.tri[i] = t; }
   m.dv.resize((size_t)nf * nv * 2); std::memcpy(m.dv.data(), b + (size_t)nv * 4 + (size_t)nt * 6, (size_t)nf * nv * 4);
+  m.dv0 = m.dv;
+  const size_t nb = ((size_t)nt + 7) / 8;
+  if (m.tmv.size() >= need + nb * nf) m.ok0.assign(m.tmv.begin() + need, m.tmv.begin() + need + nb * nf);
+  mem_add((long long)(m.dv0.size() * 2 + m.ok0.size()));
   return true;
 }
 static inline void vert(const Map& m, int f, int v, double& x, double& y) {
   const size_t o = (size_t)f * m.nv * 2 + (size_t)v * 2;
   x = (m.q0[(size_t)v * 2] + m.dv[o]) / 16.0; y = (m.q0[(size_t)v * 2 + 1] + m.dv[o + 1]) / 16.0;
+}
+static inline void vert0(const Map& m, int f, int v, double& x, double& y) {
+  const size_t o = (size_t)f * m.nv * 2 + (size_t)v * 2;
+  x = (m.q0[(size_t)v * 2] + m.dv0[o]) / 16.0; y = (m.q0[(size_t)v * 2 + 1] + m.dv0[o + 1]) / 16.0;
+}
+static inline bool ok0(const Map& m, int f, int t) { return (m.ok0[(size_t)f * ((m.nt + 7) / 8) + (t >> 3)] >> (t & 7)) & 1; }
+// a vertex the tracker threw off for this frame only: it touches a triangle dropped here but kept in the frames before
+// and after (cyclic), and lies more than 1.5 px (and more than those two frames differ) from their midpoint. It is put
+// on the midpoint and the drop flags of its triangles are worked out again (same rule as the tracker)
+static void mend_frame(Map& m, int f) {
+  if (f == 0 || m.nf < 3 || m.ok0.empty()) return;
+  const int g0 = f - 1, g1 = (f + 1) % m.nf, k = m.k;
+  std::vector<uint8_t> bad((size_t)m.nv, 0);
+  for (int t = 0; t < m.nt; t++)
+    if (!ok0(m, f, t) && ok0(m, g0, t) && ok0(m, g1, t)) for (int c = 0; c < 3; c++) bad[m.tri[t * 3 + c]] = 1;
+  std::vector<uint8_t> moved((size_t)m.nv, 0);
+  bool any = false;
+  const size_t o_dv = 16 + (size_t)m.nv * 4 + (size_t)m.nt * 6 + (size_t)f * m.nv * 4;
+  for (int v = 0; v < m.nv; v++) {
+    if (!bad[v]) continue;
+    double x, y, ax, ay, bx, by;
+    vert0(m, f, v, x, y); vert0(m, g0, v, ax, ay); vert0(m, g1, v, bx, by);
+    const double mx = (ax + bx) * 0.5, my = (ay + by) * 0.5;
+    const double e = std::hypot(x - mx, y - my), d = std::hypot(bx - ax, by - ay);
+    if (e <= 1.5 * k || e <= d) continue;
+    const size_t o = (size_t)f * m.nv * 2 + (size_t)v * 2;
+    const long qx = std::lround(mx * 16.0) - m.q0[(size_t)v * 2], qy = std::lround(my * 16.0) - m.q0[(size_t)v * 2 + 1];
+    m.dv[o] = (int16_t)std::min(32767L, std::max(-32768L, qx)); m.dv[o + 1] = (int16_t)std::min(32767L, std::max(-32768L, qy));
+    std::memcpy(&m.tmv[o_dv + (size_t)v * 4], &m.dv[o], 2); std::memcpy(&m.tmv[o_dv + (size_t)v * 4 + 2], &m.dv[o + 1], 2);
+    moved[v] = 1; any = true;
+  }
+  if (!any) return;
+  const size_t nb = ((size_t)m.nt + 7) / 8, o_ok = 16 + (size_t)m.nv * 4 + (size_t)m.nt * 6 + (size_t)m.nf * m.nv * 4 + (size_t)f * nb;
+  for (int t = 0; t < m.nt; t++) {
+    const int a = m.tri[t * 3], b = m.tri[t * 3 + 1], c = m.tri[t * 3 + 2];
+    if (!moved[a] && !moved[b] && !moved[c]) continue;
+    double x[3], y[3];
+    vert(m, f, a, x[0], y[0]); vert(m, f, b, x[1], y[1]); vert(m, f, c, x[2], y[2]);
+    const double px0 = m.q0[(size_t)a * 2] / 16.0, py0 = m.q0[(size_t)a * 2 + 1] / 16.0, px1 = m.q0[(size_t)b * 2] / 16.0, py1 = m.q0[(size_t)b * 2 + 1] / 16.0;
+    const double px2 = m.q0[(size_t)c * 2] / 16.0, py2 = m.q0[(size_t)c * 2 + 1] / 16.0;
+    const double a0 = 0.5 * ((px1 - px0) * (py2 - py0) - (px2 - px0) * (py1 - py0));
+    const double a1 = 0.5 * ((x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]));
+    const double r = a1 / (std::fabs(a0) < 1e-6 ? 1e-6 : a0);
+    uint8_t& byte = m.tmv[o_ok + (t >> 3)];
+    if (r > 0.5 && r < 2.0) byte |= (uint8_t)(1u << (t & 7)); else byte &= (uint8_t)~(1u << (t & 7));
+  }
 }
 static void cut_eyes(Map& m, int i, std::vector<uint8_t>& out) {
   if (m.eyes.empty()) return;
@@ -2543,19 +2594,50 @@ static inline uint8_t fhash8(int32_t id, uint32_t o) {
   x = (x ^ 61u) ^ (x >> 16); x *= 9u; x ^= x >> 4; x *= 0x27d4eb2du; x ^= x >> 15;
   return (uint8_t)((x & 0xffffu) >> 8);
 }
-// rule23 c0: where the sprite equals frame 0 within 1 sprite px use frame 0 as it is, elsewhere frame-0 facet attributes
-// found through this frame's triangle (barycentric -> frame-0 position); the level keeps this frame's map there
+// sprite px that did not move against frame 0: equal within 1 px, and along x and along y the first colour edge met on
+// at least one side (and the way to it) is unchanged. A flat area that shifted has its edges changed on both sides
+static void still_px(const Map& m, int f, std::vector<uint8_t>& still) {
+  const int fw = m.fw, fh = m.fh;
+  const size_t n = (size_t)fw * fh;
+  const uint8_t* a = &m.frames[(size_t)f * m.fsz()];
+  const uint8_t* b = &m.frames[0];
+  std::vector<uint8_t> diff(n), ax(n), ay(n), run((size_t)std::max(fw, fh));
+  for (size_t i = 0; i < n; i++) diff[i] = std::memcmp(a + i * 4, b + i * 4, 4) != 0;
+  auto edge = [&](size_t p, size_t q) { return std::memcmp(a + p * 4, a + q * 4, 4) != 0; };
+  for (int y = 0; y < fh; y++) {
+    const size_t r = (size_t)y * fw;
+    for (int x = fw - 1; x >= 0; x--) run[x] = diff[r + x] ? 0 : (x + 1 >= fw ? 1 : (edge(r + x, r + x + 1) ? !diff[r + x + 1] : run[x + 1]));
+    for (int x = 0; x < fw; x++) ax[r + x] = run[x];
+    for (int x = 0; x < fw; x++) run[x] = diff[r + x] ? 0 : (x == 0 ? 1 : (edge(r + x, r + x - 1) ? !diff[r + x - 1] : run[x - 1]));
+    for (int x = 0; x < fw; x++) ax[r + x] |= run[x];
+  }
+  for (int x = 0; x < fw; x++) {
+    for (int y = fh - 1; y >= 0; y--) { const size_t i = (size_t)y * fw + x; run[y] = diff[i] ? 0 : (y + 1 >= fh ? 1 : (edge(i, i + fw) ? !diff[i + fw] : run[y + 1])); }
+    for (int y = 0; y < fh; y++) ay[(size_t)y * fw + x] = run[y];
+    for (int y = 0; y < fh; y++) { const size_t i = (size_t)y * fw + x; run[y] = diff[i] ? 0 : (y == 0 ? 1 : (edge(i, i - fw) ? !diff[i - fw] : run[y - 1])); }
+    for (int y = 0; y < fh; y++) ay[(size_t)y * fw + x] |= run[y];
+  }
+  still.assign(n, 0);
+  for (int y = 0; y < fh; y++)
+    for (int x = 0; x < fw; x++) {
+      const size_t i = (size_t)y * fw + x;
+      if (!ax[i] || !ay[i]) continue;
+      bool s = true;
+      for (int sy = std::max(y - 1, 0); sy <= std::min(y + 1, fh - 1) && s; sy++)
+        for (int sx = std::max(x - 1, 0); sx <= std::min(x + 1, fw - 1); sx++) if (diff[(size_t)sy * fw + sx]) { s = false; break; }
+      still[i] = s;
+    }
+}
+// rule23 c0: still sprite px (still_px) use frame 0 as it is, elsewhere frame-0 facet attributes found through this
+// frame's triangle (barycentric -> frame-0 position); the level keeps this frame's map there
 static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
   const int fw = m.fw, fh = m.fh, k = m.k, W = fw * k, H = fh * k;
   const size_t N = (size_t)W * H;
   std::vector<uint8_t>& out = j.out;
   face.assign(N * 4, 0);
   const bool ref = !m.out0.empty() && m.ids0.size() == N && j.ids.size() == N;
-  std::vector<uint8_t> diff((size_t)fw * fh, 0);
-  if (ref && f != 0) {
-    const uint8_t* a = &m.frames[(size_t)f * m.fsz()]; const uint8_t* b = &m.frames[0];
-    for (size_t i = 0; i < (size_t)fw * fh; i++) diff[i] = std::memcmp(a + i * 4, b + i * 4, 4) != 0;
-  }
+  std::vector<uint8_t> still;
+  if (ref && f != 0) still_px(m, f, still);
   for (int Y = 0; Y < H; Y++)
     for (int X = 0; X < W; X++) {
       const size_t I = (size_t)Y * W + X;
@@ -2564,12 +2646,7 @@ static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
       std::memcpy(mb, &out[I * 4], 4); std::memcpy(mf, mb, 4);
       idf = j.ids.size() == N ? j.ids[I] : -1;
       if (ref) {
-        bool same = true;
-        if (f != 0) {
-          const int sx0 = std::max((X - k) / k, 0), sx1 = std::min((X + k) / k, fw - 1);
-          const int sy0 = std::max((Y - k) / k, 0), sy1 = std::min((Y + k) / k, fh - 1);
-          for (int sy = sy0; sy <= sy1 && same; sy++) for (int sx = sx0; sx <= sx1; sx++) if (diff[(size_t)sy * fw + sx]) { same = false; break; }
-        }
+        const bool same = f == 0 || still[(size_t)std::min(Y / k, fh - 1) * fw + std::min(X / k, fw - 1)];
         if (same) {
           std::memcpy(mb, &m.out0[I * 4], 4); std::memcpy(mf, mb, 4); idf = m.ids0[I];
         } else if (idf >= 0 && idf < m.nt) {
@@ -2593,6 +2670,49 @@ static void c0(Map& m, int f, tmap::Job& j, std::vector<uint8_t>& face) {
         face[I * 4] = fhash8(idf, 0); face[I * 4 + 1] = fhash8(idf, 7919); face[I * 4 + 2] = fhash8(idf, 104729); face[I * 4 + 3] = fhash8(idf, 15485863);
       }
     }
+  // a triangle the tracker dropped for one or two frames (kept in the frames around them, cyclic) is drawn where it lies
+  // between those frames (linear in time), with its frame-0 facet values, over the body pixels there
+  const size_t nb = ((size_t)m.nt + 7) / 8, o_ok = 16 + (size_t)m.nv * 4 + (size_t)m.nt * 6 + (size_t)m.nf * m.nv * 4;
+  if (!ref || f == 0 || m.nf < 3 || m.ok0.empty() || m.tmv.size() < o_ok + nb * m.nf) return;
+  const uint8_t* okp = &m.tmv[o_ok];
+  auto okt = [&](int g, int t) { return g == f ? (okp[(size_t)g * nb + (t >> 3)] >> (t & 7)) & 1 : (int)ok0(m, g, t); };
+  const int GAP = 2;
+  for (int t = 0; t < m.nt; t++) {
+    if (okt(f, t)) continue;
+    int da = 0, db = 0;
+    for (int d = 1; d <= GAP && !da; d++) if (okt(((f - d) % m.nf + m.nf) % m.nf, t)) da = d;
+    for (int d = 1; d <= GAP && !db; d++) if (okt((f + d) % m.nf, t)) db = d;
+    if (!da || !db || da + db > GAP + 1) continue;
+    const int g0 = ((f - da) % m.nf + m.nf) % m.nf, g1 = (f + db) % m.nf;
+    const double w = (double)da / (da + db);
+    double vx[3], vy[3], wx[3], wy[3];
+    for (int c = 0; c < 3; c++) {
+      double ax, ay, bx, by;
+      vert0(m, g0, m.tri[t * 3 + c], ax, ay); vert0(m, g1, m.tri[t * 3 + c], bx, by);
+      vx[c] = ax + (bx - ax) * w; vy[c] = ay + (by - ay) * w;
+      vert(m, 0, m.tri[t * 3 + c], wx[c], wy[c]);
+    }
+    const double e1x = vx[1] - vx[0], e1y = vy[1] - vy[0], e2x = vx[2] - vx[0], e2y = vy[2] - vy[0];
+    const double den = e1x * e2y - e1y * e2x;
+    if (std::fabs(den) < 2.0) continue;
+    const int x0 = std::max((int)std::floor(std::min({vx[0], vx[1], vx[2]})), 0), x1 = std::min((int)std::ceil(std::max({vx[0], vx[1], vx[2]})), W - 1);
+    const int y0 = std::max((int)std::floor(std::min({vy[0], vy[1], vy[2]})), 0), y1 = std::min((int)std::ceil(std::max({vy[0], vy[1], vy[2]})), H - 1);
+    const uint8_t fh8[4] = {fhash8(t, 0), fhash8(t, 7919), fhash8(t, 104729), fhash8(t, 15485863)};
+    for (int Y = y0; Y <= y1; Y++)
+      for (int X = x0; X <= x1; X++) {
+        const double rx = X + 0.5 - vx[0], ry = Y + 0.5 - vy[0];
+        const double l1 = (rx * e2y - ry * e2x) / den, l2 = (e1x * ry - e1y * rx) / den;
+        if (l1 < 0 || l2 < 0 || l1 + l2 > 1) continue;
+        const size_t I = (size_t)Y * W + X;
+        if (out[I * 4 + 3] == 0) continue;
+        const double qx = wx[0] + l1 * (wx[1] - wx[0]) + l2 * (wx[2] - wx[0]), qy = wy[0] + l1 * (wy[1] - wy[0]) + l2 * (wy[2] - wy[0]);
+        const int ix = std::min(std::max((int)std::floor(qx), 0), W - 1), iy = std::min(std::max((int)std::floor(qy), 0), H - 1);
+        const size_t Q = (size_t)iy * W + ix;
+        if (m.out0[Q * 4 + 3] == 0) continue;
+        out[I * 4 + 1] = m.out0[Q * 4 + 1]; out[I * 4 + 2] = m.out0[Q * 4 + 2]; out[I * 4 + 3] = std::max<uint8_t>(m.out0[Q * 4], 2);
+        std::memcpy(&face[I * 4], fh8, 4);
+      }
+  }
 }
 // aux values of one frame at sprite resolution (same steps as the game's Ruby ARCTeraBodyAux)
 static void edt1(const std::vector<double>& f, int n, std::vector<int>& v, std::vector<double>& z, std::vector<double>& d) {
@@ -2683,6 +2803,147 @@ static void aux_frame(Map& m, int i) {
     o[I * 4 + 3] = mg > 1e-5 ? (uint8_t)(std::lround(-gy / mg * 127) + 128) : 128;
   }
   ac[0] = x0; ac[1] = y0; ac[2] = w; ac[3] = h; ac[4] = top; ac[5] = bot;
+}
+
+// chessboard distance to the nearest 0 entry (others start large)
+static void cheb_dist(std::vector<int>& d, int w, int h) {
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      int& v = d[(size_t)y * w + x];
+      if (x > 0) v = std::min(v, d[(size_t)y * w + x - 1] + 1);
+      if (y > 0) for (int dx = -1; dx <= 1; dx++) if (x + dx >= 0 && x + dx < w) v = std::min(v, d[(size_t)(y - 1) * w + x + dx] + 1);
+    }
+  for (int y = h - 1; y >= 0; y--)
+    for (int x = w - 1; x >= 0; x--) {
+      int& v = d[(size_t)y * w + x];
+      if (x + 1 < w) v = std::min(v, d[(size_t)y * w + x + 1] + 1);
+      if (y + 1 < h) for (int dx = -1; dx <= 1; dx++) if (x + dx >= 0 && x + dx < w) v = std::min(v, d[(size_t)(y + 1) * w + x + dx] + 1);
+    }
+}
+// v6: where a frame equals the one before it out to the nearest colour edge on x and on y (at least 3 px), the map and
+// facet values are taken from the frame before (frames in order from frame 0), so parts that do not move stay as they were
+static void hold_still(Map& m) {
+  const int fw = m.fw, fh = m.fh, k = m.k, mw = fw * k;
+  const size_t n = (size_t)fw * fh;
+  const int BIG = 1 << 20;
+  std::vector<int> hx(n), vy(n), dd(n);
+  for (int f = 1; f < m.nf; f++) {
+    const int32_t* ca = &m.crop[(size_t)f * 4]; const int32_t* cb = &m.crop[(size_t)(f - 1) * 4];
+    if (ca[2] == 0 || cb[2] == 0) continue;
+    if (m.px[f].size() != (size_t)ca[2] * ca[3] * 4 || m.px[f - 1].size() != (size_t)cb[2] * cb[3] * 4) continue;
+    if (m.fpx[f].size() != m.px[f].size() || m.fpx[f - 1].size() != m.px[f - 1].size()) continue;
+    const uint8_t* a = &m.frames[(size_t)f * m.fsz()]; const uint8_t* b = &m.frames[(size_t)(f - 1) * m.fsz()];
+    bool any = false;
+    for (size_t i = 0; i < n; i++) {
+      hx[i] = BIG; vy[i] = BIG;
+      dd[i] = std::memcmp(a + i * 4, b + i * 4, 4) != 0 ? 0 : BIG;
+      any = any || dd[i] == 0;
+    }
+    for (int y = 0; y < fh; y++)
+      for (int x = 0; x < fw; x++) {
+        const size_t i = (size_t)y * fw + x;
+        if (x + 1 < fw && std::memcmp(a + i * 4, a + (i + 1) * 4, 4) != 0) { hx[i] = 0; hx[i + 1] = 0; }
+        if (y + 1 < fh && std::memcmp(a + i * 4, a + (i + fw) * 4, 4) != 0) { vy[i] = 0; vy[i + fw] = 0; }
+      }
+    cheb_dist(hx, fw, fh); cheb_dist(vy, fw, fh);
+    if (any) cheb_dist(dd, fw, fh);
+    for (int sy = 0; sy < fh; sy++)
+      for (int sx = 0; sx < fw; sx++) {
+        const size_t i = (size_t)sy * fw + sx;
+        if (a[i * 4 + 3] == 0 || b[i * 4 + 3] == 0) continue;
+        if (dd[i] <= std::max(3, std::max(hx[i], vy[i]))) continue;
+        for (int Y = sy * k; Y < sy * k + k; Y++) {
+          const int ra = Y - ca[1], rb = Y - cb[1];
+          if (ra < 0 || ra >= ca[3] || rb < 0 || rb >= cb[3]) continue;
+          for (int X = sx * k; X < sx * k + k && X < mw; X++) {
+            const int xa = X - ca[0], xb = X - cb[0];
+            if (xa < 0 || xa >= ca[2] || xb < 0 || xb >= cb[2]) continue;
+            const size_t qa = ((size_t)ra * ca[2] + xa) * 4, qb = ((size_t)rb * cb[2] + xb) * 4;
+            if (m.px[f][qa + 3] == 0 || m.px[f - 1][qb + 3] == 0) continue;
+            std::memcpy(&m.px[f][qa], &m.px[f - 1][qb], 4);
+            std::memcpy(&m.fpx[f][qa], &m.fpx[f - 1][qb], 4);
+          }
+        }
+      }
+  }
+}
+
+// v6: one-frame flips of facet values. Each frame is matched to the frames before and after (cyclic, sprite optical
+// flow); where both neighbours carry the same facet over a patch thicker than a line and this frame shows another,
+// the neighbours' facet values are used. Frame 0 is never changed
+static bool sprite_flow(const uint8_t* a, const uint8_t* b, int fw, int fh, std::vector<float>& fx, std::vector<float>& fy) {
+  using namespace tmap::trk;
+  std::vector<uint8_t> ga, gb;
+  flow_img(a, fw, fh, 1, false, ga); flow_img(b, fw, fh, 1, false, gb);
+  const DisCfg c = dis_cfg(fw, fh, 0);
+  if (c.coarsest < 0) return false;
+  DisRef R; dis_ref(ga.data(), fw, fh, c, R);
+  DisWork K;
+  if (!dis_calc(R, gb.data(), K)) return false;
+  const DisLevel& L = R.lv[c.finest];
+  fx.resize((size_t)fw * fh); fy.resize((size_t)fw * fh);
+  resize_linear_any(K.Ux.data(), L.w, L.h, fx.data(), fw, fh);
+  resize_linear_any(K.Uy.data(), L.w, L.h, fy.data(), fw, fh);
+  const float mlt = (float)(1 << c.finest);
+  for (size_t i = 0; i < fx.size(); i++) { fx[i] *= mlt; fy[i] *= mlt; }
+  return true;
+}
+static void despike(Map& m) {
+  if (m.nf < 3) return;
+  const int fw = m.fw, fh = m.fh, k = m.k;
+  std::vector<uint8_t> pm, pf;  // frame f-1 as it was before this pass
+  std::vector<float> ax, ay, bx, by;
+  std::vector<uint8_t> cand, keep;
+  std::vector<uint8_t> nb(4 * 2);
+  for (int f = 1; f < m.nf; f++) {
+    const int g0 = f - 1, g1 = (f + 1) % m.nf;
+    const int32_t* c = &m.crop[(size_t)f * 4];
+    const size_t csz = (size_t)c[2] * c[3] * 4;
+    std::vector<uint8_t> om = m.px[f], of = m.fpx[f];
+    const std::vector<uint8_t>& m0 = f == 1 ? m.px[0] : pm; const std::vector<uint8_t>& f0 = f == 1 ? m.fpx[0] : pf;
+    const int32_t* c0 = &m.crop[(size_t)g0 * 4]; const int32_t* c1 = &m.crop[(size_t)g1 * 4];
+    const bool ok = c[2] > 0 && c0[2] > 0 && c1[2] > 0 && m.px[f].size() == csz && m.fpx[f].size() == csz &&
+                    m0.size() == (size_t)c0[2] * c0[3] * 4 && f0.size() == m0.size() &&
+                    m.px[g1].size() == (size_t)c1[2] * c1[3] * 4 && m.fpx[g1].size() == m.px[g1].size() &&
+                    sprite_flow(&m.frames[(size_t)f * m.fsz()], &m.frames[(size_t)g0 * m.fsz()], fw, fh, ax, ay) &&
+                    sprite_flow(&m.frames[(size_t)f * m.fsz()], &m.frames[(size_t)g1 * m.fsz()], fw, fh, bx, by);
+    if (ok) {
+      const int cw = c[2], ch = c[3];
+      cand.assign((size_t)cw * ch, 0);
+      std::vector<int32_t> src((size_t)cw * ch, -1);
+      for (int r = 0; r < ch; r++)
+        for (int q = 0; q < cw; q++) {
+          const size_t o = ((size_t)r * cw + q) * 4;
+          if (m.px[f][o + 3] == 0) continue;
+          const int X = q + c[0], Y = r + c[1];
+          const int sx = std::min(std::max(X / k, 0), fw - 1), sy = std::min(std::max(Y / k, 0), fh - 1);
+          const size_t si = (size_t)sy * fw + sx;
+          const int Xa = X + (int)std::lround(ax[si] * k), Ya = Y + (int)std::lround(ay[si] * k);
+          const int Xb = X + (int)std::lround(bx[si] * k), Yb = Y + (int)std::lround(by[si] * k);
+          const int qa = Xa - c0[0], ra = Ya - c0[1], qb = Xb - c1[0], rb = Yb - c1[1];
+          if (qa < 0 || qa >= c0[2] || ra < 0 || ra >= c0[3] || qb < 0 || qb >= c1[2] || rb < 0 || rb >= c1[3]) continue;
+          const size_t oa = ((size_t)ra * c0[2] + qa) * 4, ob = ((size_t)rb * c1[2] + qb) * 4;
+          if (m0[oa + 3] == 0 || m.px[g1][ob + 3] == 0) continue;
+          const uint8_t* fa = &f0[oa]; const uint8_t* fb = &m.fpx[g1][ob];
+          if (std::memcmp(fa, fb, 4) != 0 || (fa[0] | fa[1] | fa[2] | fa[3]) == 0 || std::memcmp(fa, &of[o], 4) == 0) continue;
+          cand[(size_t)r * cw + q] = 1; src[(size_t)r * cw + q] = (int32_t)oa;
+        }
+      keep.assign(cand.size(), 0);  // opening by a 3x3 square: drop lines one or two px thick
+      for (int r = 1; r + 1 < ch; r++)
+        for (int q = 1; q + 1 < cw; q++) {
+          bool all = true;
+          for (int dy = -1; dy <= 1 && all; dy++) for (int dx = -1; dx <= 1; dx++) if (!cand[(size_t)(r + dy) * cw + q + dx]) { all = false; break; }
+          if (all) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) keep[(size_t)(r + dy) * cw + q + dx] = 1;
+        }
+      for (size_t i = 0; i < keep.size(); i++) {
+        if (!keep[i]) continue;
+        const size_t o = i * 4, oa = (size_t)src[i];
+        m.px[f][o + 1] = m0[oa + 1]; m.px[f][o + 2] = m0[oa + 2]; m.px[f][o + 3] = m0[oa + 3];
+        std::memcpy(&m.fpx[f][o], &f0[oa], 4);
+      }
+    }
+    pm.swap(om); pf.swap(of);
+  }
 }
 
 // shelf pack (as the Ruby pack) and the blob
@@ -2776,8 +3037,9 @@ static void drop_inputs(Map& m) {
   for (auto& p : m.px) { mem_add(-(long long)p.size()); std::vector<uint8_t>().swap(p); }
   std::vector<std::vector<uint8_t>>().swap(m.px);
   for (auto* v : {&m.fpx, &m.apx}) { for (auto& p : *v) { mem_add(-(long long)p.size()); std::vector<uint8_t>().swap(p); } std::vector<std::vector<uint8_t>>().swap(*v); }
-  mem_add(-(long long)(m.out0.size() + m.ids0.size() * 4));
+  mem_add(-(long long)(m.out0.size() + m.ids0.size() * 4 + m.dv0.size() * 2 + m.ok0.size()));
   std::vector<uint8_t>().swap(m.out0); std::vector<int32_t>().swap(m.ids0);
+  std::vector<int16_t>().swap(m.dv0); std::vector<uint8_t>().swap(m.ok0);
 }
 
 struct Pool {
@@ -2820,6 +3082,7 @@ struct Pool {
     m.state = 3;
   }
   void frame(Map& m, int f) {
+    if (m.v6) mend_frame(m, f);
     int ip[8] = {m.fw, m.fh, m.fw, m.k, m.sid, f, 0, 0};
     int err = 0;
     std::unique_ptr<tmap::Job> j(job_from(ip, &m.frames[(size_t)f * m.fsz()], m.tmv.data(), m.par.c_str(), &err));
@@ -2838,6 +3101,10 @@ struct Pool {
     mem_add(-jm);
     if (r) { m.state = r; return; }
     if (m.done.fetch_add(1) + 1 == m.nf && m.state.load() == 3) {
+      if (m.v6) {
+        hold_still(m);
+        despike(m);
+      }
       pack(m);
       drop_inputs(m);
       m.state = 4;
