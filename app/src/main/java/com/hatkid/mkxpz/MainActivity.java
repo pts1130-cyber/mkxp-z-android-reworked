@@ -267,7 +267,7 @@ public class MainActivity extends SDLActivity
             public void run() {
                 try {
                     ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
-                    List<ApplicationExitInfo> list = am.getHistoricalProcessExitReasons(ctx.getPackageName(), 0, 5);
+                    List<ApplicationExitInfo> list = am.getHistoricalProcessExitReasons(ctx.getPackageName(), 0, 10);
                     File dir = new File(GAME_PATH_DEFAULT + "/_log");
                     if (!dir.isDirectory() && !dir.mkdirs())
                         return;
@@ -275,6 +275,7 @@ public class MainActivity extends SDLActivity
                     StringBuilder sb = new StringBuilder();
                     sb.append("지난 종료 기록 (최근 순, 이번 실행 ").append(fmt.format(new Date())).append(")\n");
                     int i = 0;
+                    boolean traced = false;
                     for (ApplicationExitInfo e : list) {
                         sb.append("#").append(i).append(' ').append(fmt.format(new Date(e.getTimestamp())))
                           .append(" 이유=").append(reasonName(e.getReason())).append('(').append(e.getReason()).append(')')
@@ -282,7 +283,8 @@ public class MainActivity extends SDLActivity
                           .append(" 중요도=").append(e.getImportance())
                           .append(" 메모리PSS=").append(e.getPss() / 1024).append("MB RSS=").append(e.getRss() / 1024).append("MB")
                           .append(" 설명=").append(e.getDescription()).append("\n");
-                        if (i == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        int why = e.getReason();
+                        if (!traced && (why == ApplicationExitInfo.REASON_CRASH_NATIVE || why == ApplicationExitInfo.REASON_ANR || why == ApplicationExitInfo.REASON_CRASH)) {
                             InputStream in = null;
                             try { in = e.getTraceInputStream(); } catch (Exception ignored) {}
                             if (in != null) {
@@ -295,7 +297,8 @@ public class MainActivity extends SDLActivity
                                     out.write(buf, 0, n);
                                 out.close();
                                 in.close();
-                                sb.append("   추적 기록 -> ").append(tf.getName()).append(' ').append(tf.length()).append("바이트\n");
+                                traced = true;
+                                sb.append("   #").append(i).append(" 추적 기록 -> ").append(tf.getName()).append(' ').append(tf.length()).append("바이트\n");
                             }
                         }
                         i++;
