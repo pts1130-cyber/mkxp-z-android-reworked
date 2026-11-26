@@ -179,6 +179,7 @@ jobs:
           mkdir build/artifact
           cd build/artifact
           cp /mingw64/bin/zlib1.dll .
+          if [ -f /mingw64/bin/libz-1.dll ]; then cp /mingw64/bin/libz-1.dll .; fi
           cp ../../windows/build-mingw64/bin/x64-msvcrt-ruby310.dll .
           cp -r ../../windows/build-mingw64/lib/ruby/3.1.0 .
           mv ./3.1.0 ./stdlib
