@@ -50,7 +50,12 @@ std::string filesystemImpl::contentsOfFileAsString(const char *path) {
 // chdir and getcwd do not support unicode on Windows
 bool filesystemImpl::setCurrentDirectory(const char *path) {
     fs::path stdPath(path);
-    fs::current_path(stdPath);
+    try {
+        fs::current_path(stdPath);
+    } catch (...) {
+        Debug() << "Failed to set current path." << path;
+        return false;
+    }
     bool ret;
 
     try {
@@ -76,8 +81,14 @@ std::string filesystemImpl::getCurrentDirectory() {
 std::string filesystemImpl::normalizePath(const char *path, bool preferred, bool absolute) {
     fs::path stdPath(path);
     
-    if (!stdPath.is_absolute() && absolute)
-        stdPath = fs::current_path() / stdPath;
+    // ARC: getcwd can fail (ENOENT on the first run after an APK update); keep the path relative instead of aborting
+    if (!stdPath.is_absolute() && absolute) {
+        try {
+            stdPath = fs::current_path() / stdPath;
+        } catch (...) {
+            Debug() << "Failed to get current path for" << path;
+        }
+    }
 
     stdPath = stdPath.lexically_normal();
     std::string ret(stdPath);
