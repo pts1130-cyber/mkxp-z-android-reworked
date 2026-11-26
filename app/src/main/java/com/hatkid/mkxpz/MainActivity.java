@@ -26,6 +26,14 @@ import android.provider.Settings;
 import android.util.Log;
 import java.util.Locale;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.List;
+import android.app.ActivityManager;
+import android.app.ApplicationExitInfo;
 
 import org.libsdl.app.SDLActivity;
 import com.hatkid.mkxpz.gamepad.Gamepad;
@@ -110,6 +118,8 @@ public class MainActivity extends SDLActivity
     protected void onCreate(Bundle savedInstanceState)
     {
         super.onCreate(savedInstanceState);
+
+        writeExitReasons();
 
         mStorageManager = (StorageManager) getSystemService(STORAGE_SERVICE);
 
@@ -243,6 +253,83 @@ public class MainActivity extends SDLActivity
         } else {
             // onStart: Resume SDL thread
             runSDLThread();
+        }
+    }
+
+    // ARC: why the previous runs ended (Android 11+), written to <game>/_log/engine_exit.txt; native crash / ANR traces beside it
+    private void writeExitReasons()
+    {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R)
+            return;
+        final Context ctx = getApplicationContext();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+                    List<ApplicationExitInfo> list = am.getHistoricalProcessExitReasons(ctx.getPackageName(), 0, 5);
+                    File dir = new File(GAME_PATH_DEFAULT + "/_log");
+                    if (!dir.isDirectory() && !dir.mkdirs())
+                        return;
+                    SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("지난 종료 기록 (최근 순, 이번 실행 ").append(fmt.format(new Date())).append(")\n");
+                    int i = 0;
+                    for (ApplicationExitInfo e : list) {
+                        sb.append("#").append(i).append(' ').append(fmt.format(new Date(e.getTimestamp())))
+                          .append(" 이유=").append(reasonName(e.getReason())).append('(').append(e.getReason()).append(')')
+                          .append(" 상태=").append(e.getStatus())
+                          .append(" 중요도=").append(e.getImportance())
+                          .append(" 메모리PSS=").append(e.getPss() / 1024).append("MB RSS=").append(e.getRss() / 1024).append("MB")
+                          .append(" 설명=").append(e.getDescription()).append("\n");
+                        if (i == 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            InputStream in = null;
+                            try { in = e.getTraceInputStream(); } catch (Exception ignored) {}
+                            if (in != null) {
+                                String ext = e.getReason() == ApplicationExitInfo.REASON_ANR ? ".txt" : ".pb";
+                                File tf = new File(dir, "engine_exit_trace" + ext);
+                                OutputStream out = new FileOutputStream(tf);
+                                byte[] buf = new byte[65536];
+                                int n;
+                                while ((n = in.read(buf)) > 0)
+                                    out.write(buf, 0, n);
+                                out.close();
+                                in.close();
+                                sb.append("   추적 기록 -> ").append(tf.getName()).append(' ').append(tf.length()).append("바이트\n");
+                            }
+                        }
+                        i++;
+                    }
+                    OutputStream o = new FileOutputStream(new File(dir, "engine_exit.txt"));
+                    o.write(sb.toString().getBytes("UTF-8"));
+                    o.close();
+                } catch (Throwable t) {
+                    Log.w(TAG, "exit reasons: " + t);
+                }
+            }
+        }).start();
+    }
+
+    private static String reasonName(int r)
+    {
+        switch (r) {
+            case 1: return "스스로 종료";
+            case 2: return "신호로 종료";
+            case 3: return "메모리 부족 강제종료";
+            case 4: return "자바 충돌";
+            case 5: return "네이티브 충돌";
+            case 6: return "응답 없음(ANR)";
+            case 7: return "초기화 실패";
+            case 8: return "권한 바뀜";
+            case 9: return "리소스 과다";
+            case 10: return "사용자 요청";
+            case 11: return "사용자 중지";
+            case 12: return "의존 앱 종료";
+            case 13: return "기타";
+            case 14: return "얼림";
+            case 15: return "패키지 상태 바뀜";
+            case 16: return "패키지 업데이트";
+            default: return "알 수 없음";
         }
     }
 
