@@ -778,8 +778,8 @@ namespace
         ArcPreItem() : stage(PRE_QUEUED), surf(0) {}
     };
 
-    const size_t PRE_MAX_DONE = 16;
-    const size_t PRE_MAX_BYTES = 160u * 1024u * 1024u;
+    const size_t PRE_MAX_DONE = 32;
+    const size_t PRE_MAX_BYTES = 256u * 1024u * 1024u;
 
     /* queue key: "<file>" or "<file>\x01<scale>" for a picture wanted at 1/scale */
     std::string arcPreKey(const char *filename, int lscale)

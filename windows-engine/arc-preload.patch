@@ -108,8 +108,8 @@ index 676294d..c46d0e4 100644
 +
 +    /* same limits as the Android engine: the worker pauses while this many
 +     * finished pictures (or bytes) are waiting to be taken */
-+    static const size_t MAX_DONE = 16;
-+    static const size_t MAX_BYTES = 160u * 1024u * 1024u;
++    static const size_t MAX_DONE = 32;
++    static const size_t MAX_BYTES = 256u * 1024u * 1024u;
  
      std::mutex lock;
      std::condition_variable cond;
