@@ -786,8 +786,9 @@ namespace
 
     /* upload ahead: at most this many bytes of uploaded-but-not-taken textures, this many ms per frame */
     size_t arcUpMaxBytes = 64u * 1024u * 1024u;
-    double arcUpBudgetMs = 2.0;
+    double arcUpBudgetMs = 1.0;
     const size_t ARC_UP_STRIP = 256u * 1024u;
+    const size_t ARC_UP_BUSY_ALLOC = 4u * 1024u * 1024u;
 
     /* queue key: "<file>" or "<file>\x01<scale>" for a picture wanted at 1/scale */
     std::string arcPreKey(const char *filename, int lscale)
@@ -821,8 +822,8 @@ namespace
     struct ArcUpStats
     {
         int pictures, taken, partial;
-        double mb, ms, frameMax;
-        ArcUpStats() : pictures(0), taken(0), partial(0), mb(0), ms(0), frameMax(0) {}
+        double mb, ms, frameMax, idleMs;
+        ArcUpStats() : pictures(0), taken(0), partial(0), mb(0), ms(0), frameMax(0), idleMs(0) {}
     };
     ArcUpStats arcUp;
 
@@ -1134,8 +1135,8 @@ void Bitmap::preloadClear()
         if (lf)
         {
             char clk[16];
-            fprintf(lf, "[%s 엔진 %.1f초] 미리 올림 %d장 %.1fMB 합 %.1fms 한 프레임 최대 %.1fms | 받아 감 %d장(덜 올라간 채 %d장)\n",
-                    arcClockStr(clk), SDL_GetTicks() / 1000.0, arcUp.pictures, arcUp.mb, arcUp.ms, arcUp.frameMax,
+            fprintf(lf, "[%s 엔진 %.1f초] 미리 올림 %d장 %.1fMB 합 %.1fms(쉬는 시간 %.1fms) 한 프레임 최대 %.1fms | 받아 감 %d장(덜 올라간 채 %d장)\n",
+                    arcClockStr(clk), SDL_GetTicks() / 1000.0, arcUp.pictures, arcUp.mb, arcUp.ms, arcUp.idleMs, arcUp.frameMax,
                     arcUp.taken, arcUp.partial);
             fclose(lf);
         }
@@ -1186,11 +1187,35 @@ void Bitmap::preloadDrop(const char *filename, int lscale)
     st->cond.notify_all();
 }
 
-/* ARC: game thread, once per Graphics.update: upload finished pictures to textures ahead of use,
- * in the order they finished, a strip at a time, within arcUpBudgetMs. Bitmap.new then only takes the texture */
-void Bitmap::preloadPump()
+/* ARC: game thread: upload finished pictures to textures ahead of use, in the order they finished,
+ * a strip at a time, for at most budgetMs. Called with a small fixed budget from Graphics.update and with the
+ * frame's spare time (what the frame limiter would otherwise sleep) right before the swap.
+ * A picture that does not fit under arcUpMaxBytes yet is skipped, not waited for. Bitmap.new then only takes the texture */
+static bool arcPreUploadOne(ArcPreState *st, ArcPreItem &e, Uint64 t0, double budgetMs)
 {
-    if (!arcPre || arcUpBudgetMs <= 0.0)
+    SDL_Surface *s = e.surf;
+    TEX::bind(e.tex.tex);
+    int strip = (int)(ARC_UP_STRIP / ((size_t)s->w * 4));
+    if (strip < 1)
+        strip = 1;
+
+    while (e.rows < s->h)
+    {
+        int n = std::min(strip, s->h - e.rows);
+        TEX::uploadSubImage(0, e.rows, s->w, n, (const Uint8 *)s->pixels + (size_t)e.rows * s->pitch, GL_RGBA);
+        e.rows += n;
+        if (arcMs(SDL_GetPerformanceCounter() - t0) >= budgetMs)
+            break;
+    }
+    (void)st;
+    return e.rows >= s->h;
+}
+
+void Bitmap::preloadPump(double budgetMs, bool idle)
+{
+    if (budgetMs < 0.0)
+        budgetMs = arcUpBudgetMs;
+    if (!arcPre || budgetMs <= 0.0 || arcUpBudgetMs <= 0.0)
         return;
 
     ArcPreState *st = arcPre;
@@ -1198,12 +1223,15 @@ void Bitmap::preloadPump()
     bool did = false;
     std::lock_guard<std::mutex> lk(st->lock);
 
-    while (!st->doneOrder.empty())
+    for (size_t i = 0; i < st->doneOrder.size();)
     {
-        std::map<std::string, ArcPreItem>::iterator it = st->items.find(st->doneOrder.front());
+        if (arcMs(SDL_GetPerformanceCounter() - t0) >= budgetMs)
+            break;
+
+        std::map<std::string, ArcPreItem>::iterator it = st->items.find(st->doneOrder[i]);
         if (it == st->items.end() || it->second.stage != PRE_DONE || !it->second.surf)
         {
-            st->doneOrder.pop_front();
+            st->doneOrder.erase(st->doneOrder.begin() + i);
             continue;
         }
 
@@ -1216,11 +1244,15 @@ void Bitmap::preloadPump()
             if (s->w > glState.caps.maxTexSize || s->h > glState.caps.maxTexSize ||
                 s->pitch != s->w * 4 || bytes > arcUpMaxBytes)
             {
-                st->doneOrder.pop_front();
+                st->doneOrder.erase(st->doneOrder.begin() + i);
                 continue;
             }
-            if (st->upBytes + bytes > arcUpMaxBytes)
-                break;
+            /* a new big texture (allocation is one blocking step) only in spare time, never in a busy frame */
+            if (st->upBytes + bytes > arcUpMaxBytes || (!idle && bytes > ARC_UP_BUSY_ALLOC))
+            {
+                ++i;
+                continue;
+            }
             try
             {
                 e.tex = shState->texPool().request(s->w, s->h);
@@ -1228,7 +1260,7 @@ void Bitmap::preloadPump()
             catch (const Exception &)
             {
                 e.tex = TEXFBO();
-                st->doneOrder.pop_front();
+                st->doneOrder.erase(st->doneOrder.begin() + i);
                 continue;
             }
             e.rows = 0;
@@ -1236,38 +1268,22 @@ void Bitmap::preloadPump()
         }
 
         did = true;
-        TEX::bind(e.tex.tex);
-        int strip = (int)(ARC_UP_STRIP / ((size_t)s->w * 4));
-        if (strip < 1)
-            strip = 1;
-
-        bool out = false;
-        while (e.rows < s->h)
-        {
-            int n = std::min(strip, s->h - e.rows);
-            TEX::uploadSubImage(0, e.rows, s->w, n, (const Uint8 *)s->pixels + (size_t)e.rows * s->pitch, GL_RGBA);
-            e.rows += n;
-            if (arcMs(SDL_GetPerformanceCounter() - t0) >= arcUpBudgetMs)
-            {
-                out = true;
-                break;
-            }
-        }
-
-        if (e.rows >= s->h)
+        if (arcPreUploadOne(st, e, t0, budgetMs))
         {
             ++arcUp.pictures;
             arcUp.mb += (double)s->w * s->h * 4 / 1048576.0;
-            st->doneOrder.pop_front();
+            st->doneOrder.erase(st->doneOrder.begin() + i);
+            continue;
         }
-        if (out)
-            break;
+        break;
     }
 
     if (did)
     {
         double ms = arcMs(SDL_GetPerformanceCounter() - t0);
         arcUp.ms += ms;
+        if (idle)
+            arcUp.idleMs += ms;
         if (ms > arcUp.frameMax)
             arcUp.frameMax = ms;
     }

@@ -703,6 +703,14 @@ struct FPSLimiter {
     }
     
     void setDesiredFPS(uint16_t value) { tpf = tickFreq / value; }
+
+    /* ARC: ms left until delay() would end the frame (0 when the limiter is off) */
+    double spareMs() const {
+        if (disabled)
+            return 0.0;
+        int64_t toDelay = tpf - (int64_t)(SDL_GetPerformanceCounter() - lastTickCount) - adj.idealDiff;
+        return toDelay > 0 ? (double)toDelay * 1000.0 / (double)tickFreq : 0.0;
+    }
     
     void delay() {
         if (disabled)
@@ -1448,9 +1456,16 @@ struct GraphicsPrivate {
     }
     
     void swapGLBuffer() {
+        /* ARC: spend the time the limiter would sleep on uploading preloaded pictures, keeping a margin */
+        {
+            double spare = fpsLimiter.spareMs() - 1.5;
+            if (spare > 0.5)
+                Bitmap::preloadPump(std::min(spare, 20.0), true);
+        }
+
         uint64_t arcT0 = SDL_GetPerformanceCounter();
         arcGfx.swapStart(arcT0);
-        
+
         fpsLimiter.delay();
         
         uint64_t arcT1 = SDL_GetPerformanceCounter();
