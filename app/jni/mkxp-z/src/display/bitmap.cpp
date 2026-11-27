@@ -829,7 +829,7 @@ namespace
     /* game thread: free a table item (decoded pixels and an uploaded-ahead texture) */
     void arcPreFreeItem(ArcPreState *st, ArcPreItem &e)
     {
-        if (e.tex.tex)
+        if (e.tex.tex.gl)
         {
             if (e.surf)
                 st->upBytes -= (size_t)e.surf->w * (size_t)e.surf->h * 4;
@@ -1011,7 +1011,7 @@ namespace
                 SDL_Surface *surf = it->second.surf;
                 st->doneBytes -= (size_t)surf->pitch * (size_t)surf->h;
                 --st->doneCount;
-                if (it->second.tex.tex)
+                if (it->second.tex.tex.gl)
                 {
                     *upTex = it->second.tex;
                     *upRows = it->second.rows;
@@ -1210,7 +1210,7 @@ void Bitmap::preloadPump()
         ArcPreItem &e = it->second;
         SDL_Surface *s = e.surf;
 
-        if (!e.tex.tex)
+        if (!e.tex.tex.gl)
         {
             size_t bytes = (size_t)s->w * (size_t)s->h * 4;
             if (s->w > glState.caps.maxTexSize || s->h > glState.caps.maxTexSize ||
@@ -1665,7 +1665,7 @@ Bitmap::Bitmap(const char *filename, int lscale)
     Uint64 arcS3 = arcS2;
     int arcUpPct = -1;
 
-    if (arcUpTex.tex && (arcUpTex.width != imgSurf->w || arcUpTex.height != imgSurf->h))
+    if (arcUpTex.tex.gl && (arcUpTex.width != imgSurf->w || arcUpTex.height != imgSurf->h))
     {
         shState->texPool().release(arcUpTex);
         arcUpTex = TEXFBO();
@@ -1684,7 +1684,7 @@ Bitmap::Bitmap(const char *filename, int lscale)
         TEXFBO tex;
         int fromRow = 0;
 
-        if (arcUpTex.tex)
+        if (arcUpTex.tex.gl)
         {
             tex = arcUpTex;
             fromRow = arcUpRows;
