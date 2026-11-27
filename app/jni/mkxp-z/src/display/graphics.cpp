@@ -1679,6 +1679,7 @@ void Graphics::update(bool checkForShutdown) {
     p->checkSyncLock();
 
     arcLowMemServe();
+    Bitmap::preloadPump();
     
     
 #ifdef MKXPZ_STEAM

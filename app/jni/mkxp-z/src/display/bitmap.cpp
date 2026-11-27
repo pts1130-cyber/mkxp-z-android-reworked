@@ -771,15 +771,23 @@ namespace
 {
     enum ArcPreStage { PRE_QUEUED, PRE_WORKING, PRE_DONE };
 
+    /* tex/rows: a finished picture uploaded ahead to a texture, rows uploaded so far (game thread only) */
     struct ArcPreItem
     {
         ArcPreStage stage;
         SDL_Surface *surf;
-        ArcPreItem() : stage(PRE_QUEUED), surf(0) {}
+        TEXFBO tex;
+        int rows;
+        ArcPreItem() : stage(PRE_QUEUED), surf(0), rows(0) {}
     };
 
     const size_t PRE_MAX_DONE = 32;
     const size_t PRE_MAX_BYTES = 256u * 1024u * 1024u;
+
+    /* upload ahead: at most this many bytes of uploaded-but-not-taken textures, this many ms per frame */
+    size_t arcUpMaxBytes = 64u * 1024u * 1024u;
+    double arcUpBudgetMs = 2.0;
+    const size_t ARC_UP_STRIP = 256u * 1024u;
 
     /* queue key: "<file>" or "<file>\x01<scale>" for a picture wanted at 1/scale */
     std::string arcPreKey(const char *filename, int lscale)
@@ -799,13 +807,39 @@ namespace
         std::condition_variable cond;
         std::deque<std::string> queue;
         std::map<std::string, ArcPreItem> items;
+        std::deque<std::string> doneOrder;
         size_t doneCount;
         size_t doneBytes;
+        size_t upBytes;
         bool quit;
         std::thread worker;
 
-        ArcPreState() : doneCount(0), doneBytes(0), quit(false) {}
+        ArcPreState() : doneCount(0), doneBytes(0), upBytes(0), quit(false) {}
     };
+
+    /* upload-ahead statistics since the last preload_clear */
+    struct ArcUpStats
+    {
+        int pictures, taken, partial;
+        double mb, ms, frameMax;
+        ArcUpStats() : pictures(0), taken(0), partial(0), mb(0), ms(0), frameMax(0) {}
+    };
+    ArcUpStats arcUp;
+
+    /* game thread: free a table item (decoded pixels and an uploaded-ahead texture) */
+    void arcPreFreeItem(ArcPreState *st, ArcPreItem &e)
+    {
+        if (e.tex.tex)
+        {
+            if (e.surf)
+                st->upBytes -= (size_t)e.surf->w * (size_t)e.surf->h * 4;
+            shState->texPool().release(e.tex);
+            e.tex = TEXFBO();
+        }
+        if (e.surf)
+            SDL_FreeSurface(e.surf);
+        e.surf = 0;
+    }
 
     ArcPreState *arcPre = 0;
 
@@ -918,6 +952,7 @@ namespace
                     it->second.stage = PRE_DONE;
                     ++st->doneCount;
                     st->doneBytes += (size_t)surf->pitch * (size_t)surf->h;
+                    st->doneOrder.push_back(name);
                 }
             }
 
@@ -927,9 +962,11 @@ namespace
 
     /* game thread: returns the decoded surface if the file was preloaded.
      * A file still waiting in the queue is not waited for (the caller loads it itself) */
-    SDL_Surface *arcPreTake(const char *filename, int lscale, double *waitedMs)
+    SDL_Surface *arcPreTake(const char *filename, int lscale, double *waitedMs, TEXFBO *upTex, int *upRows)
     {
         *waitedMs = -1.0;
+        *upTex = TEXFBO();
+        *upRows = 0;
         arcPreMiss[0] = 0;
 
         if (!arcPre)
@@ -974,6 +1011,15 @@ namespace
                 SDL_Surface *surf = it->second.surf;
                 st->doneBytes -= (size_t)surf->pitch * (size_t)surf->h;
                 --st->doneCount;
+                if (it->second.tex.tex)
+                {
+                    *upTex = it->second.tex;
+                    *upRows = it->second.rows;
+                    st->upBytes -= (size_t)surf->w * (size_t)surf->h * 4;
+                    ++arcUp.taken;
+                    if (it->second.rows < surf->h)
+                        ++arcUp.partial;
+                }
                 st->items.erase(it);
                 lk.unlock();
                 st->cond.notify_all();
@@ -1070,16 +1116,31 @@ void Bitmap::preloadClear()
 
         for (std::map<std::string, ArcPreItem>::iterator it = st->items.begin(); it != st->items.end();)
         {
-            if (it->second.surf)
-                SDL_FreeSurface(it->second.surf);
+            arcPreFreeItem(st, it->second);
             it = st->items.erase(it);
         }
 
         st->doneCount = 0;
         st->doneBytes = 0;
+        st->upBytes = 0;
+        st->doneOrder.clear();
     }
 
     st->cond.notify_all();
+
+    if (arcUp.pictures > 0)
+    {
+        FILE *lf = fopen("_log/engine_img.txt", "a");
+        if (lf)
+        {
+            char clk[16];
+            fprintf(lf, "[%s 엔진 %.1f초] 미리 올림 %d장 %.1fMB 합 %.1fms 한 프레임 최대 %.1fms | 받아 감 %d장(덜 올라간 채 %d장)\n",
+                    arcClockStr(clk), SDL_GetTicks() / 1000.0, arcUp.pictures, arcUp.mb, arcUp.ms, arcUp.frameMax,
+                    arcUp.taken, arcUp.partial);
+            fclose(lf);
+        }
+    }
+    arcUp = ArcUpStats();
 }
 
 /* ARC: drop one picture from the preload table (queued, being decoded or finished) and keep the rest.
@@ -1104,7 +1165,7 @@ void Bitmap::preloadDrop(const char *filename, int lscale)
             SDL_Surface *surf = it->second.surf;
             st->doneBytes -= (size_t)surf->pitch * (size_t)surf->h;
             --st->doneCount;
-            SDL_FreeSurface(surf);
+            arcPreFreeItem(st, it->second);
         }
         else if (it->second.stage == PRE_QUEUED)
         {
@@ -1123,6 +1184,113 @@ void Bitmap::preloadDrop(const char *filename, int lscale)
     }
 
     st->cond.notify_all();
+}
+
+/* ARC: game thread, once per Graphics.update: upload finished pictures to textures ahead of use,
+ * in the order they finished, a strip at a time, within arcUpBudgetMs. Bitmap.new then only takes the texture */
+void Bitmap::preloadPump()
+{
+    if (!arcPre || arcUpBudgetMs <= 0.0)
+        return;
+
+    ArcPreState *st = arcPre;
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    bool did = false;
+    std::lock_guard<std::mutex> lk(st->lock);
+
+    while (!st->doneOrder.empty())
+    {
+        std::map<std::string, ArcPreItem>::iterator it = st->items.find(st->doneOrder.front());
+        if (it == st->items.end() || it->second.stage != PRE_DONE || !it->second.surf)
+        {
+            st->doneOrder.pop_front();
+            continue;
+        }
+
+        ArcPreItem &e = it->second;
+        SDL_Surface *s = e.surf;
+
+        if (!e.tex.tex)
+        {
+            size_t bytes = (size_t)s->w * (size_t)s->h * 4;
+            if (s->w > glState.caps.maxTexSize || s->h > glState.caps.maxTexSize ||
+                s->pitch != s->w * 4 || bytes > arcUpMaxBytes)
+            {
+                st->doneOrder.pop_front();
+                continue;
+            }
+            if (st->upBytes + bytes > arcUpMaxBytes)
+                break;
+            try
+            {
+                e.tex = shState->texPool().request(s->w, s->h);
+            }
+            catch (const Exception &)
+            {
+                e.tex = TEXFBO();
+                st->doneOrder.pop_front();
+                continue;
+            }
+            e.rows = 0;
+            st->upBytes += bytes;
+        }
+
+        did = true;
+        TEX::bind(e.tex.tex);
+        int strip = (int)(ARC_UP_STRIP / ((size_t)s->w * 4));
+        if (strip < 1)
+            strip = 1;
+
+        bool out = false;
+        while (e.rows < s->h)
+        {
+            int n = std::min(strip, s->h - e.rows);
+            TEX::uploadSubImage(0, e.rows, s->w, n, (const Uint8 *)s->pixels + (size_t)e.rows * s->pitch, GL_RGBA);
+            e.rows += n;
+            if (arcMs(SDL_GetPerformanceCounter() - t0) >= arcUpBudgetMs)
+            {
+                out = true;
+                break;
+            }
+        }
+
+        if (e.rows >= s->h)
+        {
+            ++arcUp.pictures;
+            arcUp.mb += (double)s->w * s->h * 4 / 1048576.0;
+            st->doneOrder.pop_front();
+        }
+        if (out)
+            break;
+    }
+
+    if (did)
+    {
+        double ms = arcMs(SDL_GetPerformanceCounter() - t0);
+        arcUp.ms += ms;
+        if (ms > arcUp.frameMax)
+            arcUp.frameMax = ms;
+    }
+}
+
+void Bitmap::preloadUploadSettings(double budgetMs, long long maxBytes)
+{
+    if (budgetMs >= 0.0)
+        arcUpBudgetMs = budgetMs;
+    if (maxBytes >= 0)
+        arcUpMaxBytes = (size_t)maxBytes;
+}
+
+void Bitmap::preloadUploadInfo(double *budgetMs, unsigned long long *maxBytes, unsigned long long *usedBytes)
+{
+    *budgetMs = arcUpBudgetMs;
+    *maxBytes = (unsigned long long)arcUpMaxBytes;
+    *usedBytes = 0;
+    if (arcPre)
+    {
+        std::lock_guard<std::mutex> lk(arcPre->lock);
+        *usedBytes = (unsigned long long)arcPre->upBytes;
+    }
 }
 
 void Bitmap::preloadShutdown()
@@ -1305,13 +1473,14 @@ void arcLowMemFreePictures(unsigned long long *preBytes, int *preDone, int *preQ
 
             for (std::map<std::string, ArcPreItem>::iterator it = st->items.begin(); it != st->items.end();)
             {
-                if (it->second.surf)
-                    SDL_FreeSurface(it->second.surf);
+                arcPreFreeItem(st, it->second);
                 it = st->items.erase(it);
             }
 
             st->doneCount = 0;
             st->doneBytes = 0;
+            st->upBytes = 0;
+            st->doneOrder.clear();
         }
 
         st->cond.notify_all();
@@ -1349,7 +1518,9 @@ Bitmap::Bitmap(const char *filename, int lscale)
     if (lscale < 1)
         lscale = 1;
     const int arcReqLscale = lscale;
-    handler.surface = arcPreTake(filename, lscale, &arcPreWaitMs);
+    TEXFBO arcUpTex;
+    int arcUpRows = 0;
+    handler.surface = arcPreTake(filename, lscale, &arcPreWaitMs, &arcUpTex, &arcUpRows);
     bool arcPreScaled = handler.surface != 0;   /* a preloaded picture is already at 1/lscale */
     bool arcFromCache = false;
     if (!handler.surface)
@@ -1472,7 +1643,7 @@ Bitmap::Bitmap(const char *filename, int lscale)
     
     SDL_Surface *imgSurf = handler.surface;
 
-
+    Uint64 arcS0 = SDL_GetPerformanceCounter();
     p->ensureFormat(imgSurf, SDL_PIXELFORMAT_ABGR8888);
 
     if (lscale > 1 && !arcPreScaled)
@@ -1487,8 +1658,18 @@ Bitmap::Bitmap(const char *filename, int lscale)
             lscale = 1;
     }
 
+    Uint64 arcS1 = SDL_GetPerformanceCounter();
     if (!arcFromCache)
         arcDecPut(filename, arcReqLscale, imgSurf, lscale);
+    Uint64 arcS2 = SDL_GetPerformanceCounter();
+    Uint64 arcS3 = arcS2;
+    int arcUpPct = -1;
+
+    if (arcUpTex.tex && (arcUpTex.width != imgSurf->w || arcUpTex.height != imgSurf->h))
+    {
+        shState->texPool().release(arcUpTex);
+        arcUpTex = TEXFBO();
+    }
 
     if (imgSurf->w > glState.caps.maxTexSize || imgSurf->h > glState.caps.maxTexSize)
     {
@@ -1501,23 +1682,37 @@ Bitmap::Bitmap(const char *filename, int lscale)
     {
         /* Regular surface */
         TEXFBO tex;
-        
-        try
+        int fromRow = 0;
+
+        if (arcUpTex.tex)
         {
-            tex = shState->texPool().request(imgSurf->w, imgSurf->h);
+            tex = arcUpTex;
+            fromRow = arcUpRows;
+            arcUpPct = (int)((long long)arcUpRows * 100 / imgSurf->h);
         }
-        catch (const Exception &e)
+        else
         {
-            SDL_FreeSurface(imgSurf);
-            throw e;
+            try
+            {
+                tex = shState->texPool().request(imgSurf->w, imgSurf->h);
+            }
+            catch (const Exception &e)
+            {
+                SDL_FreeSurface(imgSurf);
+                throw e;
+            }
         }
-        
+        arcS3 = SDL_GetPerformanceCounter();
+
         p = new BitmapPrivate(this);
         p->gl = tex;
         p->lscale = lscale;
 
+        /* the pool hands out a texture already allocated at this size: fill it instead of reallocating */
         TEX::bind(p->gl.tex);
-        TEX::uploadImage(p->gl.width, p->gl.height, imgSurf->pixels, GL_RGBA);
+        if (fromRow < imgSurf->h)
+            TEX::uploadSubImage(0, fromRow, p->gl.width, imgSurf->h - fromRow,
+                                (const Uint8 *)imgSurf->pixels + (size_t)fromRow * imgSurf->pitch, GL_RGBA);
         if (lscale > 1)
             TEX::setSmooth(true);
 
@@ -1550,11 +1745,16 @@ Bitmap::Bitmap(const char *filename, int lscale)
             {
                 char clk[16];
                 ++arcImgLines;
-                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms | %dx%d %s%s%s\n",
+                char upTxt[32] = "";
+                if (arcUpPct >= 0)
+                    snprintf(upTxt, sizeof(upTxt), " [미리 올림 %d%%]", arcUpPct);
+                fprintf(lf, "[%s 엔진 %.1f초] %.0fms 합계 | 파일열기+목록 %.0fms 읽기 %.0fms(%zu바이트 %zu번) 풀기 %.0fms | 올리기·변환 %.0fms(변환 %.1f 그림기억 %.1f 텍스처 %.1f 올리기 %.1f) | %dx%d %s%s%s%s\n",
                         arcClockStr(clk), SDL_GetTicks() / 1000.0,
                         total, arcMs(arcT1 - arcT0) - handler.readMs - handler.decodeMs,
                         handler.readMs, handler.readBytes, handler.readCalls,
-                        handler.decodeMs, arcMs(arcT2 - arcT1), width(), height(), filename,
+                        handler.decodeMs, arcMs(arcT2 - arcT1),
+                        arcMs(arcS1 - arcS0), arcMs(arcS2 - arcS1), arcMs(arcS3 - arcS2), arcMs(arcT2 - arcS3),
+                        width(), height(), filename, upTxt,
                         arcFromCache ? " [그림기억 적중]" : (arcPreWaitMs < 0.0 ? "" : (arcPreWaitMs < 1.0 ? " [선읽기 적중]" : " [선읽기 기다림]")),
                         arcPreMiss);
                 fclose(lf);
@@ -1612,10 +1812,10 @@ Bitmap::Bitmap(void *pixeldata, int width, int height)
         
         p = new BitmapPrivate(this);
         p->gl = tex;
-        
+
         TEX::bind(p->gl.tex);
-        TEX::uploadImage(p->gl.width, p->gl.height, surface->pixels, GL_RGBA);
-        
+        TEX::uploadSubImage(0, 0, p->gl.width, p->gl.height, surface->pixels, GL_RGBA);
+
         SDL_FreeSurface(surface);
     }
     

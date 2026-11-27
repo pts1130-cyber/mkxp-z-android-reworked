@@ -48,6 +48,9 @@ public:
 	static void preloadClear();
 	static void preloadDrop(const char *filename, int logicalScale = 1);
 	static void preloadShutdown();
+	static void preloadPump();
+	static void preloadUploadSettings(double budgetMs, long long maxBytes);
+	static void preloadUploadInfo(double *budgetMs, unsigned long long *maxBytes, unsigned long long *usedBytes);
 	static void preloadLimits(int *maxDone, unsigned long long *maxBytes);
 	void releasePixels();
 	int logicalScale() const;

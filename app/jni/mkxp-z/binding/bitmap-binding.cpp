@@ -923,6 +923,26 @@ RB_METHOD(bitmapPreloadClear) {
     return Qnil;
 }
 
+/* ARC: Bitmap.preload_upload(ms_per_frame = nil, max_bytes = nil) sets upload-ahead (nil keeps a value, 0 ms turns it off);
+ * returns [ms_per_frame, max_bytes, bytes uploaded ahead and not taken yet] */
+RB_METHOD(bitmapPreloadUpload) {
+    RB_UNUSED_PARAM;
+
+    double ms = -1.0;
+    long long bytes = -1;
+    if (argc > 0 && argv[0] != Qnil)
+        ms = NUM2DBL(argv[0]);
+    if (argc > 1 && argv[1] != Qnil)
+        bytes = NUM2LL(argv[1]);
+    if (ms >= 0.0 || bytes >= 0)
+        Bitmap::preloadUploadSettings(ms, bytes);
+
+    double curMs = 0.0;
+    unsigned long long maxBytes = 0, used = 0;
+    Bitmap::preloadUploadInfo(&curMs, &maxBytes, &used);
+    return rb_ary_new3(3, rb_float_new(curMs), ULL2NUM(maxBytes), ULL2NUM(used));
+}
+
 void bitmapBindingInit() {
     VALUE klass = rb_define_class("Bitmap", rb_cObject);
 #if RAPI_FULL > 187
@@ -937,6 +957,7 @@ void bitmapBindingInit() {
     rb_define_class_method(klass, "preload_clear", bitmapPreloadClear);
     rb_define_class_method(klass, "preload_drop", bitmapPreloadDrop);
     rb_define_class_method(klass, "preload_limits", bitmapPreloadLimits);
+    rb_define_class_method(klass, "preload_upload", bitmapPreloadUpload);
     
     _rb_define_method(klass, "initialize", bitmapInitialize);
     _rb_define_method(klass, "initialize_copy", bitmapInitializeCopy);
